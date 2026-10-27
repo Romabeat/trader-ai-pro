@@ -226,6 +226,63 @@ def analyze():
         }), 500
 
 
+@app.get("/analyze_multi")
+def analyze_multi():
+    symbol = request.args.get("symbol", "R_100").strip().upper()
+    entry_tf = request.args.get("entry_tf", "H1").strip().upper()
+
+    if symbol not in ALLOWED_SYMBOLS:
+        return jsonify({
+            "status": "error",
+            "message": "Indice non autorisé."
+        }), 400
+
+    if entry_tf not in {"H1", "H2"}:
+        return jsonify({
+            "status": "error",
+            "message": "entry_tf doit être H1 ou H2."
+        }), 400
+
+    results = {}
+
+    try:
+        for timeframe in ("D1", "H4", entry_tf):
+            data = fetch_candles(symbol, timeframe, 100)
+            candles_data = data.get("candles", [])
+
+            if len(candles_data) < 30:
+                return jsonify({
+                    "status": "error",
+                    "message": f"Pas assez de bougies en {timeframe}.",
+                    "received": len(candles_data)
+                }), 422
+
+            results[timeframe] = analyze_candles(candles_data)
+
+        return jsonify({
+            "status": "ok",
+            "symbol": symbol,
+            "analysis": results,
+            "note": (
+                "Comparaison multi-unités de temps. "
+                "Ce résultat ne constitue pas encore un signal d'entrée."
+            )
+        })
+
+    except ValueError as exc:
+        return jsonify({
+            "status": "error",
+            "message": str(exc)
+        }), 502
+
+    except Exception:
+        app.logger.exception("Erreur d'analyse multi-unités")
+        return jsonify({
+            "status": "error",
+            "message": "Échec de l'analyse multi-unités."
+        }), 500
+    
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
