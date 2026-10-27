@@ -5,7 +5,7 @@ import websocket
 
 URLS = [
     "wss://ws.derivws.com/websockets/v3?app_id=1089",
-    "wss://ws.binaryws.com/websockets/v3",
+    "wss://ws.binaryws.com/websockets/v3?app_id=1089",
 ]
 
 def test_endpoint(url, timeout=12):
@@ -13,7 +13,7 @@ def test_endpoint(url, timeout=12):
     done = threading.Event()
 
     def on_open(ws):
-        print(f"WS_OPEN: {result['endpoint']}")
+        print("WS_OPEN:", result["endpoint"])
         ws.send(json.dumps({
             "active_symbols": "brief",
             "product_type": "basic",
@@ -22,6 +22,7 @@ def test_endpoint(url, timeout=12):
 
     def on_message(ws, message):
         data = json.loads(message)
+
         if data.get("msg_type") == "active_symbols":
             result["status"] = "ok"
             result["count"] = len(data.get("active_symbols", []))
@@ -36,11 +37,11 @@ def test_endpoint(url, timeout=12):
 
     def on_error(ws, error):
         result["error"] = str(error)
-        print(f"WS_ERROR: {result['endpoint']}: {error}")
+        print("WS_ERROR:", result["endpoint"], error)
         done.set()
 
     def on_close(ws, code, message):
-        print(f"WS_CLOSE: {result['endpoint']}: {code} {message}")
+        print("WS_CLOSE:", result["endpoint"], code, message)
         done.set()
 
     ws = websocket.WebSocketApp(
@@ -52,7 +53,10 @@ def test_endpoint(url, timeout=12):
     )
 
     thread = threading.Thread(
-        target=lambda: ws.run_forever(ping_interval=20, ping_timeout=10),
+        target=lambda: ws.run_forever(
+            ping_interval=20,
+            ping_timeout=10
+        ),
         daemon=True
     )
     thread.start()
@@ -63,18 +67,22 @@ def test_endpoint(url, timeout=12):
 
     return result
 
-def get_synthetic_symbols(timeout=15):
-    results = []
+def get_synthetic_symbols(timeout=12):
+    diagnostic = []
 
     for url in URLS:
         result = test_endpoint(url, timeout)
-        results.append(result)
+        diagnostic.append(result)
         print("WS_TEST_RESULT:", json.dumps(result))
 
         if result.get("status") == "ok":
-            return {"symbols": [], "diagnostic": results}
+            return {
+                "symbols": [],
+                "diagnostic": diagnostic
+            }
 
     return {
-        "error": "Les deux connexions WebSocket ont échoué.",
-        "diagnostic": results
+        "error": "Les connexions WebSocket ont échoué.",
+        "diagnostic": diagnostic
     }
+
