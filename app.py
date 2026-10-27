@@ -2,12 +2,22 @@
 import os
 from flask import Flask, jsonify, request
 import requests
+
 from deriv_market import get_synthetic_symbols, get_candles
+from analysis_engine import analyze_candles
 
 app = Flask(__name__)
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+ALLOWED_SYMBOLS = {
+    "1HZ100V", "1HZ10V", "1HZ15V", "1HZ25V",
+    "1HZ30V", "1HZ50V", "1HZ75V", "1HZ90V",
+    "R_10", "R_100", "R_25", "R_50", "R_75",
+}
+
+ALLOWED_TIMEFRAMES = {"H1", "H2", "H4", "D1"}
 
 
 @app.get("/")
@@ -16,8 +26,12 @@ def home():
         "bot": "TRADER AI PRO",
         "status": "online",
         "mode": "alerts_only",
-        "symbols_test": "/symbols",
-        "candles_test": "/candles?symbol=R_100&timeframe=H1&count=50"
+        "routes": [
+            "/health",
+            "/symbols",
+            "/candles?symbol=R_100&timeframe=H1&count=50",
+            "/analyze?symbol=R_100&timeframe=H1&count=50",
+        ],
     })
 
 
@@ -34,7 +48,7 @@ def symbols():
         if data.get("error"):
             return jsonify({
                 "status": "error",
-                "message": data["error"]
+                "message": data["error"],
             }), 502
 
         found = data.get("symbols", [])
@@ -42,80 +56,174 @@ def symbols():
         return jsonify({
             "status": "ok",
             "count": len(found),
-            "symbols": found
+            "symbols": found,
         })
 
     except Exception:
-        app.logger.exception("Erreur pendant la récupération des indices")
+        app.logger.exception("Erreur de récupération des indices")
         return jsonify({
             "status": "error",
-            "message": "Impossible de récupérer les indices."
+            "message": "Impossible de récupérer les indices.",
         }), 500
+
+
+def fetch_candles(symbol, timeframe, count):
+    """Récupère les bougies et renvoie une erreur exploitable si nécessaire."""
+    data = get_candles(
+        symbol=symbol,
+        timeframe=timeframe,
+        count=count,
+        timeout=8,
+    )
+
+    if data.get("error"):
+        raise ValueError(data["error"])
+
+    return data
 
 
 @app.get("/candles")
 def candles():
-    symbol = request.args.get("symbol", "R_100").strip()
-    timeframe = request.args.get("timeframe", "H1").upper()
+    symbol = request.args.get("symbol", "R_100").strip().upper()
+    timeframe = request.args.get("timeframe", "H1").strip().upper()
+
     try:
         count = int(request.args.get("count", "50"))
     except ValueError:
         return jsonify({
             "status": "error",
-            "message": "count doit être un nombre entier."
+            "message": "count doit être un entier.",
+        }), 400
+
+    if symbol not in ALLOWED_SYMBOLS:
+        return jsonify({
+            "status": "error",
+            "message": "Indice non autorisé.",
+        }), 400
+
+    if timeframe not in ALLOWED_TIMEFRAMES:
+        return jsonify({
+            "status": "error",
+            "message": "Unité autorisée : H1, H2, H4 ou D1.",
         }), 400
 
     if not 1 <= count <= 200:
         return jsonify({
             "status": "error",
-            "message": "count doit être compris entre 1 et 200."
+            "message": "count doit être compris entre 1 et 200.",
         }), 400
 
     try:
-        data = get_candles(
-            symbol=symbol,
-            timeframe=timeframe,
-            count=count,
-            timeout=8
-        )
-
-        if data.get("error"):
-            return jsonify({
-                "status": "error",
-                "message": data["error"]
-            }), 502
+        data = fetch_candles(symbol, timeframe, count)
 
         return jsonify({
             "status": "ok",
-            "symbol": data["symbol"],
-            "timeframe": data["timeframe"],
-            "count": data["count"],
-            "candles": data["candles"]
+            "symbol": data.get("symbol", symbol),
+            "timeframe": data.get("timeframe", timeframe),
+            "count": data.get("count", len(data.get("candles", []))),
+            "candles": data.get("candles", []),
         })
 
-    except Exception:
-        app.logger.exception("Erreur pendant la récupération des bougies")
+    except ValueError as exc:
         return jsonify({
             "status": "error",
-            "message": "Impossible de récupérer les bougies."
+            "message": str(exc),
+        }), 502
+
+    except Exception:
+        app.logger.exception("Erreur de récupération des bougies")
+        return jsonify({
+            "status": "error",
+            "message": "Impossible de récupérer les bougies.",
         }), 500
 
 
 def send_telegram(message):
+    """Envoie un message Telegram si les variables Render sont configurées."""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return False
 
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+
     response = requests.post(
         url,
         json={
             "chat_id": TELEGRAM_CHAT_ID,
-            "text": message
+            "text": message,
         },
-        timeout=15
+        timeout=15,
     )
     response.raise_for_status()
     return True
+
+
+@app.get("/analyze")
+def analyze():
+    symbol = request.args.get("symbol", "R_100").strip().upper()
+    timeframe = request.args.get("timeframe", "H1").strip().upper()
+
+    try:
+        count = int(request.args.get("count", "100"))
+    except ValueError:
+        return jsonify({
+            "status": "error",
+            "message": "count doit être un entier.",
+        }), 400
+
+    if symbol not in ALLOWED_SYMBOLS:
+        return jsonify({
+            "status": "error",
+            "message": "Indice non autorisé.",
+        }), 400
+
+    if timeframe not in ALLOWED_TIMEFRAMES:
+        return jsonify({
+            "status": "error",
+            "message": "Unité autorisée : H1, H2, H4 ou D1.",
+        }), 400
+
+    if not 30 <= count <= 200:
+        return jsonify({
+            "status": "error",
+            "message": "Pour l'analyse, count doit être entre 30 et 200.",
+        }), 400
+
+    try:
+        data = fetch_candles(symbol, timeframe, count)
+        candles_data = data.get("candles", [])
+
+        if len(candles_data) < 30:
+            return jsonify({
+                "status": "error",
+                "message": "Pas assez de bougies pour analyser ce marché.",
+                "received": len(candles_data),
+            }), 422
+
+        analysis = analyze_candles(candles_data)
+
+        return jsonify({
+            "status": "ok",
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "analysis": analysis,
+            "note": (
+                "Analyse technique indicative. "
+                "Aucun ordre n'est exécuté automatiquement."
+            ),
+        })
+
+    except ValueError as exc:
+        return jsonify({
+            "status": "error",
+            "message": str(exc),
+        }), 502
+
+    except Exception:
+        app.logger.exception("Erreur pendant l'analyse")
+        return jsonify({
+            "status": "error",
+            "message": "Impossible d'analyser cet indice.",
+        }), 500
 
 
 if __name__ == "__main__":
