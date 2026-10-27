@@ -1,7 +1,7 @@
 
 import os
-from flask import Flask, jsonify, request
 import requests
+from flask import Flask, jsonify, request
 
 from deriv_market import get_synthetic_symbols, get_candles
 from analysis_engine import analyze_candles
@@ -31,6 +31,7 @@ def home():
             "/symbols",
             "/candles?symbol=R_100&timeframe=H1&count=50",
             "/analyze?symbol=R_100&timeframe=H1&count=50",
+            "/analyze_multi?symbol=R_100&entry_tf=H1",
         ],
     })
 
@@ -68,7 +69,6 @@ def symbols():
 
 
 def fetch_candles(symbol, timeframe, count):
-    """Récupère les bougies et renvoie une erreur exploitable si nécessaire."""
     data = get_candles(
         symbol=symbol,
         timeframe=timeframe,
@@ -139,7 +139,7 @@ def candles():
 
 
 def send_telegram(message):
-    """Envoie un message Telegram si les variables Render sont configurées."""
+    """Envoie un message Telegram et vérifie la réponse de l'API."""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return False
 
@@ -154,7 +154,9 @@ def send_telegram(message):
         timeout=15,
     )
     response.raise_for_status()
-    return True
+
+    result = response.json()
+    return result.get("ok", False)
 
 
 @app.get("/analyze")
@@ -234,13 +236,13 @@ def analyze_multi():
     if symbol not in ALLOWED_SYMBOLS:
         return jsonify({
             "status": "error",
-            "message": "Indice non autorisé."
+            "message": "Indice non autorisé.",
         }), 400
 
     if entry_tf not in {"H1", "H2"}:
         return jsonify({
             "status": "error",
-            "message": "entry_tf doit être H1 ou H2."
+            "message": "entry_tf doit être H1 ou H2.",
         }), 400
 
     results = {}
@@ -254,7 +256,7 @@ def analyze_multi():
                 return jsonify({
                     "status": "error",
                     "message": f"Pas assez de bougies en {timeframe}.",
-                    "received": len(candles_data)
+                    "received": len(candles_data),
                 }), 422
 
             results[timeframe] = analyze_candles(candles_data)
@@ -266,50 +268,55 @@ def analyze_multi():
             "note": (
                 "Comparaison multi-unités de temps. "
                 "Ce résultat ne constitue pas encore un signal d'entrée."
-            )
+            ),
         })
 
     except ValueError as exc:
         return jsonify({
             "status": "error",
-            "message": str(exc)
+            "message": str(exc),
         }), 502
 
     except Exception:
         app.logger.exception("Erreur d'analyse multi-unités")
         return jsonify({
             "status": "error",
-            "message": "Échec de l'analyse multi-unités."
+            "message": "Échec de l'analyse multi-unités.",
         }), 500
-    
+
 
 @app.get("/telegram_test")
 def telegram_test():
-    test_key = os.environ.get("TELEGRAM_TEST_KEY", "")
-    supplied_key = request.args.get("key", "")
-
-    if not test_key or supplied_key != test_key:
-        return jsonify({
-            "status": "error",
-            "message": "Accès refusé."
-        }), 403
-
+    # Test provisoire : cette route doit être protégée ou retirée après vérification.
     try:
-        send_telegram(
+        if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+            return jsonify({
+                "status": "error",
+                "message": "Variables Telegram manquantes dans Render.",
+            }), 500
+
+        sent = send_telegram(
             "✅ TRADER AI PRO : test Telegram réussi !"
         )
+
+        if not sent:
+            return jsonify({
+                "status": "error",
+                "message": "Telegram n'a pas confirmé l'envoi.",
+            }), 502
+
         return jsonify({
             "status": "ok",
-            "message": "Message de test envoyé à Telegram."
+            "message": "Telegram a confirmé l'envoi du message.",
         })
+
     except Exception:
         app.logger.exception("Échec du test Telegram")
         return jsonify({
             "status": "error",
-            "message": "Échec de l'envoi Telegram."
+            "message": "Échec de l'envoi Telegram.",
         }), 502
 
-@app.get("/telegram_test")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
