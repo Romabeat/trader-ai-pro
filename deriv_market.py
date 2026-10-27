@@ -93,3 +93,90 @@ def get_synthetic_symbols(timeout=12):
         "error": "Connexion Deriv impossible. " + detail,
         "diagnostic": diagnostic,
     }
+
+import time
+import json
+import websocket
+
+GRANULARITY = {
+    "M30": 1800,
+    "H1": 3600,
+    "H2": 7200,
+    "H4": 14400,
+    "D1": 86400,
+}
+
+
+def get_candles(symbol, timeframe="H1", count=50, timeout=8):
+    """Récupère les bougies clôturées d'un indice Deriv."""
+    if not VOLATILITY.match(symbol or ""):
+        return {"error": "Symbole non valide : %s" % symbol}
+
+    if timeframe not in GRANULARITY:
+        return {"error": "Unité de temps non valide : %s" % timeframe}
+
+    url = "wss://ws.derivws.com/websockets/v3?app_id=1089"
+    granularity = GRANULARITY[timeframe]
+    ws = None
+
+    try:
+        ws = websocket.create_connection(url, timeout=timeout)
+        ws.send(json.dumps({
+            "ticks_history": symbol,
+            "adjust_start_time": 1,
+            "count": int(count),
+            "end": "latest",
+            "style": "candles",
+            "granularity": granularity,
+            "req_id": 2,
+        }))
+
+        while True:
+            data = json.loads(ws.recv())
+
+            if data.get("error"):
+                return {
+                    "error": data["error"].get(
+                        "message", "Erreur API Deriv"
+                    )
+                }
+
+            if data.get("msg_type") == "candles":
+                break
+
+        now = time.time()
+        candles = []
+
+        for candle in data.get("candles", []):
+            epoch = int(candle["epoch"])
+
+            if epoch + granularity <= now:
+                candles.append({
+                    "epoch": epoch,
+                    "open": float(candle["open"]),
+                    "high": float(candle["high"]),
+                    "low": float(candle["low"]),
+                    "close": float(candle["close"]),
+                })
+
+        candles.sort(key=lambda candle: candle["epoch"])
+
+        return {
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "count": len(candles),
+            "candles": candles,
+        }
+
+    except Exception as error:
+        return {
+            "error": "%s: %s" % (type(error).__name__, error)
+        }
+
+    finally:
+        if ws is not None:
+            try:
+                ws.close()
+            except Exception:
+                pass
+                       
