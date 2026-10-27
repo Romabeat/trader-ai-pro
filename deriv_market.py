@@ -114,8 +114,7 @@ def get_candles(symbol, timeframe="H1", count=50, timeout=8):
 
     if timeframe not in GRANULARITY:
         return {"error": "Unité de temps non valide : %s" % timeframe}
-
-    url = "wss://ws.derivws.com/websockets/v3?app_id=1089"
+url = "wss://api.derivws.com/trading/v1/options/ws/public"
     granularity = GRANULARITY[timeframe]
     ws = None
 
