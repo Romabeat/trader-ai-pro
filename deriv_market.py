@@ -3,6 +3,7 @@ import json
 import threading
 import time
 import websocket
+print("TEST : le module Deriv est chargé")
 
 APP_ID = "1089"
 WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
