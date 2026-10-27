@@ -283,6 +283,34 @@ def analyze_multi():
         }), 500
     
 
+@app.get("/telegram_test")
+def telegram_test():
+    test_key = os.environ.get("TELEGRAM_TEST_KEY", "")
+    supplied_key = request.args.get("key", "")
+
+    if not test_key or supplied_key != test_key:
+        return jsonify({
+            "status": "error",
+            "message": "Accès refusé."
+        }), 403
+
+    try:
+        send_telegram(
+            "✅ TRADER AI PRO : test Telegram réussi !"
+        )
+        return jsonify({
+            "status": "ok",
+            "message": "Message de test envoyé à Telegram."
+        })
+    except Exception:
+        app.logger.exception("Échec du test Telegram")
+        return jsonify({
+            "status": "error",
+            "message": "Échec de l'envoi Telegram."
+        }), 502
+
+@app.get("/telegram_test")
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
