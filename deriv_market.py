@@ -5,8 +5,7 @@ import time
 import websocket
 
 APP_ID = "1089"
-WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
-
+WS_URL = "wss://ws.binaryws.com/websockets/v3"
 def get_synthetic_symbols(timeout=15):
     """Récupère les symboles synthétiques proposés par Deriv."""
     result = {}
