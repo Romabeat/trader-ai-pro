@@ -1,1 +1,4 @@
-
+Flask
+requests
+websocket-client
+gunicorn
