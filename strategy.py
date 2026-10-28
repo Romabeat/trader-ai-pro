@@ -1,14 +1,14 @@
 
 """TRADER AI PRO - Strategie multi-timeframe.
-Contexte D1, structure H4, setup H1 et confirmation M30.
+Contexte D1, direction H4 et setup H1.
+La confirmation M30 et le RR minimal ne sont pas obligatoires.
 Les signaux sont indicatifs. Aucun ordre n'est execute.
 """
 
-from analysis_engine import analyze_candles, normalize_candles, candle_confirms
+from analysis_engine import analyze_candles, normalize_candles
 
 MIN_CANDLES = 30
 MAX_ENTRY_DRIFT = 0.005
-MIN_RR = 2.9
 
 
 def _get_candles(data):
@@ -23,23 +23,29 @@ def _get_candles(data):
 
 
 def _direction(value):
-    """Convertit les tendances du moteur en BUY, SELL ou NEUTRAL."""
+    """Convertit les tendances en BUY, SELL ou NEUTRAL."""
     if not isinstance(value, str):
         return "NEUTRAL"
 
     value = value.strip().upper()
 
-    if value in ("BUY", "BULLISH", "UP", "LONG", "HAUSSIERE", "HAUSSIER"):
+    if value in (
+        "BUY", "BULLISH", "UP", "LONG",
+        "HAUSSIERE", "HAUSSIER",
+    ):
         return "BUY"
 
-    if value in ("SELL", "BEARISH", "DOWN", "SHORT", "BAISSIERE", "BAISSIER"):
+    if value in (
+        "SELL", "BEARISH", "DOWN", "SHORT",
+        "BAISSIERE", "BAISSIER",
+    ):
         return "SELL"
 
     return "NEUTRAL"
 
 
 def _analyze(candles):
-    """Execute l'analyse technique du moteur."""
+    """Execute l'analyse technique."""
     if len(candles) < MIN_CANDLES:
         return {}
 
@@ -52,7 +58,7 @@ def _analyze(candles):
 
 
 def _extract_setup(result):
-    """Extrait un signal candidat et ses niveaux de prix."""
+    """Extrait et valide le setup H1 produit par le moteur."""
     if not isinstance(result, dict):
         return None
 
@@ -76,11 +82,12 @@ def _extract_setup(result):
     if min(entry, stop_loss, take_profit) <= 0:
         return None
 
-    if direction == "BUY" and not stop_loss < entry < take_profit:
-        return None
-
-    if direction == "SELL" and not take_profit < entry < stop_loss:
-        return None
+    if direction == "BUY":
+        if not stop_loss < entry < take_profit:
+            return None
+    else:
+        if not take_profit < entry < stop_loss:
+            return None
 
     risk = abs(entry - stop_loss)
     reward = abs(take_profit - entry)
@@ -88,10 +95,8 @@ def _extract_setup(result):
     if risk <= 0:
         return None
 
+    # Aucun RR minimal : on calcule simplement le ratio réel.
     rr = reward / risk
-
-    if rr < MIN_RR:
-        return None
 
     return {
         "direction": direction,
@@ -114,21 +119,19 @@ def find_signals(
     price_now=None,
     m30=None,
 ):
-    """Recherche un signal concordant entre D1, H4, H1 et M30."""
+    """Recherche un setup H1 concordant avec H4 et D1.
+    M30 est facultatif et aucune confirmation M30 n'est exigée.
+    Aucun ratio Reward/Risk minimal n'est impose.
+    """
 
     candles_h1 = _get_candles(h1)
     candles_h4 = _get_candles(h4)
     candles_d1 = _get_candles(d1)
-    candles_m30 = _get_candles(m30)
 
+    # Seuls H1, H4 et D1 sont obligatoires.
     if any(
         len(candles) < MIN_CANDLES
-        for candles in (
-            candles_h1,
-            candles_h4,
-            candles_d1,
-            candles_m30,
-        )
+        for candles in (candles_h1, candles_h4, candles_d1)
     ):
         return []
 
@@ -140,33 +143,33 @@ def find_signals(
     direction_h4 = _direction(analysis_h4.get("trend"))
     direction_h1 = _direction(analysis_h1.get("trend"))
 
-    # H4 doit donner une direction exploitable.
+    # H4 doit fournir une direction exploitable.
     if direction_h4 not in ("BUY", "SELL"):
         return []
 
-    # D1 ne doit pas contredire H4.
-    if direction_d1 in ("BUY", "SELL") and direction_d1 != direction_h4:
+    # D1 ne doit pas contredire H4 lorsqu'il donne une direction claire.
+    if (
+        direction_d1 in ("BUY", "SELL")
+        and direction_d1 != direction_h4
+    ):
         return []
 
     # H1 doit être dans le même sens que H4.
     if direction_h1 != direction_h4:
         return []
 
-    # Le moteur H1 doit produire un véritable setup technique.
+    # Le moteur H1 doit fournir un setup avec des niveaux valides.
     setup = _extract_setup(analysis_h1)
 
-    if setup is None or setup["direction"] != direction_h4:
+    if setup is None:
         return []
 
-    # Confirmation par la dernière bougie M30 disponible.
-    last_m30 = candles_m30[-1]
-
-    if not candle_confirms(last_m30, direction_h4):
+    if setup["direction"] != direction_h4:
         return []
 
     entry = setup["entry"]
 
-    # Refuse une entrée trop éloignée du prix actuel fourni.
+    # Si un prix actuel est fourni, éviter une entrée trop éloignée.
     if price_now is not None:
         try:
             current_price = float(price_now)
@@ -181,34 +184,34 @@ def find_signals(
         if drift > MAX_ENTRY_DRIFT:
             return []
 
-    # Vérifie à nouveau la géométrie des niveaux.
     stop_loss = setup["stop_loss"]
     take_profit = setup["take_profit"]
+
     risk = abs(entry - stop_loss)
     reward = abs(take_profit - entry)
 
-    if risk <= 0 or reward / risk < MIN_RR:
+    if risk <= 0:
         return []
 
-    signal = {
+    rr = reward / risk
+
+    return [{
         "symbol": symbol,
         "direction": setup["direction"],
         "signal": setup["direction"],
         "entry": entry,
         "stop_loss": stop_loss,
         "take_profit": take_profit,
-        "rr": round(reward / risk, 2),
+        "rr": round(rr, 2),
         "timeframe": "H1",
-        "confirmation_timeframe": "M30",
+        "confirmation_timeframe": "Aucune confirmation M30 obligatoire",
         "trend_h4": direction_h4,
         "trend_d1": direction_d1,
         "trend_h1": direction_h1,
         "status": "CONFIRMED",
         "reason": setup["reason"],
         "bar_time": setup["bar_time"],
-    }
-
-    return [signal]
+    }]
 
 
 def format_message(signal):
@@ -217,13 +220,15 @@ def format_message(signal):
         return "Signal invalide."
 
     symbol = signal.get("symbol", "Inconnu")
-    direction = signal.get("direction", signal.get("signal", "UNKNOWN"))
+    direction = signal.get(
+        "direction",
+        signal.get("signal", "UNKNOWN"),
+    )
 
     entry = signal.get("entry")
     stop_loss = signal.get("stop_loss")
     take_profit = signal.get("take_profit")
     rr = signal.get("rr", "N/A")
-
     reason = signal.get("reason", "")
 
     message = (
@@ -235,13 +240,14 @@ def format_message(signal):
         f"Stop Loss : {stop_loss}\n"
         f"Take Profit : {take_profit}\n"
         f"Risk/Reward : 1:{rr}\n"
-        "Analyse : D1 + H4 + H1 + M30\n"
-        "Statut : signal technique indicatif\n"
-        "Aucun ordre execute."
+        "Analyse : D1 + H4 + H1\n"
+        "Confirmation M30 : non obligatoire\n"
+        "RR minimal : aucun\n"
+        "Signal indicatif - aucun ordre execute."
     )
 
     if reason:
         message += f"\nConfluences : {reason}"
 
     return message
-    
+        
