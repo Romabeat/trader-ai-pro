@@ -1,6 +1,6 @@
 name: TRADER AI PRO - Analyse automatique
 
-on:
+'on':
 workflow_dispatch:
 schedule:
 - cron: "17,47 * * * *"
