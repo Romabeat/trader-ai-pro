@@ -1,16 +1,33 @@
 
-
-name: Test GitHub Actions
+name: TRADER AI PRO - Analyse automatique
 
 on:
-  push:
-    branches:
-      - main
   workflow_dispatch:
+  schedule:
+    - cron: "0 */4 * * *"
+
+permissions:
+  contents: read
 
 jobs:
-  test:
+  analysis:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+
     steps:
-      - name: Verifier le fonctionnement
-        run: echo "GitHub Actions fonctionne"
+      - name: Recuperer le code
+        uses: actions/checkout@v4
+
+      - name: Installer Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Installer les dependances
+        run: pip install -r requirements.txt
+
+      - name: Lancer l'analyse
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python scheduled_analysis.py
