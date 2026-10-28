@@ -15,32 +15,39 @@ RR_RATIO = 3.0
 
 
 def valid_candle(candle):
+    """Vérifie qu'une bougie a des prix cohérents."""
     try:
-        values = [
+        o, h, l, c = (
             float(candle[k])
             for k in ("open", "high", "low", "close")
-        ]
-        return (
-            all(isfinite(v) and v > 0 for v in values)
-            and candle["high"] >= max(candle["open"], candle["close"])
-            and candle["low"] <= min(candle["open"], candle["close"])
         )
     except (KeyError, TypeError, ValueError):
         return False
 
+    return (
+        all(isfinite(v) and v > 0 for v in (o, h, l, c))
+        and h >= max(o, c)
+        and l <= min(o, c)
+    )
+
 
 def normalize_candles(candles):
+    """Nettoie les bougies et les trie de la plus ancienne à la plus récente."""
     result = []
-    for candle in candles:
-        if not valid_candle(candle):
+    for candle in candles or []:
+        if not isinstance(candle, dict) or not valid_candle(candle):
             continue
         result.append({
-            "epoch": candle.get("epoch"),
+            "epoch": candle.get("epoch", candle.get("time")),
             "open": float(candle["open"]),
             "high": float(candle["high"]),
             "low": float(candle["low"]),
             "close": float(candle["close"]),
         })
+
+    if result and all(c["epoch"] is not None for c in result):
+        result.sort(key=lambda c: c["epoch"])
+
     return result
 
 
@@ -308,57 +315,6 @@ def analyze_candles(raw_candles):
         "status": "OK",
         "candle_count": len(candles),
     }
-nsi confirmer un retest.
-    for i in range(len(recent) - 2, 0, -1):
-        origin = recent[i - 1]
-        impulse = recent[i]
-
-        oo = float(origin["open"])
-        oc = float(origin["close"])
-        io = float(impulse["open"])
-        ic = float(impulse["close"])
-
-        origin_body = abs(oc - oo)
-        impulse_body = abs(ic - io)
-
-        if origin_body <= 0:
-            continue
-
-        if impulse_body < IMPULSE_BODY_RATIO * origin_body:
-            continue
-
-        # Bougie baissière suivie d'une impulsion haussière.
-        if oc < oo and ic > io:
-            blocks.append({
-                "type": "Order Block haussier potentiel",
-                "direction": "BUY",
-                "low": min(oo, oc),
-                "high": max(oo, oc),
-                "origin_index": i - 1,
-                "impulse_index": i,
-            })
-
-        # Bougie haussière suivie d'une impulsion baissière.
-        elif oc > oo and ic < io:
-            blocks.append({
-                "type": "Order Block baissier potentiel",
-                "direction": "SELL",
-                "low": min(oo, oc),
-                "high": max(oo, oc),
-                "origin_index": i - 1,
-                "impulse_index": i,
-            })
-
-    return blocks
-
-
-def find_order_block(candles, lookback=OB_LOOKBACK):
-    """Renvoie l'Order Block candidat le plus récent."""
-    blocks = find_order_blocks(candles, lookback)
-
-    return blocks[0] if blocks else None
-
-
 def find_supply_demand_zones(candles, lookback=30):
     """Expose les Order Blocks sous forme de zones d'offre/demande."""
     zones = []
