@@ -1,377 +1,314 @@
 
-from statistics import mean
+"""
+TRADER AI PRO - Moteur d'analyse
+Strategie : trendlines, supports/resistances et order blocks.
+Aucun ordre n'est envoyé par ce fichier.
+"""
 
-# ============================================================
-# TRADER AI PRO — MOTEUR D'ANALYSE
-# Order Blocks + Support/Résistance + Liquidité + Trendline
-# ============================================================
-#
-# ATTENTION :
-# PIP_SIZE est provisoire. Il faut vérifier la cotation de
-# chaque indice avant toute utilisation réelle.
-#
-# Le moteur produit des signaux indicatifs, pas des garanties.
-# ============================================================
+from math import isfinite
 
-PIP_SIZE = 0.01
-SL_BUFFER_PIPS = 20
-RISK_REWARD_RATIO = 3.0
 
 MIN_CANDLES = 30
-OB_LOOKBACK = 50
-SR_LOOKBACK = 50
-LIQUIDITY_LOOKBACK = 50
-SWEEP_LOOKBACK = 20
-EQUAL_LEVEL_TOLERANCE = 0.001
-IMPULSE_BODY_RATIO = 1.5
+PIVOT_RADIUS = 2
+ZONE_LOOKBACK = 40
+RR_RATIO = 3.0
 
 
-# ------------------------------------------------------------
-# OUTILS DE BASE
-# ------------------------------------------------------------
+def valid_candle(candle):
+    try:
+        values = [
+            float(candle[k])
+            for k in ("open", "high", "low", "close")
+        ]
+        return (
+            all(isfinite(v) and v > 0 for v in values)
+            and candle["high"] >= max(candle["open"], candle["close"])
+            and candle["low"] <= min(candle["open"], candle["close"])
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def normalize_candles(candles):
+    result = []
+    for candle in candles:
+        if not valid_candle(candle):
+            continue
+        result.append({
+            "epoch": candle.get("epoch"),
+            "open": float(candle["open"]),
+            "high": float(candle["high"]),
+            "low": float(candle["low"]),
+            "close": float(candle["close"]),
+        })
+    return result
+
 
 def candle_trend(candles):
-    """Estime la tendance à partir des clôtures récentes."""
-    if len(candles) < 30:
-        return "Données insuffisantes"
-
-    closes = [float(c["close"]) for c in candles]
-    recent_avg = mean(closes[-20:])
-    previous_avg = mean(closes[-30:-10])
-
-    if recent_avg > previous_avg:
-        return "Haussière"
-    if recent_avg < previous_avg:
-        return "Baissière"
-
-    return "Neutre"
-
-
-def find_trendline(candles, lookback=30):
-    """
-    Donne un contexte directionnel approximatif.
-    Cette fonction ne bloque pas les trades à contre-tendance.
-    """
     if len(candles) < 10:
-        return {"direction": "Indéterminée"}
+        return "INCONNU"
 
-    recent = candles[-min(lookback, len(candles)):]
-    half = len(recent) // 2
+    recent = candles[-10:]
+    first = recent[0]["close"]
+    last = recent[-1]["close"]
+    middle = sum(c["close"] for c in recent) / len(recent)
 
-    first = recent[:half]
-    second = recent[half:]
-
-    first_lows = mean(float(c["low"]) for c in first)
-    second_lows = mean(float(c["low"]) for c in second)
-    first_highs = mean(float(c["high"]) for c in first)
-    second_highs = mean(float(c["high"]) for c in second)
-
-    if second_lows > first_lows and second_highs > first_highs:
-        direction = "Haussière"
-    elif second_lows < first_lows and second_highs < first_highs:
-        direction = "Baissière"
-    else:
-        direction = "Latérale ou incertaine"
-
-    return {"direction": direction}
+    if last > first and last > middle:
+        return "HAUSSIERE"
+    if last < first and last < middle:
+        return "BAISSIERE"
+    return "LATERALE"
 
 
-def find_support_resistance(candles, window=SR_LOOKBACK):
-    """Repère les extrêmes récents comme niveaux potentiels."""
-    if len(candles) < 2:
-        return None, None
+def find_pivots(candles, kind):
+    pivots = []
+    radius = PIVOT_RADIUS
 
-    recent = candles[-min(window, len(candles)):]
+    for i in range(radius, len(candles) - radius):
+        value = candles[i][kind]
+        left = candles[i - radius:i]
+        right = candles[i + 1:i + radius + 1]
 
-    support = min(float(c["low"]) for c in recent)
-    resistance = max(float(c["high"]) for c in recent)
+        if kind == "high":
+            is_pivot = (
+                all(value >= c["high"] for c in left)
+                and all(value > c["high"] for c in right)
+            )
+        else:
+            is_pivot = (
+                all(value <= c["low"] for c in left)
+                and all(value < c["low"] for c in right)
+            )
 
-    return support, resistance
+        if is_pivot:
+            pivots.append((i, value))
 
-
-def find_swing_levels(candles, lookback=SR_LOOKBACK):
-    """Repère des sommets et creux locaux potentiels."""
-    recent = candles[-min(lookback, len(candles)):]
-
-    swing_highs = []
-    swing_lows = []
-
-    if len(recent) < 5:
-        return swing_highs, swing_lows
-
-    for i in range(2, len(recent) - 2):
-        high = float(recent[i]["high"])
-        low = float(recent[i]["low"])
-
-        left_highs = [
-            float(c["high"]) for c in recent[i - 2:i]
-        ]
-        right_highs = [
-            float(c["high"]) for c in recent[i + 1:i + 3]
-        ]
-
-        left_lows = [
-            float(c["low"]) for c in recent[i - 2:i]
-        ]
-        right_lows = [
-            float(c["low"]) for c in recent[i + 1:i + 3]
-        ]
-
-        if high > max(left_highs) and high >= max(right_highs):
-            swing_highs.append(high)
-
-        if low < min(left_lows) and low <= min(right_lows):
-            swing_lows.append(low)
-
-    return swing_highs, swing_lows
+    return pivots
 
 
-def detect_candle_reversal(candles):
-    """Détecte des configurations simples de retournement."""
-    if len(candles) < 2:
+def find_trendline(candles, direction):
+    kind = "low" if direction == "BUY" else "high"
+    pivots = find_pivots(candles[:-1], kind)
+
+    if len(pivots) < 2:
         return None
 
-    prev, last = candles[-2], candles[-1]
+    first_i, first_price = pivots[-2]
+    second_i, second_price = pivots[-1]
 
-    po = float(prev["open"])
-    pc = float(prev["close"])
-    o = float(last["open"])
-    c = float(last["close"])
-    h = float(last["high"])
-    l = float(last["low"])
+    if direction == "BUY" and second_price <= first_price:
+        return None
+    if direction == "SELL" and second_price >= first_price:
+        return None
 
-    body = abs(c - o)
-    upper_wick = h - max(o, c)
-    lower_wick = min(o, c) - l
+    slope = (
+        (second_price - first_price)
+        / (second_i - first_i)
+    )
+    projected = second_price + slope * (
+        len(candles) - 1 - second_i
+    )
 
-    if pc < po and c > o and c >= po and o <= pc:
-        return "Possible retournement haussier"
+    return {
+        "direction": direction,
+        "price": projected,
+        "pivot_1": first_price,
+        "pivot_2": second_price,
+    }
 
-    if pc > po and c < o and c <= po and o >= pc:
-        return "Possible retournement baissier"
 
-    if body > 0 and lower_wick >= 2 * body:
-        return "Rejet possible vers le haut"
+def find_support_resistance(candles):
+    highs = find_pivots(candles[:-1], "high")
+    lows = find_pivots(candles[:-1], "low")
+    current = candles[-1]["close"]
 
-    if body > 0 and upper_wick >= 2 * body:
-        return "Rejet possible vers le bas"
+    supports = [
+        price for _, price in lows if price < current
+    ]
+    resistances = [
+        price for _, price in highs if price > current
+    ]
+
+    return {
+        "support": max(supports) if supports else None,
+        "resistance": min(resistances) if resistances else None,
+    }
+
+
+def find_order_block(candles, direction):
+    """
+    Recherche simple d'une bougie opposée suivie d'un mouvement
+    impulsif. C'est une zone candidate, pas une garantie de réaction.
+    """
+    start = max(1, len(candles) - ZONE_LOOKBACK - 1)
+
+    for i in range(len(candles) - 2, start - 1, -1):
+        origin = candles[i]
+        impulse = candles[i + 1]
+        later = candles[i + 2:]
+
+        if direction == "BUY":
+            opposite = origin["close"] < origin["open"]
+            displacement = (
+                impulse["close"] > impulse["open"]
+                and impulse["close"] > origin["high"]
+            )
+            retest = any(
+                c["low"] <= origin["high"]
+                and c["high"] >= origin["low"]
+                for c in later
+            )
+        else:
+            opposite = origin["close"] > origin["open"]
+            displacement = (
+                impulse["close"] < impulse["open"]
+                and impulse["close"] < origin["low"]
+            )
+            retest = any(
+                c["high"] >= origin["low"]
+                and c["low"] <= origin["high"]
+                for c in later
+            )
+
+        if opposite and displacement and retest:
+            return {
+                "type": "OB_ACHAT" if direction == "BUY" else "OB_VENTE",
+                "low": origin["low"],
+                "high": origin["high"],
+                "index": i,
+            }
 
     return None
 
 
-# ------------------------------------------------------------
-# LIQUIDITÉ : EQH, EQL ET SWEEPS
-# ------------------------------------------------------------
+def candle_confirms(candle, direction):
+    body = abs(candle["close"] - candle["open"])
+    full_range = candle["high"] - candle["low"]
 
-def find_equal_levels(
-    candles,
-    lookback=LIQUIDITY_LOOKBACK,
-    tolerance=EQUAL_LEVEL_TOLERANCE,
-):
-    """
-    Repère les Equal Highs (EQH) et Equal Lows (EQL).
+    if full_range <= 0:
+        return False
 
-    Ce sont des niveaux de liquidité potentielle, pas une
-    observation directe des ordres réellement présents.
-    """
-    if len(candles) < 3:
-        return {"equal_highs": [], "equal_lows": []}
+    if direction == "BUY":
+        return (
+            candle["close"] > candle["open"]
+            and candle["close"] >= candle["low"] + full_range * 0.6
+            and body >= full_range * 0.2
+        )
 
-    recent = candles[-min(lookback, len(candles)):]
-
-    def cluster_levels(values):
-        values = sorted(float(v) for v in values)
-        clusters = []
-
-        for value in values:
-            if not clusters:
-                clusters.append([value])
-                continue
-
-            center = mean(clusters[-1])
-            scale = max(abs(center), abs(value), 1e-9)
-
-            if abs(value - center) / scale <= tolerance:
-                clusters[-1].append(value)
-            else:
-                clusters.append([value])
-
-        levels = [
-            round(mean(cluster), 5)
-            for cluster in clusters
-            if len(cluster) >= 2
-        ]
-
-        return sorted(set(levels))
-
-    return {
-        "equal_highs": cluster_levels(
-            [c["high"] for c in recent]
-        ),
-        "equal_lows": cluster_levels(
-            [c["low"] for c in recent]
-        ),
-    }
+    return (
+        candle["close"] < candle["open"]
+        and candle["close"] <= candle["high"] - full_range * 0.6
+        and body >= full_range * 0.2
+    )
 
 
-def detect_liquidity_sweep(candles, lookback=SWEEP_LOOKBACK):
-    """
-    Détecte un dépassement d'un ancien sommet ou creux,
-    suivi d'une clôture de réintégration.
-    """
-    if len(candles) < 3:
-        return None
-
-    previous = candles[-min(lookback + 1, len(candles)):-1]
-
-    if not previous:
+def build_signal(candles, direction, sr, trendline):
+    zone = find_order_block(candles[:-1], direction)
+    if not zone:
         return None
 
     last = candles[-1]
-
-    prior_high = max(float(c["high"]) for c in previous)
-    prior_low = min(float(c["low"]) for c in previous)
-
-    high = float(last["high"])
-    low = float(last["low"])
-    close = float(last["close"])
-
-    if high > prior_high and close < prior_high:
-        return {
-            "type": "BSL balayée puis réintégrée",
-            "niveau": prior_high,
-            "direction_potentielle": "Baissière",
-        }
-
-    if low < prior_low and close > prior_low:
-        return {
-            "type": "SSL balayée puis réintégrée",
-            "niveau": prior_low,
-            "direction_potentielle": "Haussière",
-        }
-
-    return None
-
-
-def find_recent_sweeps(candles, bars=10):
-    """Recherche les sweeps récents sans se limiter à la dernière bougie."""
-    sweeps = []
-    start = max(2, len(candles) - bars)
-
-    for end in range(start, len(candles)):
-        sweep = detect_liquidity_sweep(candles[:end + 1])
-
-        if sweep:
-            sweeps.append(sweep)
-
-    return sweeps
-
-
-def level_near_zone(level, zone, tolerance):
-    """Vérifie si un niveau se trouve dans ou près d'une zone."""
-    return (
-        float(zone["low"]) - tolerance
-        <= float(level)
-        <= float(zone["high"]) + tolerance
+    touched = (
+        last["low"] <= zone["high"]
+        and last["high"] >= zone["low"]
     )
+    if not touched or not candle_confirms(last, direction):
+        return None
 
+    support = sr["support"]
+    resistance = sr["resistance"]
+    midpoint = (zone["low"] + zone["high"]) / 2
 
-def has_liquidity_context(
-    candles,
-    zone,
-    direction,
-    entry,
-    equal_levels=None,
-):
-    """
-    Cherche un indice de liquidité pertinent :
-    - EQH près d'une zone de SELL ;
-    - EQL près d'une zone de BUY ;
-    - sweep récent dans le sens du retournement ;
-    - ou une cible de liquidité potentielle devant le prix.
-    """
-    if equal_levels is None:
-        equal_levels = find_equal_levels(candles[:-1])
-
-    width = max(
-        float(zone["high"]) - float(zone["low"]),
-        abs(float(entry)) * 0.0005,
-    )
-    tolerance = max(width * 2, abs(float(entry)) * 0.001)
-
-    sweeps = find_recent_sweeps(candles[:-1])
-
-    if direction == "SELL":
-        relevant_levels = equal_levels["equal_highs"]
-
-        nearby_eqh = any(
-            level_near_zone(level, zone, tolerance)
-            for level in relevant_levels
-        )
-
-        matching_sweep = any(
-            sweep["direction_potentielle"] == "Baissière"
-            for sweep in sweeps
-        )
-
-        target_liquidity = any(
-            level < entry and level < zone["low"]
-            for level in equal_levels["equal_lows"]
-        )
-
+    # Confluence simple avec support/résistance.
+    tolerance = (zone["high"] - zone["low"]) * 1.5
+    if direction == "BUY":
+        confluence = support is not None and abs(support - midpoint) <= tolerance
     else:
-        relevant_levels = equal_levels["equal_lows"]
+        confluence = resistance is not None and abs(resistance - midpoint) <= tolerance
 
-        nearby_eql = any(
-            level_near_zone(level, zone, tolerance)
-            for level in relevant_levels
-        )
+    if not confluence:
+        return None
 
-        matching_sweep = any(
-            sweep["direction_potentielle"] == "Haussière"
-            for sweep in sweeps
-        )
+    # Trendline contextuelle : elle ne suffit pas à déclencher un signal.
+    if trendline is not None:
+        if direction == "BUY" and last["close"] < trendline["price"]:
+            return None
+        if direction == "SELL" and last["close"] > trendline["price"]:
+            return None
 
-        target_liquidity = any(
-            level > entry and level > zone["high"]
-            for level in equal_levels["equal_highs"]
-        )
+    entry = last["close"]
+    zone_size = zone["high"] - zone["low"]
+    buffer = max(zone_size * 0.1, entry * 0.0001)
 
-        nearby_eqh = False
-        nearby_eql = nearby_eql
-
-    if direction == "SELL":
-        nearby_level = nearby_eqh
+    if direction == "BUY":
+        stop = zone["low"] - buffer
+        risk = entry - stop
+        if risk <= 0:
+            return None
+        target = entry + RR_RATIO * risk
     else:
-        nearby_level = nearby_eql
+        stop = zone["high"] + buffer
+        risk = stop - entry
+        if risk <= 0:
+            return None
+        target = entry - RR_RATIO * risk
 
     return {
-        "valid": nearby_level or matching_sweep or target_liquidity,
-        "nearby_equal_level": nearby_level,
-        "matching_sweep": matching_sweep,
-        "target_liquidity": target_liquidity,
+        "direction": direction,
+        "entry": entry,
+        "stop_loss": stop,
+        "take_profit": target,
+        "zone": zone,
+        "zone_low": zone["low"],
+        "zone_high": zone["high"],
+        "zone_type": zone["type"],
+        "reason": "OB retest + confirmation + confluence S/R",
+        "risk_reward": RR_RATIO,
     }
 
 
-# ------------------------------------------------------------
-# ORDER BLOCKS ET ZONES D'OFFRE / DEMANDE
-# ------------------------------------------------------------
+def analyze_candles(raw_candles):
+    candles = normalize_candles(raw_candles)
 
-def find_order_blocks(candles, lookback=OB_LOOKBACK):
-    """
-    Recherche les bougies opposées précédant une impulsion.
+    if len(candles) < MIN_CANDLES:
+        return {
+            "trend": "INCONNU",
+            "support": None,
+            "resistance": None,
+            "trendline": None,
+            "order_block": None,
+            "signal": None,
+            "status": "DONNEES_INSUFFISANTES",
+            "candle_count": len(candles),
+        }
 
-    Les zones sont des candidates : elles ne sont pas toutes
-    nécessairement valides ou encore exploitables.
-    """
-    if len(candles) < 3:
-        return []
+    trend = candle_trend(candles)
+    sr = find_support_resistance(candles)
+    buy_line = find_trendline(candles, "BUY")
+    sell_line = find_trendline(candles, "SELL")
 
-    recent = candles[-min(lookback, len(candles)):]
-    blocks = []
+    signal = None
+    order_block = None
 
-    # L'impulsion doit être suivie d'au moins une bougie :
-    # la dernière bougie pourra ainsi confirmer un retest.
+    # Le contexte de tendance filtre la direction.
+    if trend == "HAUSSIERE":
+        order_block = find_order_block(candles[:-1], "BUY")
+        signal = build_signal(candles, "BUY", sr, buy_line)
+    elif trend == "BAISSIERE":
+        order_block = find_order_block(candles[:-1], "SELL")
+        signal = build_signal(candles, "SELL", sr, sell_line)
+
+    return {
+        "trend": trend,
+        "support": sr["support"],
+        "resistance": sr["resistance"],
+        "trendline": buy_line or sell_line,
+        "order_block": order_block,
+        "signal": signal,
+        "status": "OK",
+        "candle_count": len(candles),
+    }
+nsi confirmer un retest.
     for i in range(len(recent) - 2, 0, -1):
         origin = recent[i - 1]
         impulse = recent[i]
