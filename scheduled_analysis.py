@@ -6,7 +6,23 @@ from analysis_engine import analyze_candles
 
 TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+# Sécurité : le mode test reste actif sauf si DRY_RUN vaut exactement "false".
+DRY_RUN = os.environ.get("DRY_RUN", "true").strip().lower() != "false"
+
+EXPECTED_TREND = {"BUY": "HAUSSIERE", "SELL": "BAISSIERE"}
+OPPOSITE_TREND = {"BUY": "BAISSIERE", "SELL": "HAUSSIERE"}
+
+
+def context_ok(signal, daily, h4):
+    """D1 ne doit pas être opposé ; H4 doit confirmer la direction."""
+    direction = signal.get("direction")
+    if direction not in EXPECTED_TREND:
+        return False, "direction inconnue"
+    if daily.get("trend") == OPPOSITE_TREND[direction]:
+        return False, "D1 opposé au signal"
+    if h4.get("trend") != EXPECTED_TREND[direction]:
+        return False, "H4 ne confirme pas la direction"
+    return True, "contexte D1/H4 compatible"
 
 SYMBOLS = [
     "1HZ10V",
@@ -151,6 +167,12 @@ def main():
                 )
 
                 if isinstance(candles_data, dict):
+                    if candles_data.get("error"):
+                        errors_found += 1
+                        print(
+                            f"[ERREUR DONNÉES] {symbol} | {timeframe} | "
+                            f"{candles_data['error']}"
+                        )
                     candles = candles_data.get("candles", [])
                 else:
                     candles = candles_data or []
@@ -184,18 +206,15 @@ def main():
         signal = h1.get("signal")
 
         if signal:
-            signals_found += 1
-            message = format_signal(symbol, daily, h4, h1, signal)
-            print("[SIGNAL RETENU] Signal H1 trouvé.")
-
-            if daily.get("trend") not in ("INCONNU", "LATERALE"):
-                if daily.get("trend") != h4.get("trend"):
-                    print(
-                        "[AVERTISSEMENT] Les tendances D1 et H4 "
-                        "ne concordent pas."
-                    )
-
-            send_telegram(message)
+            ok, why = context_ok(signal, daily, h4)
+            if not ok:
+                print(f"[SIGNAL REJETÉ] {symbol} : {why}.")
+            else:
+                signals_found += 1
+                print(f"[SIGNAL RETENU] {symbol} : {why}.")
+                send_telegram(
+                    format_signal(symbol, daily, h4, h1, signal)
+                )
         else:
             print(
                 f"[RÉSULTAT] {symbol} : aucun signal H1 "
