@@ -5,6 +5,7 @@ import time
 
 import websocket
 
+
 URLS = [
     "wss://api.derivws.com/trading/v1/options/ws/public",
     "wss://ws.derivws.com/websockets/v3?app_id=1089",
@@ -13,6 +14,7 @@ URLS = [
 
 VOLATILITY = re.compile(r"^(R_\d+|1HZ\d+V)$")
 MAX_PER_ENDPOINT = 8
+MAX_CANDLES = 5000
 
 GRANULARITY = {
     "M30": 1800,
@@ -27,49 +29,91 @@ def _label(url):
     return url.split("?")[0].replace("wss://", "")
 
 
+def _close_socket(ws):
+    if ws is not None:
+        try:
+            ws.close()
+        except Exception:
+            pass
+
+
+def _receive_response(ws, expected_type, timeout):
+    """
+    Attend le type de réponse demandé.
+    Retourne une erreur si l'API signale un problème
+    ou si le délai expire.
+    """
+    deadline = time.monotonic() + timeout
+
+    while time.monotonic() < deadline:
+        try:
+            data = json.loads(ws.recv())
+        except websocket.WebSocketTimeoutException:
+            break
+        except json.JSONDecodeError:
+            continue
+
+        if not isinstance(data, dict):
+            continue
+
+        if data.get("error"):
+            error = data["error"]
+            message = error.get("message", "Erreur API Deriv")
+            return None, message
+
+        if data.get("msg_type") == expected_type:
+            return data, None
+
+    return None, (
+        "Délai dépassé en attendant la réponse "
+        + expected_type
+    )
+
+
 def fetch_active_symbols(url, timeout):
     result = {"endpoint": _label(url)}
     ws = None
 
     try:
-        ws = websocket.create_connection(url, timeout=timeout)
+        ws = websocket.create_connection(
+            url,
+            timeout=timeout,
+        )
+
         ws.send(json.dumps({
             "active_symbols": "brief",
             "req_id": 1,
         }))
 
-        while True:
-            data = json.loads(ws.recv())
+        data, error = _receive_response(
+            ws,
+            "active_symbols",
+            timeout,
+        )
 
-            if data.get("error"):
-                result["error"] = data["error"].get(
-                    "message", "Erreur API"
-                )
-                break
+        if error:
+            result["error"] = error
+        else:
+            result["status"] = "ok"
+            result["raw"] = data.get("active_symbols", [])
 
-            if data.get("msg_type") == "active_symbols":
-                result["status"] = "ok"
-                result["raw"] = data.get("active_symbols", [])
-                break
+    except websocket.WebSocketBadStatusException as error:
+        result["error"] = "HTTP %s" % error.status_code
 
-    except websocket.WebSocketBadStatusException as e:
-        result["error"] = "HTTP %s" % e.status_code
-
-    except Exception as e:
-        result["error"] = "%s: %s" % (type(e).__name__, e)
+    except Exception as error:
+        result["error"] = (
+            "%s: %s" % (type(error).__name__, error)
+        )
 
     finally:
-        if ws is not None:
-            try:
-                ws.close()
-            except Exception:
-                pass
+        _close_socket(ws)
 
     print(
         "WS_TEST_RESULT:",
         result["endpoint"],
-        result.get("status") or result.get("error")
+        result.get("status") or result.get("error"),
     )
+
     return result
 
 
@@ -85,9 +129,15 @@ def get_synthetic_symbols(timeout=12):
             symbols = []
 
             for item in raw:
-                code = item.get("underlying_symbol") or item.get("symbol")
+                if not isinstance(item, dict):
+                    continue
 
-                if code and VOLATILITY.match(code):
+                code = (
+                    item.get("underlying_symbol")
+                    or item.get("symbol")
+                )
+
+                if code and VOLATILITY.fullmatch(code):
                     symbols.append({
                         "symbol": code,
                         "name": (
@@ -97,8 +147,21 @@ def get_synthetic_symbols(timeout=12):
                         ),
                     })
 
-            symbols.sort(key=lambda s: s["symbol"])
-            diagnostic.append(result)
+            # Supprime les doublons éventuels.
+            unique = {
+                item["symbol"]: item
+                for item in symbols
+            }
+
+            symbols = sorted(
+                unique.values(),
+                key=lambda item: item["symbol"],
+            )
+
+            diagnostic.append({
+                "endpoint": result["endpoint"],
+                "status": "ok",
+            })
 
             return {
                 "symbols": symbols,
@@ -112,10 +175,10 @@ def get_synthetic_symbols(timeout=12):
 
     detail = " | ".join(
         "%s -> %s" % (
-            d["endpoint"],
-            d.get("error", "échec")
+            item["endpoint"],
+            item.get("error", "échec"),
         )
-        for d in diagnostic
+        for item in diagnostic
     )
 
     return {
@@ -124,91 +187,205 @@ def get_synthetic_symbols(timeout=12):
     }
 
 
-def get_candles(symbol, timeframe="H1", count=50, timeout=8):
-    """Récupère les bougies clôturées d'un indice Deriv."""
+def get_candles(
+    symbol,
+    timeframe="H1",
+    count=50,
+    timeout=8,
+):
+    """
+    Récupère les bougies clôturées d'un indice Deriv.
 
-    if not VOLATILITY.match(symbol or ""):
-        return {"error": "Symbole non valide : %s" % symbol}
+    Format retourné :
+    {
+        "symbol": "...",
+        "timeframe": "H1",
+        "count": 100,
+        "candles": [
+            {
+                "epoch": 1234567890,
+                "open": 1.0,
+                "high": 1.2,
+                "low": 0.9,
+                "close": 1.1
+            }
+        ]
+    }
+    """
+    if not isinstance(symbol, str) or not VOLATILITY.fullmatch(symbol):
+        return {
+            "error": "Symbole non valide : %s" % symbol
+        }
 
     if timeframe not in GRANULARITY:
-        return {"error": "Unité de temps non valide : %s" % timeframe}
-
-    granularity = GRANULARITY[timeframe]
-    ws = None
-    errors = []
-
-    # Essaye les adresses dans l'ordre, comme pour les symboles.
-    for url in URLS:
-        try:
-            ws = websocket.create_connection(url, timeout=timeout)
-            break
-        except Exception as error:
-            errors.append(
-                "%s -> %s: %s"
-                % (_label(url), type(error).__name__, error)
-            )
-
-    if ws is None:
         return {
-            "error": "Connexion WebSocket impossible. " + " | ".join(errors)
+            "error": "Unité de temps non valide : %s" % timeframe
         }
 
     try:
-        ws.send(json.dumps({
-            "ticks_history": symbol,
-            "adjust_start_time": 1,
-            "count": int(count),
-            "end": "latest",
-            "style": "candles",
-            "granularity": granularity,
-            "req_id": 2,
-        }))
+        count = int(count)
+    except (TypeError, ValueError):
+        return {"error": "Le nombre de bougies doit être un entier"}
 
-        while True:
-            data = json.loads(ws.recv())
-
-            if data.get("error"):
-                return {
-                    "error": data["error"].get(
-                        "message", "Erreur API Deriv"
-                    )
-                }
-
-            if data.get("msg_type") == "candles":
-                break
-
-        now = time.time()
-        candles = []
-
-        for candle in data.get("candles", []):
-            epoch = int(candle["epoch"])
-
-            if epoch + granularity <= now:
-                candles.append({
-                    "epoch": epoch,
-                    "open": float(candle["open"]),
-                    "high": float(candle["high"]),
-                    "low": float(candle["low"]),
-                    "close": float(candle["close"]),
-                })
-
-        candles.sort(key=lambda candle: candle["epoch"])
-
+    if count < 1 or count > MAX_CANDLES:
         return {
-            "symbol": symbol,
-            "timeframe": timeframe,
-            "count": len(candles),
-            "candles": candles,
+            "error": (
+                "Nombre de bougies invalide : "
+                "choisir entre 1 et %s" % MAX_CANDLES
+            )
         }
 
-    except Exception as error:
-        return {
-            "error": "%s: %s" % (type(error).__name__, error)
-        }
+    try:
+        timeout = max(1, float(timeout))
+    except (TypeError, ValueError):
+        return {"error": "Délai d'attente invalide"}
 
-    finally:
-        if ws is not None:
-            try:
-                ws.close()
-            except Exception:
-                pass
+    granularity = GRANULARITY[timeframe]
+    errors = []
+
+    # Essaye chaque endpoint jusqu'à obtenir des bougies valides.
+    for url in URLS:
+        ws = None
+
+        try:
+            ws = websocket.create_connection(
+                url,
+                timeout=timeout,
+            )
+
+            ws.send(json.dumps({
+                "ticks_history": symbol,
+                "adjust_start_time": 1,
+                "count": count,
+                "end": "latest",
+                "style": "candles",
+                "granularity": granularity,
+                "req_id": 2,
+            }))
+
+            data, error = _receive_response(
+                ws,
+                "candles",
+                timeout,
+            )
+
+            if error:
+                errors.append(
+                    "%s -> %s" % (_label(url), error)
+                )
+                continue
+
+            raw_candles = data.get("candles", [])
+
+            if not isinstance(raw_candles, list):
+                errors.append(
+                    "%s -> Format des bougies invalide"
+                    % _label(url)
+                )
+                continue
+
+            now = time.time()
+            candles = []
+
+            for candle in raw_candles:
+                try:
+                    epoch = int(candle["epoch"])
+                    open_price = float(candle["open"])
+                    high = float(candle["high"])
+                    low = float(candle["low"])
+                    close = float(candle["close"])
+
+                    values = [
+                        open_price,
+                        high,
+                        low,
+                        close,
+                    ]
+
+                    # Refuse les valeurs non finies ou incohérentes.
+                    if not all(
+                        value == value
+                        and abs(value) != float("inf")
+                        for value in values
+                    ):
+                        continue
+
+                    if min(values) <= 0:
+                        continue
+
+                    if high < max(open_price, close, low):
+                        continue
+
+                    if low > min(open_price, close, high):
+                        continue
+
+                    # Ne conserve que les bougies entièrement clôturées.
+                    if epoch + granularity > now:
+                        continue
+
+                    candles.append({
+                        "epoch": epoch,
+                        "open": open_price,
+                        "high": high,
+                        "low": low,
+                        "close": close,
+                    })
+
+                except (KeyError, TypeError, ValueError, OverflowError):
+                    continue
+
+            # Trie les bougies et élimine les doublons temporels.
+            candles.sort(key=lambda item: item["epoch"])
+
+            unique_candles = {}
+            for candle in candles:
+                unique_candles[candle["epoch"]] = candle
+
+            candles = sorted(
+                unique_candles.values(),
+                key=lambda item: item["epoch"],
+            )
+
+            if not candles:
+                errors.append(
+                    "%s -> Aucune bougie clôturée valide"
+                    % _label(url)
+                )
+                continue
+
+            return {
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "count": len(candles),
+                "candles": candles,
+            }
+
+        except websocket.WebSocketBadStatusException as error:
+            errors.append(
+                "%s -> HTTP %s"
+                % (_label(url), error.status_code)
+            )
+
+        except Exception as error:
+            errors.append(
+                "%s -> %s: %s"
+                % (
+                    _label(url),
+                    type(error).__name__,
+                    str(error)[:150],
+                )
+            )
+
+        finally:
+            _close_socket(ws)
+
+    return {
+        "error": (
+            "Impossible de récupérer les bougies pour "
+            + symbol
+            + " en "
+            + timeframe
+            + ". "
+            + " | ".join(errors)
+        )
+    }
