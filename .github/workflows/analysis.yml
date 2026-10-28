@@ -32,3 +32,4 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python scheduled_analysis.py
         
+# Test de reconnaissance du workflow
