@@ -1,31 +1,47 @@
 name: TRADER AI PRO - Analyse automatique
 
 on:
-  workflow_dispatch:
-  schedule:
-    - cron: "5 */4 * * *"
+workflow_dispatch:
+schedule:
+- cron: "17,47 * * * *"
 
 permissions:
-  contents: read
+contents: read
+
+concurrency:
+group: trader-ai-pro-analysis
+cancel-in-progress: false
 
 jobs:
-  analysis:
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - name: Recuperer le code
-        uses: actions/checkout@v4
-      - name: Installer Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - name: Installer les dependances
-        run: pip install -r requirements.txt
-      - name: Verifier la syntaxe Python
-        run: python -m py_compile analysis_engine.py scheduled_analysis.py deriv_market.py
-      - name: Lancer l'analyse en mode test
-        run: python scheduled_analysis.py
-        env:
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          DRY_RUN: "true"
+analysis:
+runs-on: ubuntu-latest
+timeout-minutes: 25
+
+steps:
+  - name: Recuperer le code
+    uses: actions/checkout@v4
+
+  - name: Installer Python
+    uses: actions/setup-python@v5
+    with:
+      python-version: "3.12"
+
+  - name: Installer les dependances
+    run: |
+      python -m pip install --upgrade pip
+      pip install -r requirements.txt
+
+  - name: Verifier la syntaxe Python
+    run: |
+      python -m py_compile analysis_engine.py
+      python -m py_compile strategy.py
+      python -m py_compile deriv_market.py
+      python -m py_compile scheduled_analysis.py
+      python -m py_compile app.py
+
+  - name: Lancer les analyses en mode test
+    run: python -u scheduled_analysis.py
+    env:
+      TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      DRY_RUN: "true"
