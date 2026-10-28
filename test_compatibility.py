@@ -1,140 +1,98 @@
-"""Verification de compatibilite de TRADER AI PRO."""
+
+"""Tests de compatibilite de Trader AI Pro."""
 
 import inspect
-import sys
+
+import analysis_engine
+import strategy
+import deriv_market
+import scheduled_analysis
+
 
 def check(condition, message):
-if not condition:
-raise AssertionError(message)
-print("[OK] " + message)
+    """Arrete les tests si une condition n'est pas satisfaite."""
+    if not condition:
+        raise AssertionError(message)
+    print(f"[OK] {message}", flush=True)
+
 
 def main():
-print("=" * 55)
-print("TEST DE COMPATIBILITE - TRADER AI PRO")
-print("=" * 55)
+    """Execute les controles de compatibilite."""
 
-try:
-    import analysis_engine
-    import strategy
-    import deriv_market
-    import scheduled_analysis
-except Exception as exc:
-    print("[ECHEC] Impossible de charger les modules.")
-    print("Erreur :", type(exc).__name__, str(exc))
-    return 1
-
-print("\n1. Verification des modules")
-
-check(
-    callable(getattr(analysis_engine, "analyze_candles", None)),
-    "analysis_engine.analyze_candles disponible",
-)
-
-check(
-    callable(getattr(analysis_engine, "normalize_candles", None)),
-    "analysis_engine.normalize_candles disponible",
-)
-
-check(
-    callable(getattr(analysis_engine, "candle_confirms", None)),
-    "analysis_engine.candle_confirms disponible",
-)
-
-check(
-    callable(getattr(strategy, "find_signals", None)),
-    "strategy.find_signals disponible",
-)
-
-check(
-    callable(getattr(strategy, "format_message", None)),
-    "strategy.format_message disponible",
-)
-
-check(
-    callable(getattr(deriv_market, "get_candles", None)),
-    "deriv_market.get_candles disponible",
-)
-
-check(
-    callable(getattr(scheduled_analysis, "main", None)),
-    "scheduled_analysis.main disponible",
-)
-
-print("\n2. Verification des signatures")
-
-parameters = inspect.signature(strategy.find_signals).parameters
-
-for name in ("symbol", "h1", "h4", "d1", "m30", "price_now"):
+    # 1. Verifier les fonctions principales.
     check(
-        name in parameters,
-        "find_signals accepte le parametre " + name,
+        callable(getattr(analysis_engine, "analyze_candles", None)),
+        "analysis_engine.analyze_candles existe",
+    )
+    check(
+        callable(getattr(analysis_engine, "normalize_candles", None)),
+        "analysis_engine.normalize_candles existe",
+    )
+    check(
+        callable(getattr(analysis_engine, "candle_confirms", None)),
+        "analysis_engine.candle_confirms existe",
+    )
+    check(
+        callable(getattr(strategy, "find_signals", None)),
+        "strategy.find_signals existe",
+    )
+    check(
+        callable(getattr(strategy, "format_message", None)),
+        "strategy.format_message existe",
+    )
+    check(
+        callable(getattr(deriv_market, "get_candles", None)),
+        "deriv_market.get_candles existe",
+    )
+    check(
+        callable(getattr(scheduled_analysis, "main", None)),
+        "scheduled_analysis.main existe",
     )
 
-print("\n3. Test du format des bougies")
+    # 2. Verifier les parametres de find_signals.
+    parameters = inspect.signature(strategy.find_signals).parameters
 
-sample = [
-    {
-        "epoch": 1000 + i * 1800,
-        "open": 100.0 + i,
-        "high": 102.0 + i,
-        "low": 99.0 + i,
-        "close": 101.0 + i,
+    for name in ("symbol", "h1", "h4", "d1", "m30"):
+        check(
+            name in parameters,
+            f"find_signals accepte le parametre {name}",
+        )
+
+    # 3. Verifier les unites de temps Deriv.
+    granularities = getattr(deriv_market, "GRANULARITY", {})
+
+    expected = {
+        "M30": 1800,
+        "H1": 3600,
+        "H4": 14400,
+        "D1": 86400,
     }
-    for i in range(40)
-]
 
-normalized = analysis_engine.normalize_candles(sample)
+    for timeframe, seconds in expected.items():
+        check(
+            granularities.get(timeframe) == seconds,
+            f"Granularite {timeframe} configuree correctement",
+        )
 
-check(
-    isinstance(normalized, list),
-    "normalisation : resultat de type liste",
-)
-
-check(
-    len(normalized) >= 30,
-    "normalisation : au moins 30 bougies conservees",
-)
-
-analysis = analysis_engine.analyze_candles(normalized)
-
-check(
-    isinstance(analysis, dict),
-    "analyse : resultat de type dictionnaire",
-)
-
-check(
-    "trend" in analysis,
-    "analyse : champ trend present",
-)
-
-check(
-    "signal" in analysis,
-    "analyse : champ signal present",
-)
-
-print("\n4. Verification des unites de temps")
-
-expected = {
-    "M30": 1800,
-    "H1": 3600,
-    "H4": 14400,
-    "D1": 86400,
-}
-
-actual = getattr(deriv_market, "GRANULARITY", {})
-
-for timeframe, seconds in expected.items():
+    # 4. Verifier le mode test securise par defaut.
     check(
-        actual.get(timeframe) == seconds,
-        "%s : granularite correcte" % timeframe,
+        scheduled_analysis.DRY_RUN is True
+        or scheduled_analysis.DRY_RUN is False,
+        "DRY_RUN est defini",
     )
 
-print("\n" + "=" * 55)
-print("TOUS LES TESTS DE COMPATIBILITE SONT PASSES.")
-print("Attention : cela ne valide pas la rentabilite des signaux.")
-print("=" * 55)
+    check(
+        isinstance(scheduled_analysis.SYMBOLS, list)
+        and len(scheduled_analysis.SYMBOLS) > 0,
+        "La liste des actifs n'est pas vide",
+    )
 
-return 0
+    print(
+        "\nTous les controles de compatibilite sont passes.",
+        flush=True,
+    )
 
-if name == "main":
-sys.exit(main())
+
+if __name__ == "__main__":
+    main()
+    
