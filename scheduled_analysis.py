@@ -1,210 +1,213 @@
 
 import os
 import requests
-
 from deriv_market import get_candles
 from analysis_engine import analyze_candles
 
 TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-
-# Sécurité : le mode test est activé par défaut.
 DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
 
 SYMBOLS = [
-    "1HZ100V", "1HZ10V", "1HZ15V", "1HZ25V",
-    "1HZ30V", "1HZ50V", "1HZ75V", "1HZ90V",
-    "R_10", "R_100", "R_25", "R_50", "R_75",
+    "1HZ10V",
+    "1HZ15V",
+    "1HZ25V",
+    "1HZ30V",
+    "1HZ50V",
+    "1HZ75V",
+    "1HZ90V",
+    "1HZ100V",
+    "R_10",
+    "R_25",
+    "R_50",
+    "R_75",
+    "R_100",
 ]
 
 
 def send_telegram(message):
+    if DRY_RUN:
+        print("[MODE TEST] Envoi Telegram désactivé.")
+        print(message)
+        return
+
     if not TOKEN or not CHAT_ID:
-        raise RuntimeError("Variables Telegram manquantes.")
+        print("[ERREUR] TELEGRAM_TOKEN ou TELEGRAM_CHAT_ID manquant.")
+        return
 
-    response = requests.post(
-        f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-        json={"chat_id": CHAT_ID, "text": message},
-        timeout=20,
-    )
-    response.raise_for_status()
-
-    if not response.json().get("ok"):
-        raise RuntimeError("Telegram n'a pas confirmé l'envoi.")
-
-
-def get_analysis(symbol, timeframe):
-    print(
-        f"[DONNEES] {symbol} | {timeframe} | "
-        "Demande de bougies à Deriv...",
-        flush=True,
-    )
-
-    data = get_candles(
-        symbol=symbol,
-        timeframe=timeframe,
-        count=100,
-        timeout=8,
-    )
-
-    if data.get("error"):
-        raise RuntimeError(data["error"])
-
-    candles = data.get("candles", [])
-
-    print(
-        f"[DONNEES] {symbol} | {timeframe} | "
-        f"{len(candles)} bougies clôturées reçues",
-        flush=True,
-    )
-
-    if len(candles) < 30:
-        raise RuntimeError(
-            f"Pas assez de bougies : {len(candles)}"
+    try:
+        response = requests.post(
+            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+            data={
+                "chat_id": CHAT_ID,
+                "text": message,
+            },
+            timeout=15,
         )
+        response.raise_for_status()
 
-    result = analyze_candles(candles)
+        result = response.json()
+        if not result.get("ok"):
+            print("[ERREUR TELEGRAM]", result)
+        else:
+            print("[TELEGRAM] Message envoyé.")
+    except Exception as exc:
+        print(f"[ERREUR TELEGRAM] {exc}")
 
+
+def show_analysis(symbol, timeframe, result):
     print(
-        f"[TENDANCE] {symbol} | {timeframe} | "
-        f"{result.get('trend', 'indisponible')}",
-        flush=True,
+        f"[ANALYSE] {symbol} | {timeframe} "
+        f"| statut={result.get('status')} "
+        f"| bougies={result.get('candle_count')} "
+        f"| tendance={result.get('trend')}"
+    )
+    print(
+        f"[NIVEAUX] {symbol} | {timeframe} "
+        f"| support={result.get('support')} "
+        f"| résistance={result.get('resistance')}"
     )
 
-    print(
-        f"[ANALYSE] {symbol} | {timeframe} | "
-        f"Signal détecté : {result.get('signal')}",
-        flush=True,
-    )
+    trendline = result.get("trendline")
+    if trendline:
+        print(
+            f"[TRENDLINE] {symbol} | {timeframe} "
+            f"| direction={trendline.get('direction')} "
+            f"| prix={trendline.get('price')}"
+        )
+    else:
+        print(f"[TRENDLINE] {symbol} | {timeframe} | aucune")
 
-    return result
+    order_block = result.get("order_block")
+    if order_block:
+        print(
+            f"[ORDER BLOCK] {symbol} | {timeframe} "
+            f"| type={order_block.get('type')} "
+            f"| bas={order_block.get('low')} "
+            f"| haut={order_block.get('high')}"
+        )
+    else:
+        print(f"[ORDER BLOCK] {symbol} | {timeframe} | aucun")
+
+    signal = result.get("signal")
+    if signal:
+        print(
+            f"[SIGNAL] {symbol} | {timeframe} "
+            f"| {signal.get('direction')} "
+            f"| entrée={signal.get('entry')} "
+            f"| SL={signal.get('stop_loss')} "
+            f"| TP={signal.get('take_profit')} "
+            f"| RR=1:{signal.get('risk_reward')}"
+        )
+    else:
+        print(f"[AUCUN SIGNAL] {symbol} | {timeframe}")
+
+
+def format_signal(symbol, daily, h4, h1, signal):
+    return (
+        f"TRADER AI PRO\n\n"
+        f"Actif : {symbol}\n"
+        f"Direction : {signal['direction']}\n"
+        f"Entrée : {signal['entry']:.5f}\n"
+        f"Stop Loss : {signal['stop_loss']:.5f}\n"
+        f"Take Profit : {signal['take_profit']:.5f}\n"
+        f"Ratio risque/rendement : 1:{signal['risk_reward']:.0f}\n\n"
+        f"Tendance D1 : {daily.get('trend')}\n"
+        f"Tendance H4 : {h4.get('trend')}\n"
+        f"Tendance H1 : {h1.get('trend')}\n"
+        f"Zone : {signal.get('zone_type')}\n"
+        f"Bas de zone : {signal.get('zone_low'):.5f}\n"
+        f"Haut de zone : {signal.get('zone_high'):.5f}\n"
+        f"Motif : {signal.get('reason')}\n\n"
+        f"Mode test : {'OUI' if DRY_RUN else 'NON'}\n"
+        f"Signal à vérifier avant toute décision."
+    )
 
 
 def main():
-    print("=" * 55, flush=True)
-    print("TRADER AI PRO — DIAGNOSTIC", flush=True)
-    print(f"Mode test DRY_RUN : {DRY_RUN}", flush=True)
-    print(f"Nombre d'indices à analyser : {len(SYMBOLS)}", flush=True)
-    print("=" * 55, flush=True)
+    print("=" * 60)
+    print("TRADER AI PRO - DÉMARRAGE")
+    print(f"Mode test : {DRY_RUN}")
+    print(f"Nombre d'actifs : {len(SYMBOLS)}")
+    print("=" * 60)
 
-    messages = []
-    errors = []
-    analyzed = 0
+    signals_found = 0
+    errors_found = 0
 
     for symbol in SYMBOLS:
-        print(f"\n[INDICE] Début de l'analyse : {symbol}", flush=True)
+        print(f"\n{'-' * 45}\n[ACTIF] {symbol}")
 
-        try:
-            daily = get_analysis(symbol, "D1")
-            four_hour = get_analysis(symbol, "H4")
-            hourly = get_analysis(symbol, "H1")
-            analyzed += 1
+        analyses = {}
 
-            signal = hourly.get("signal") or {}
-            direction = str(
-                signal.get("direction", "")
-            ).upper()
+        for timeframe in ("D1", "H4", "H1"):
+            try:
+                print(f"[TÉLÉCHARGEMENT] {symbol} | {timeframe}")
 
-            if direction not in ("BUY", "SELL"):
-                print(
-                    f"[REJET] {symbol} : aucun signal H1 "
-                    "conforme aux règles actuelles.",
-                    flush=True,
+                candles_data = get_candles(
+                    symbol,
+                    timeframe,
+                    count=100,
+                    timeout=8,
                 )
-                continue
 
-            entry = signal.get("entry")
-            stop = signal.get("stop_loss")
-            target = signal.get("take_profit")
-            zone_low = signal.get("zone_low")
-            zone_high = signal.get("zone_high")
+                if isinstance(candles_data, dict):
+                    candles = candles_data.get("candles", [])
+                else:
+                    candles = candles_data or []
 
-            if any(value is None for value in (
-                entry, stop, target, zone_low, zone_high
-            )):
                 print(
-                    f"[REJET] {symbol} : signal incomplet.",
-                    flush=True,
+                    f"[DONNÉES] {symbol} | {timeframe} "
+                    f"| bougies reçues={len(candles)}"
                 )
-                continue
 
-            message = (
-                f"TRADER AI PRO — {symbol}\n"
-                f"Signal : {direction}\n"
-                f"Unité d'entrée : H1\n"
-                f"Contexte H4 : {four_hour.get('trend', 'indisponible')}\n"
-                f"Contexte D1 : {daily.get('trend', 'indisponible')}\n"
-                f"Zone : {zone_low} – {zone_high}\n"
-                f"Entrée indicative : {entry}\n"
-                f"SL : {stop}\n"
-                f"TP : {target}\n"
-                f"Risque/rendement visé : 1:3\n"
-                f"Type de zone : {signal.get('zone_type', 'non précisé')}\n"
-                f"Motif : {signal.get('reason', 'non précisé')}\n\n"
-                "Signal indicatif, non validé par backtest. "
-                "Vérifie le graphique avant toute décision."
-            )
+                result = analyze_candles(candles)
+                show_analysis(symbol, timeframe, result)
+                analyses[timeframe] = result
 
-            messages.append(message)
+            except Exception as exc:
+                errors_found += 1
+                print(
+                    f"[ERREUR ANALYSE] {symbol} | "
+                    f"{timeframe} | {type(exc).__name__}: {exc}"
+                )
+                analyses[timeframe] = {
+                    "trend": "INCONNU",
+                    "signal": None,
+                    "status": "ERREUR",
+                    "candle_count": 0,
+                }
+
+        daily = analyses.get("D1", {})
+        h4 = analyses.get("H4", {})
+        h1 = analyses.get("H1", {})
+
+        signal = h1.get("signal")
+
+        if signal:
+            signals_found += 1
+            message = format_signal(symbol, daily, h4, h1, signal)
+            print("[SIGNAL RETENU] Signal H1 trouvé.")
+
+            if daily.get("trend") not in ("INCONNU", "LATERALE"):
+                if daily.get("trend") != h4.get("trend"):
+                    print(
+                        "[AVERTISSEMENT] Les tendances D1 et H4 "
+                        "ne concordent pas."
+                    )
+
+            send_telegram(message)
+        else:
             print(
-                f"[SIGNAL] {symbol} : {direction} détecté.",
-                flush=True,
+                f"[RÉSULTAT] {symbol} : aucun signal H1 "
+                "conforme aux règles actuelles."
             )
 
-        except Exception as exc:
-            error_message = f"{symbol}: {str(exc)[:200]}"
-            errors.append(error_message)
-            print(f"[ERREUR] {error_message}", flush=True)
-
-    print("\n" + "=" * 55, flush=True)
-    print("BILAN DU DIAGNOSTIC", flush=True)
-    print(f"Indices entièrement analysés : {analyzed}/{len(SYMBOLS)}", flush=True)
-    print(f"Signaux conformes détectés : {len(messages)}", flush=True)
-    print(f"Indices en erreur : {len(errors)}", flush=True)
-    print(f"Mode test : {DRY_RUN}", flush=True)
-
-    if DRY_RUN:
-        print(
-            "[TEST] Aucun message Telegram ne sera envoyé.",
-            flush=True,
-        )
-
-        for message in messages:
-            print("\n[SIGNAL SIMULÉ]\n" + message, flush=True)
-
-        for error in errors:
-            print(f"[ERREUR DETAILLEE] {error}", flush=True)
-
-    else:
-        for message in messages:
-            try:
-                send_telegram(message)
-                print("[TELEGRAM] Signal envoyé.", flush=True)
-            except Exception as exc:
-                print(
-                    f"[TELEGRAM ERREUR] {str(exc)[:200]}",
-                    flush=True,
-                )
-
-        if errors:
-            try:
-                send_telegram(
-                    "TRADER AI PRO — erreurs sur certains indices :\n"
-                    + "\n".join(errors[:10])
-                )
-            except Exception as exc:
-                print(
-                    f"[TELEGRAM ERREUR] {str(exc)[:200]}",
-                    flush=True,
-                )
-
-        if not messages and not errors:
-            send_telegram(
-                "TRADER AI PRO : analyse terminée. "
-                "Aucun signal BUY/SELL conforme détecté."
-            )
-
-    print("Fin du diagnostic.", flush=True)
+    print("\n" + "=" * 60)
+    print("TRADER AI PRO - FIN DE L'ANALYSE")
+    print(f"Signaux trouvés : {signals_found}")
+    print(f"Erreurs rencontrées : {errors_found}")
+    print(f"Mode test actif : {DRY_RUN}")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
