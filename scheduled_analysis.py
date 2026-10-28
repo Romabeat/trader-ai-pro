@@ -1,12 +1,12 @@
-"""TRADER AI PRO - analyse multi-unites et alertes Telegram.
+"""TRADER AI PRO - Analyse automatique multi-timeframes.
 
 D1 : contexte general.
 H4 : direction de la structure.
-H1 : detection du setup.
+H1 : setup.
 M30 : confirmation.
 
-Aucun ordre n'est execute.
-Le mode test est actif par defaut.
+Ce programme genere des alertes indicatives.
+Il n'execute aucun ordre de trading.
 """
 
 import os
@@ -16,16 +16,16 @@ import requests
 from deriv_market import get_candles
 from strategy import find_signals, format_message
 
---------------------------------------------------
+==================================================
 
 CONFIGURATION
 
---------------------------------------------------
+==================================================
 
 TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
-La securite prime : seul DRY_RUN=false active l'envoi Telegram.
+Le mode test reste actif sauf si DRY_RUN vaut exactement "false".
 
 DRY_RUN = (
 os.environ.get("DRY_RUN", "true").strip().lower() != "false"
@@ -48,6 +48,7 @@ SYMBOLS = [
 ]
 
 TIMEFRAMES = ("D1", "H4", "H1", "M30")
+
 CANDLE_COUNT = 100
 REQUEST_TIMEOUT = 15
 
@@ -56,14 +57,14 @@ level=logging.INFO,
 format="%(asctime)s | %(levelname)s | %(message)s",
 )
 
---------------------------------------------------
+==================================================
 
-DONNEES DE MARCHE
+RECUPERATION DES BOUGIES
 
---------------------------------------------------
+==================================================
 
 def fetch_candles(symbol, timeframe):
-"""Recupere et verifie les bougies d'un actif."""
+"""Recupere les bougies d'un actif et d'une unite de temps."""
 
 try:
     result = get_candles(
@@ -71,9 +72,10 @@ try:
         timeframe=timeframe,
         count=CANDLE_COUNT,
     )
+
 except Exception as exc:
     logging.error(
-        "%s %s : erreur de recuperation (%s)",
+        "%s %s : erreur de recuperation (%s).",
         symbol,
         timeframe,
         type(exc).__name__,
@@ -82,17 +84,7 @@ except Exception as exc:
 
 if not isinstance(result, dict):
     logging.error(
-        "%s %s : reponse inattendue du fournisseur.",
-        symbol,
-        timeframe,
-    )
-    return []
-
-candles = result.get("candles", [])
-
-if not isinstance(candles, list):
-    logging.error(
-        "%s %s : format de bougies invalide.",
+        "%s %s : reponse invalide du fournisseur.",
         symbol,
         timeframe,
     )
@@ -100,14 +92,16 @@ if not isinstance(candles, list):
 
 if result.get("error"):
     logging.warning(
-        "%s %s : %s",
+        "%s %s : recuperation impossible (%s).",
         symbol,
         timeframe,
         result.get("error"),
     )
     return []
 
-if not candles:
+candles = result.get("candles")
+
+if not isinstance(candles, list) or not candles:
     logging.warning(
         "%s %s : aucune bougie disponible.",
         symbol,
@@ -116,7 +110,7 @@ if not candles:
     return []
 
 logging.info(
-    "%s %s : %s bougies recues.",
+    "%s %s : %d bougies recues.",
     symbol,
     timeframe,
     len(candles),
@@ -124,26 +118,25 @@ logging.info(
 
 return candles
 
---------------------------------------------------
+==================================================
 
-TELEGRAM
+ENVOI TELEGRAM
 
---------------------------------------------------
+==================================================
 
 def send_telegram(message):
-"""Envoie un message uniquement si le mode test est desactive."""
+"""Envoie une alerte uniquement hors mode test."""
 
 if DRY_RUN:
     logging.info(
-        "MODE TEST : aucun message Telegram envoye.\n%s",
+        "MODE TEST : message non envoye sur Telegram.\n%s",
         message,
     )
     return False
 
 if not TOKEN or not CHAT_ID:
     logging.error(
-        "Envoi impossible : TELEGRAM_TOKEN ou TELEGRAM_CHAT_ID "
-        "manquant dans les variables d'environnement."
+        "Envoi impossible : secrets Telegram manquants."
     )
     return False
 
@@ -163,18 +156,16 @@ try:
     data = response.json()
 
     if not data.get("ok"):
-        logging.error(
-            "Telegram a refuse le message."
-        )
+        logging.error("Telegram a refuse le message.")
         return False
 
-    logging.info("Message Telegram envoye avec succes.")
+    logging.info("Alerte Telegram envoyee.")
     return True
 
 except requests.RequestException as exc:
-    # Ne jamais afficher le token dans les journaux.
+    # Ne jamais afficher l'URL contenant le token.
     logging.error(
-        "Erreur d'envoi Telegram : %s",
+        "Echec de l'envoi Telegram (%s).",
         type(exc).__name__,
     )
     return False
@@ -183,17 +174,17 @@ except ValueError:
     logging.error("Reponse Telegram invalide.")
     return False
 
---------------------------------------------------
+==================================================
 
 ANALYSE D'UN ACTIF
 
---------------------------------------------------
+==================================================
 
 def analyze_symbol(symbol):
 """Analyse un actif sur D1, H4, H1 et M30."""
 
 logging.info("=" * 55)
-logging.info("DEBUT ANALYSE : %s", symbol)
+logging.info("ANALYSE DE %s", symbol)
 
 market = {}
 
@@ -210,83 +201,81 @@ for timeframe in TIMEFRAMES:
 
     market[timeframe] = candles
 
-# La derniere cloture M30 sert de prix de reference.
 try:
     price_now = float(market["M30"][-1]["close"])
+
 except (KeyError, TypeError, ValueError, IndexError):
     logging.warning(
-        "%s : impossible de determiner le prix M30.",
+        "%s : prix de reference M30 invalide.",
         symbol,
     )
     return []
 
-signals, logs = find_signals(
-    symbol=symbol,
-    d1=market["D1"],
-    h4=market["H4"],
-    h1=market["H1"],
-    m30=market["M30"],
-    price_now=price_now,
-)
+try:
+    signals, messages = find_signals(
+        symbol=symbol,
+        d1=market["D1"],
+        h4=market["H4"],
+        h1=market["H1"],
+        m30=market["M30"],
+        price_now=price_now,
+    )
 
-for entry in logs:
-    logging.info("%s", entry)
+except Exception as exc:
+    logging.exception(
+        "%s : erreur pendant l'analyse (%s).",
+        symbol,
+        type(exc).__name__,
+    )
+    return []
+
+for message in messages:
+    logging.info("%s", message)
 
 if not signals:
-    logging.info("%s : aucun signal exploitable.", symbol)
+    logging.info("%s : aucun signal valide.", symbol)
     return []
 
-valid_signals = []
+return [
+    signal
+    for signal in signals
+    if isinstance(signal, dict)
+]
 
-for signal in signals:
-    if not isinstance(signal, dict):
-        continue
-
-    try:
-        message = format_message(signal)
-    except (KeyError, TypeError, ValueError) as exc:
-        logging.error(
-            "%s : formatage du signal impossible (%s).",
-            symbol,
-            type(exc).__name__,
-        )
-        continue
-
-    logging.info(
-        "%s : signal %s valide.",
-        symbol,
-        signal.get("direction", "INCONNUE"),
-    )
-
-    send_telegram(message)
-    valid_signals.append(signal)
-
-return valid_signals
-
---------------------------------------------------
+==================================================
 
 EXECUTION GENERALE
 
---------------------------------------------------
+==================================================
 
 def main():
-logging.info("TRADER AI PRO - demarrage")
-logging.info(
-"Mode : %s",
-"TEST (aucun envoi Telegram)"
-if DRY_RUN
-else "ENVOI TELEGRAM ACTIVE",
-)
+"""Lance une analyse de tous les actifs configures."""
 
-if not DRY_RUN and (not TOKEN or not CHAT_ID):
-    logging.error(
-        "Configuration incomplete : ajoute TELEGRAM_TOKEN et "
-        "TELEGRAM_CHAT_ID aux secrets avant de lancer le bot."
+logging.info("=" * 55)
+logging.info("TRADER AI PRO - DEMARRAGE")
+
+if DRY_RUN:
+    logging.info(
+        "MODE TEST ACTIF : aucun message ne sera envoye."
     )
-    return
+else:
+    logging.warning(
+        "MODE ENVOI ACTIF : les signaux valides pourront "
+        "etre envoyes sur Telegram."
+    )
+
+    if not TOKEN or not CHAT_ID:
+        logging.error(
+            "Configuration Telegram incomplete. "
+            "Verifie les secrets TELEGRAM_TOKEN et TELEGRAM_CHAT_ID."
+        )
+        return
+
+# Cette memoire ne dure que pendant l'execution courante.
+seen_keys = set()
 
 total_signals = 0
-seen_keys = set()
+total_sent = 0
 
 for symbol in SYMBOLS:
     try:
@@ -295,7 +284,7 @@ for symbol in SYMBOLS:
         for signal in signals:
             key = signal.get("key")
 
-            # Evite les doublons pour un meme signal durant cette execution.
+            # Le doublon est verifie AVANT tout envoi.
             if key and key in seen_keys:
                 logging.info(
                     "%s : doublon ignore pendant cette execution.",
@@ -306,23 +295,44 @@ for symbol in SYMBOLS:
             if key:
                 seen_keys.add(key)
 
+            try:
+                message = format_message(signal)
+
+            except (KeyError, TypeError, ValueError) as exc:
+                logging.error(
+                    "%s : formatage impossible (%s).",
+                    symbol,
+                    type(exc).__name__,
+                )
+                continue
+
             total_signals += 1
 
+            logging.info(
+                "%s : signal %s detecte.",
+                symbol,
+                signal.get("direction", "INCONNUE"),
+            )
+
+            if send_telegram(message):
+                total_sent += 1
+
     except Exception as exc:
-        # Un actif en erreur ne doit pas interrompre toute l'analyse.
+        # Une erreur sur un actif ne bloque pas les autres.
         logging.exception(
             "%s : erreur inattendue (%s).",
             symbol,
             type(exc).__name__,
         )
 
-logging.info("-" * 55)
+logging.info("=" * 55)
 logging.info("ANALYSE TERMINEE")
-logging.info("Nombre de signaux valides : %s", total_signals)
+logging.info("Signaux valides : %d", total_signals)
+logging.info("Messages Telegram envoyes : %d", total_sent)
 
 if DRY_RUN:
     logging.info(
-        "Mode test : aucun signal n'a ete envoye sur Telegram."
+        "Mode test termine : aucun message Telegram envoye."
     )
 
 if name == "main":
