@@ -38,6 +38,10 @@ steps:
       python -m py_compile deriv_market.py
       python -m py_compile scheduled_analysis.py
       python -m py_compile app.py
+      python -m py_compile test_compatibility.py
+
+  - name: Tester la compatibilite des modules
+    run: python test_compatibility.py
 
   - name: Lancer les analyses en mode test
     run: python -u scheduled_analysis.py
