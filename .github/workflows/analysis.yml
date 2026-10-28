@@ -1,10 +1,9 @@
-
 name: TRADER AI PRO - Analyse automatique
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 */4 * * *"
+    - cron: "5 */4 * * *"
 
 permissions:
   contents: read
@@ -24,9 +23,9 @@ jobs:
           python-version: "3.12"
 
       - name: Installer les dependances
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+        run: | python -m pip install --upgrade pip pip install -r requirements.txt 
+      - name: Verifier la syntaxe Python
+        run: python -m py_compile analysis_engine.py scheduled_analysis.py deriv_market.py
 
       - name: Lancer l'analyse en mode test
         env:
