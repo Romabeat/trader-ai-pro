@@ -61,8 +61,9 @@ def main():
             entry = signal.get("entry")
             stop = signal.get("stop_loss")
             target = signal.get("take_profit")
-            zone_low = signal.get("zone_low")
-            zone_high = signal.get("zone_high")
+            zone = signal.get("zone") or {}
+            zone_low = zone.get("low")
+            zone_high = zone.get("high")
 
             if any(v is None for v in
                    (entry, stop, target, zone_low, zone_high)):
