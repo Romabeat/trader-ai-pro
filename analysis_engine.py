@@ -1,6 +1,13 @@
 
 from statistics import mean
 
+# IMPORTANT :
+# Cette valeur est provisoire. Vérifier la valeur d'un pip
+# pour chaque indice Deriv avant toute utilisation réelle.
+PIP_SIZE = 0.01
+SL_BUFFER_PIPS = 10
+RISK_REWARD_RATIO = 3
+
 
 def candle_trend(candles):
     """Estime la tendance à partir des clôtures récentes."""
@@ -90,7 +97,7 @@ def find_trendline(candles, lookback=30):
 
 
 def find_equal_levels(candles, lookback=50, tolerance=0.001):
-    """Regroupe les sommets et creux proches pour limiter les doublons."""
+    """Repère des sommets et creux proches."""
     if len(candles) < 3:
         return {
             "equal_highs": [],
@@ -98,9 +105,6 @@ def find_equal_levels(candles, lookback=50, tolerance=0.001):
         }
 
     recent = candles[-min(lookback, len(candles)):]
-
-    highs = [float(c["high"]) for c in recent]
-    lows = [float(c["low"]) for c in recent]
 
     def cluster_levels(values):
         values = sorted(values)
@@ -120,30 +124,21 @@ def find_equal_levels(candles, lookback=50, tolerance=0.001):
                 clusters.append([value])
 
         levels = [
-            {
-                "level": mean(cluster),
-                "count": len(cluster),
-            }
+            round(mean(cluster), 5)
             for cluster in clusters
             if len(cluster) >= 2
         ]
 
-        levels.sort(
-            key=lambda item: item["count"],
-            reverse=True,
-        )
-
-        selected = levels[:5]
-        selected.sort(key=lambda item: item["level"])
-
-        return [
-            round(item["level"], 5)
-            for item in selected
-        ]
+        levels.sort()
+        return levels[:5]
 
     return {
-        "equal_highs": cluster_levels(highs),
-        "equal_lows": cluster_levels(lows),
+        "equal_highs": cluster_levels(
+            [float(c["high"]) for c in recent]
+        ),
+        "equal_lows": cluster_levels(
+            [float(c["low"]) for c in recent]
+        ),
     }
 
 
@@ -152,13 +147,7 @@ def detect_liquidity_sweep(candles, lookback=20):
     if len(candles) < 3:
         return None
 
-    lookback = max(1, lookback)
-
-    if len(candles) > lookback:
-        previous = candles[-lookback - 1:-1]
-    else:
-        previous = candles[:-1]
-
+    previous = candles[-min(lookback + 1, len(candles)):-1]
     if not previous:
         return None
 
@@ -268,8 +257,122 @@ def find_supply_demand_zones(candles, lookback=30):
     return zones[-5:]
 
 
+def generate_signal(candles):
+    """
+    Génère un signal indicatif si une prise de liquidité,
+    un retournement et une zone de réaction concordent.
+    Le SL est placé à 10 pips au-delà de la zone.
+    Le TP vise un ratio risque/rendement de 1:3.
+    """
+    if len(candles) < 30:
+        return {
+            "direction": "AUCUN SIGNAL",
+            "reason": "Données insuffisantes",
+        }
+
+    sweep = detect_liquidity_sweep(candles)
+    reversal = detect_candle_reversal(candles)
+    order_block = find_order_block(candles)
+    zones = find_supply_demand_zones(candles)
+
+    if not sweep or not reversal:
+        return {
+            "direction": "AUCUN SIGNAL",
+            "reason": "Pas de confirmation suffisante",
+        }
+
+    bullish = sweep["direction_potentielle"] == "Haussière"
+
+    if bullish:
+        confirms = (
+            "haussier" in reversal.lower()
+            or "vers le haut" in reversal.lower()
+        )
+        expected_ob = "Order Block haussier potentiel"
+        expected_zone = "Demand potentielle"
+    else:
+        confirms = (
+            "baissier" in reversal.lower()
+            or "vers le bas" in reversal.lower()
+        )
+        expected_ob = "Order Block baissier potentiel"
+        expected_zone = "Supply potentielle"
+
+    if not confirms:
+        return {
+            "direction": "AUCUN SIGNAL",
+            "reason": "Le retournement ne confirme pas la prise de liquidité",
+        }
+
+    # Priorité à l'Order Block correspondant.
+    zone = (
+        order_block
+        if order_block and order_block["type"] == expected_ob
+        else None
+    )
+
+    # Sinon, utiliser une zone d'offre ou de demande correspondante.
+    if zone is None:
+        matching_zones = [
+            item for item in zones
+            if item["type"] == expected_zone
+        ]
+        if matching_zones:
+            zone = matching_zones[-1]
+
+    if zone is None:
+        return {
+            "direction": "AUCUN SIGNAL",
+            "reason": "Aucune zone de réaction correspondante détectée",
+        }
+
+    entry = float(candles[-1]["close"])
+    buffer = SL_BUFFER_PIPS * PIP_SIZE
+
+    if bullish:
+        sl = float(zone["low"]) - buffer
+        risk = entry - sl
+
+        if risk <= 0:
+            return {
+                "direction": "AUCUN SIGNAL",
+                "reason": "Le prix d'entrée ne permet pas un SL cohérent",
+            }
+
+        tp = entry + RISK_REWARD_RATIO * risk
+
+    else:
+        sl = float(zone["high"]) + buffer
+        risk = sl - entry
+
+        if risk <= 0:
+            return {
+                "direction": "AUCUN SIGNAL",
+                "reason": "Le prix d'entrée ne permet pas un SL cohérent",
+            }
+
+        tp = entry - RISK_REWARD_RATIO * risk
+
+    return {
+        "direction": "BUY" if bullish else "SELL",
+        "entry": round(entry, 5),
+        "zone": {
+            "type": zone["type"],
+            "low": round(float(zone["low"]), 5),
+            "high": round(float(zone["high"]), 5),
+        },
+        "stop_loss": round(sl, 5),
+        "sl_buffer_pips": SL_BUFFER_PIPS,
+        "pip_size_used": PIP_SIZE,
+        "take_profit": round(tp, 5),
+        "risk_reward": "1:3",
+        "reason": sweep["type"] + " + " + reversal,
+        "status": "Signal indicatif à confirmer",
+    }
+
+
 def analyze_candles(candles):
-    """Regroupe les éléments de l'analyse technique."""
+    """Regroupe les éléments d'analyse et le signal potentiel."""
     if not candles:
         return {
             "trend": "Données insuffisantes",
@@ -284,6 +387,10 @@ def analyze_candles(candles):
             },
             "order_block": None,
             "supply_demand_zones": [],
+            "signal": {
+                "direction": "AUCUN SIGNAL",
+                "reason": "Aucune bougie disponible",
+            },
         }
 
     support, resistance = find_support_resistance(candles)
@@ -298,5 +405,5 @@ def analyze_candles(candles):
         "liquidity_levels": find_equal_levels(candles),
         "order_block": find_order_block(candles),
         "supply_demand_zones": find_supply_demand_zones(candles),
+        "signal": generate_signal(candles),
     }
-    
