@@ -4,8 +4,9 @@ from statistics import mean
 # IMPORTANT :
 # Cette valeur est provisoire. Vérifier la valeur d'un pip
 # pour chaque indice Deriv avant toute utilisation réelle.
+# Paramètres provisoires : vérifier PIP_SIZE pour chaque indice.
 PIP_SIZE = 0.01
-SL_BUFFER_PIPS = 10
+SL_BUFFER_PIPS = 20
 RISK_REWARD_RATIO = 3
 
 
