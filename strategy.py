@@ -1,10 +1,12 @@
 """
 Trader AI Pro - Strategie SMC D1/H4
 ------------------------------------
-D1 : filtre directionnel
-H4 : structure, BOS, displacement et Order Block
-Entree : ouverture de la bougie de l'Order Block
-RR minimum : 1.5
+D1 : biais directionnel.
+H4 : structure, BOS, displacement et Order Block.
+Entree : ouverture de la bougie de l'Order Block.
+SL : au-dela de la zone avec marge ATR.
+TP : cible structurelle H4.
+RR minimum : 1.5.
 
 Scanner uniquement : aucun ordre n'est execute.
 """
@@ -17,6 +19,7 @@ from math import isfinite
 # ============================================================
 
 MIN_RR = 1.5
+
 MIN_D1_CANDLES = 100
 MIN_H4_CANDLES = 200
 
@@ -30,20 +33,22 @@ SL_ATR_BUFFER = 0.10
 MIN_BODY_RATIO = 0.55
 MIN_DISPLACEMENT_ATR = 0.80
 
-# Le prix doit rester du bon cote de l'entree en attente.
-# BUY : prix actuel au-dessus de l'entree.
-# SELL : prix actuel en dessous de l'entree.
+# Eviter les configurations trop anciennes.
+MAX_BOS_AGE = 20
+
+# Eviter une entree devenue trop eloignee du prix.
+MAX_ENTRY_DISTANCE_ATR = 1.5
 
 
 # ============================================================
-# NORMALISATION DES BOUGIES
+# OUTILS
 # ============================================================
 
 def _number(value):
     try:
         result = float(value)
         return result if isfinite(result) else None
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
 
 
@@ -54,14 +59,32 @@ def _first_value(row, keys):
     return None
 
 
+def _diagnose(diagnostics, symbol, reason):
+    """
+    Compatible avec un dictionnaire ou une liste.
+
+    Avec un dictionnaire :
+        diagnostics[symbol] = [motifs de rejet]
+
+    Avec une liste :
+        ajout d'un message texte.
+    """
+    if diagnostics is None:
+        return
+
+    message = f"{symbol}: {reason}"
+
+    if isinstance(diagnostics, dict):
+        diagnostics.setdefault(symbol, []).append(reason)
+
+    elif isinstance(diagnostics, list):
+        diagnostics.append(message)
+
+
 def _normalize(candles):
     """
-    Accepte notamment les formats :
-    open/high/low/close
-    o/h/l/c
-    OHLC issus d'API de marche.
-
-    Retourne une liste de bougies normalisees.
+    Accepte les formats open/high/low/close et o/h/l/c.
+    Les bougies doivent etre chronologiques.
     """
     result = []
 
@@ -74,31 +97,47 @@ def _normalize(candles):
 
         o = _number(_first_value(row, ("open", "o", "Open")))
         h = _number(_first_value(row, ("high", "h", "High")))
-        l = _number(_first_value(row, ("low", "l", "Low")))
+        low = _number(_first_value(row, ("low", "l", "Low")))
         c = _number(_first_value(row, ("close", "c", "Close")))
 
-        if None in (o, h, l, c):
+        if None in (o, h, low, c):
             continue
 
-        if h < l or h < max(o, c) or l > min(o, c):
+        if h < max(o, low, c) or low > min(o, h, c):
             continue
 
         epoch = _first_value(
             row,
-            ("epoch", "time", "timestamp", "datetime")
+            ("epoch", "time", "timestamp", "datetime"),
         )
 
         result.append({
             "o": o,
             "h": h,
-            "l": l,
+            "l": low,
             "c": c,
             "epoch": epoch,
         })
 
-    # Les donnees doivent etre chronologiques.
-    # On ne les inverse pas automatiquement : le module de marche
-    # doit fournir les bougies de la plus ancienne a la plus recente.
+    # Refuser un historique mal ordonne plutot que d'inverser
+    # silencieusement les bougies.
+    epochs = [
+        _number(row["epoch"])
+        for row in result
+    ]
+
+    valid_epochs = [
+        value for value in epochs
+        if value is not None
+    ]
+
+    if len(valid_epochs) == len(result) and len(result) > 1:
+        if any(
+            valid_epochs[i] >= valid_epochs[i + 1]
+            for i in range(len(valid_epochs) - 1)
+        ):
+            return []
+
     return result
 
 
@@ -121,8 +160,9 @@ def _atr(rows, period=ATR_PERIOD):
     ranges = []
 
     for i in range(len(rows) - period, len(rows)):
-        previous_close = rows[i - 1]["c"]
-        ranges.append(_true_range(rows[i], previous_close))
+        ranges.append(
+            _true_range(rows[i], rows[i - 1]["c"])
+        )
 
     if not ranges:
         return None
@@ -157,12 +197,6 @@ def _is_bearish(candle):
 # ============================================================
 
 def _pivots(rows, radius=PIVOT_RADIUS):
-    """
-    Identifie les pivots locaux.
-
-    Un pivot n'est confirme qu'apres la cloture des bougies
-    situees a sa droite.
-    """
     highs = []
     lows = []
 
@@ -185,10 +219,6 @@ def _pivots(rows, radius=PIVOT_RADIUS):
 
 
 def _structure(rows):
-    """
-    Determine une structure haussiere, baissiere ou neutre
-    a partir des deux derniers pivots hauts et bas confirmes.
-    """
     highs, lows = _pivots(rows)
 
     if len(highs) < 2 or len(lows) < 2:
@@ -200,53 +230,50 @@ def _structure(rows):
     previous_low = lows[-2][1]
     latest_low = lows[-1][1]
 
-    higher_high = latest_high > previous_high
-    higher_low = latest_low > previous_low
-
-    lower_high = latest_high < previous_high
-    lower_low = latest_low < previous_low
-
-    if higher_high and higher_low:
+    if (
+        latest_high > previous_high
+        and latest_low > previous_low
+    ):
         return "BULLISH"
 
-    if lower_high and lower_low:
+    if (
+        latest_high < previous_high
+        and latest_low < previous_low
+    ):
         return "BEARISH"
 
     return "NEUTRAL"
 
 
 def _daily_bias(d1):
-    """
-    Le Daily doit presenter une structure identifiable.
-    En cas de structure neutre, aucun signal n'est autorise.
-    """
     return _structure(d1)
 
 
 # ============================================================
-# RECHERCHE DE BOS ET D'ORDER BLOCK
+# BREAK OF STRUCTURE
 # ============================================================
 
 def _find_bos(rows, direction, atr_value):
     """
-    Recherche une cassure de structure accompagnee d'une bougie
-    impulsive.
+    Recherche une cassure confirmee par cloture et accompagnee
+    d'un displacement.
 
-    La cassure est comparee aux pivots confirmes AVANT la bougie
-    de cassure, afin d'eviter d'utiliser des informations futures.
+    Les pivots de reference sont calcules uniquement sur les
+    bougies precedant la bougie de cassure.
     """
-    start = max(PIVOT_RADIUS * 2 + 1, len(rows) - OB_LOOKBACK)
+    start = max(
+        PIVOT_RADIUS * 2 + 1,
+        len(rows) - OB_LOOKBACK,
+    )
 
     for i in range(len(rows) - 1, start - 1, -1):
         candle = rows[i]
 
-        # La bougie doit montrer un deplacement directionnel.
-        if direction == "BUY":
-            if not _is_bullish(candle):
-                continue
-        else:
-            if not _is_bearish(candle):
-                continue
+        if direction == "BUY" and not _is_bullish(candle):
+            continue
+
+        if direction == "SELL" and not _is_bearish(candle):
+            continue
 
         if _body_ratio(candle) < MIN_BODY_RATIO:
             continue
@@ -256,8 +283,6 @@ def _find_bos(rows, direction, atr_value):
         if body < MIN_DISPLACEMENT_ATR * atr_value:
             continue
 
-        # Les pivots sont calcules uniquement avec les bougies
-        # precedant la bougie de cassure.
         previous_rows = rows[:i]
         highs, lows = _pivots(previous_rows)
 
@@ -265,44 +290,37 @@ def _find_bos(rows, direction, atr_value):
             candidates = [
                 (index, level)
                 for index, level in highs
-                if index < i and candle["c"] > level
+                if rows[index]["h"] < candle["c"]
             ]
         else:
             candidates = [
                 (index, level)
                 for index, level in lows
-                if index < i and candle["c"] < level
+                if rows[index]["l"] > candle["c"]
             ]
 
         if not candidates:
             continue
 
-        # Le pivot casse le plus recent est privilegie.
-        broken_pivot_index, broken_level = candidates[-1]
+        pivot_index, broken_level = candidates[-1]
 
         return {
             "index": i,
             "broken_level": broken_level,
-            "pivot_index": broken_pivot_index,
+            "pivot_index": pivot_index,
             "impulse": candle,
+            "age": len(rows) - 1 - i,
         }
 
     return None
 
 
+# ============================================================
+# ORDER BLOCK
+# ============================================================
+
 def _find_order_block(rows, bos, direction):
-    """
-    Recherche la derniere bougie opposee precedant l'impulsion
-    ayant casse la structure.
-
-    BUY  : derniere bougie baissiere.
-    SELL : derniere bougie haussiere.
-
-    La bougie de l'Order Block est identifiee par son ouverture,
-    son plus haut et son plus bas.
-    """
     impulse_index = bos["index"]
-
     first_index = max(0, impulse_index - OB_SEARCH_BACK)
 
     for i in range(impulse_index - 1, first_index - 1, -1):
@@ -331,31 +349,30 @@ def _find_order_block(rows, bos, direction):
 
 def _is_invalidated(rows, ob, direction):
     """
-    Invalidation conservatrice :
-    une cloture ulterieure a l'Order Block au-dela de la zone
-    rend la configuration inutilisable.
+    Verifie les clotures ulterieures a l'Order Block.
+    Une cloture au-dela de la zone invalide le setup.
     """
-    candle_index = ob["index"]
-
-    for candle in rows[candle_index + 1:]:
-        if direction == "BUY" and candle["c"] < ob["zone_low"]:
+    for candle in rows[ob["index"] + 1:]:
+        if (
+            direction == "BUY"
+            and candle["c"] < ob["zone_low"]
+        ):
             return True
 
-        if direction == "SELL" and candle["c"] > ob["zone_high"]:
+        if (
+            direction == "SELL"
+            and candle["c"] > ob["zone_high"]
+        ):
             return True
 
     return False
 
 
 # ============================================================
-# LIQUIDITE ET ENGLOBEMENT
+# CONFLUENCES SECONDAIRES
 # ============================================================
 
 def _liquidity_sweep(rows, direction, lookback=20):
-    """
-    Detection simple d'une prise de liquidite sur les bougies
-    recentes. Cette information reste un filtre secondaire.
-    """
     if len(rows) < lookback + 2:
         return False
 
@@ -364,10 +381,18 @@ def _liquidity_sweep(rows, direction, lookback=20):
 
     if direction == "BUY":
         previous_low = min(c["l"] for c in previous)
-        return latest["l"] < previous_low and latest["c"] > previous_low
+
+        return (
+            latest["l"] < previous_low
+            and latest["c"] > previous_low
+        )
 
     previous_high = max(c["h"] for c in previous)
-    return latest["h"] > previous_high and latest["c"] < previous_high
+
+    return (
+        latest["h"] > previous_high
+        and latest["c"] < previous_high
+    )
 
 
 def _engulfing(rows, direction):
@@ -394,16 +419,10 @@ def _engulfing(rows, direction):
 
 
 # ============================================================
-# OBJECTIF STRUCTUREL ET GESTION DU RISQUE
+# TAKE PROFIT STRUCTUREL
 # ============================================================
 
 def _target_from_structure(rows, direction, entry, stop_loss):
-    """
-    Recherche un pivot H4 dans le sens du trade.
-
-    Le premier objectif structurel valide doit egalement offrir
-    un RR d'au moins MIN_RR.
-    """
     highs, lows = _pivots(rows)
 
     risk = abs(entry - stop_loss)
@@ -412,17 +431,14 @@ def _target_from_structure(rows, direction, entry, stop_loss):
         return None, None
 
     if direction == "BUY":
-        candidates = sorted(
-            {
-                level
-                for _, level in highs
-                if level > entry
-            }
-        )
+        candidates = sorted({
+            level
+            for _, level in highs
+            if level > entry
+        })
 
         for target in candidates:
-            reward = target - entry
-            rr = reward / risk
+            rr = (target - entry) / risk
 
             if rr >= MIN_RR:
                 return target, rr
@@ -438,8 +454,7 @@ def _target_from_structure(rows, direction, entry, stop_loss):
         )
 
         for target in candidates:
-            reward = entry - target
-            rr = reward / risk
+            rr = (entry - target) / risk
 
             if rr >= MIN_RR:
                 return target, rr
@@ -448,7 +463,7 @@ def _target_from_structure(rows, direction, entry, stop_loss):
 
 
 # ============================================================
-# CONSTRUCTION DU SIGNAL
+# DETECTION DES SIGNAUX
 # ============================================================
 
 def find_signals(
@@ -461,91 +476,124 @@ def find_signals(
     diagnostics=None,
 ):
     """
-    API conservee pour rester compatible avec le scanner.
+    Compatible avec l'interface de scheduled_analysis.py.
 
-    Parametres principaux :
-        d1 : 100 bougies Daily
-        h4 : 200 bougies H4
-        price_now : dernier prix disponible
-
-    h1 et m30 sont conserves pour compatibilite, mais ne sont
-    pas utilises par cette strategie D1/H4.
+    diagnostics accepte un dictionnaire ou une liste.
+    Retourne toujours une liste de signaux.
     """
+
     signals = []
 
     def reject(reason):
-        if isinstance(diagnostics, list):
-            diagnostics.append(f"{symbol}: {reason}")
+        _diagnose(
+            diagnostics,
+            symbol,
+            reason,
+        )
 
     d1_rows = _normalize(d1)
     h4_rows = _normalize(h4)
 
+    # --------------------------------------------------------
+    # 1. Historique
+    # --------------------------------------------------------
+
     if len(d1_rows) < MIN_D1_CANDLES:
         reject(
-            f"Historique D1 insuffisant : {len(d1_rows)}/"
-            f"{MIN_D1_CANDLES} bougies."
+            f"Historique D1 insuffisant : "
+            f"{len(d1_rows)}/{MIN_D1_CANDLES}."
         )
         return signals
 
     if len(h4_rows) < MIN_H4_CANDLES:
         reject(
-            f"Historique H4 insuffisant : {len(h4_rows)}/"
-            f"{MIN_H4_CANDLES} bougies."
+            f"Historique H4 insuffisant : "
+            f"{len(h4_rows)}/{MIN_H4_CANDLES}."
         )
         return signals
 
     # --------------------------------------------------------
-    # 1. Biais Daily
+    # 2. Biais Daily
     # --------------------------------------------------------
 
     bias = _daily_bias(d1_rows)
 
     if bias == "NEUTRAL":
-        reject("Structure Daily neutre ou insuffisamment claire.")
+        reject(
+            "Biais D1 neutre : structure directionnelle non confirmee."
+        )
         return signals
 
     direction = "BUY" if bias == "BULLISH" else "SELL"
 
     # --------------------------------------------------------
-    # 2. Volatilite H4
-    # --------------------------------------------------------
-
-    atr_value = _atr(h4_rows)
-
-    if atr_value is None:
-        reject("ATR H4 indisponible.")
-        return signals
-
-    # --------------------------------------------------------
-    # 3. Structure H4 et BOS
+    # 3. Structure H4
     # --------------------------------------------------------
 
     h4_structure = _structure(h4_rows)
 
     if h4_structure != bias:
         reject(
-            "Desaccord entre le biais Daily et la structure H4."
+            f"Desaccord D1/H4 : D1={bias}, H4={h4_structure}."
         )
         return signals
 
-    bos = _find_bos(h4_rows, direction, atr_value)
+    # --------------------------------------------------------
+    # 4. ATR H4
+    # --------------------------------------------------------
+
+    atr_value = _atr(h4_rows)
+
+    if atr_value is None:
+        reject("ATR H4 indisponible ou invalide.")
+        return signals
+
+    # --------------------------------------------------------
+    # 5. BOS et displacement
+    # --------------------------------------------------------
+
+    bos = _find_bos(
+        h4_rows,
+        direction,
+        atr_value,
+    )
 
     if bos is None:
-        reject("Aucun BOS H4 accompagne d'un deplacement valide.")
+        reject(
+            "Aucun BOS H4 recent avec displacement suffisant."
+        )
+        return signals
+
+    if bos["age"] > MAX_BOS_AGE:
+        reject(
+            f"BOS trop ancien : {bos['age']} bougies H4."
+        )
         return signals
 
     # --------------------------------------------------------
-    # 4. Order Block H4
+    # 6. Order Block
     # --------------------------------------------------------
 
-    ob = _find_order_block(h4_rows, bos, direction)
+    ob = _find_order_block(
+        h4_rows,
+        bos,
+        direction,
+    )
 
     if ob is None:
-        reject("Aucun Order Block valide avant le BOS.")
+        reject(
+            "Aucune bougie opposee valide avant le BOS."
+        )
         return signals
 
-    if _is_invalidated(h4_rows, ob, direction):
-        reject("Order Block H4 deja invalide.")
+    if _is_invalidated(
+        h4_rows,
+        ob,
+        direction,
+    ):
+        reject(
+            "Order Block invalide par une cloture ulterieure."
+        )
         return signals
 
     zone_low = ob["zone_low"]
@@ -553,30 +601,43 @@ def find_signals(
     entry = ob["entry"]
 
     if zone_high <= zone_low:
-        reject("Dimensions de l'Order Block invalides.")
+        reject("Zone Order Block invalide.")
         return signals
 
     # --------------------------------------------------------
-    # 5. Verification du prix actuel
+    # 7. Prix actuel et entree sniper
     # --------------------------------------------------------
 
     current_price = _number(price_now)
 
     if current_price is None or current_price <= 0:
-        reject("Prix actuel indisponible : entree non validee.")
+        reject("Prix actuel absent ou invalide.")
         return signals
 
-    # Refuser une entree deja depassee.
+    distance = abs(current_price - entry)
+
+    if distance > MAX_ENTRY_DISTANCE_ATR * atr_value:
+        reject(
+            "Prix trop eloigne de l'entree sniper : "
+            f"{distance:.5f}, limite "
+            f"{MAX_ENTRY_DISTANCE_ATR * atr_value:.5f}."
+        )
+        return signals
+
     if direction == "BUY" and current_price <= entry:
-        reject("Entree BUY deja atteinte ou depassee.")
+        reject(
+            "BUY : prix au niveau de l'entree ou en dessous."
+        )
         return signals
 
     if direction == "SELL" and current_price >= entry:
-        reject("Entree SELL deja atteinte ou depassee.")
+        reject(
+            "SELL : prix au niveau de l'entree ou au-dessus."
+        )
         return signals
 
     # --------------------------------------------------------
-    # 6. Stop Loss avec marge ATR
+    # 8. Stop Loss
     # --------------------------------------------------------
 
     buffer = atr_value * SL_ATR_BUFFER
@@ -589,11 +650,11 @@ def find_signals(
     risk = abs(entry - stop_loss)
 
     if risk <= 0:
-        reject("Risque nul ou invalide.")
+        reject("Risque invalide : impossible de calculer le SL.")
         return signals
 
     # --------------------------------------------------------
-    # 7. Take Profit structurel et RR
+    # 9. Take Profit et RR
     # --------------------------------------------------------
 
     take_profit, rr = _target_from_structure(
@@ -604,21 +665,25 @@ def find_signals(
     )
 
     if take_profit is None or rr is None:
-        reject("Aucun objectif structurel ne respecte le RR minimum.")
+        reject(
+            "Aucune cible structurelle ne respecte le RR minimum."
+        )
         return signals
 
     if rr < MIN_RR:
-        reject(f"RR insuffisant : {rr:.2f}.")
+        reject(
+            f"RR insuffisant : {rr:.2f}, minimum {MIN_RR:.2f}."
+        )
         return signals
 
     # --------------------------------------------------------
-    # 8. Identifiant de signal
+    # 10. Identifiant unique
     # --------------------------------------------------------
 
     epoch = ob["candle"].get("epoch")
 
     if epoch is None:
-        epoch = bos["index"]
+        epoch = f"index-{ob['index']}"
 
     safe_epoch = str(epoch).replace(" ", "_").replace(":", "-")
 
@@ -628,7 +693,7 @@ def find_signals(
     )
 
     # --------------------------------------------------------
-    # 9. Signal final
+    # 11. Signal final
     # --------------------------------------------------------
 
     signal = {
@@ -648,28 +713,37 @@ def find_signals(
         "order_block_index": ob["index"],
         "bos_index": bos["index"],
         "bos_level": bos["broken_level"],
+        "bos_age": bos["age"],
         "atr_h4": atr_value,
         "engulfing": _engulfing(h4_rows, direction),
         "liquidity_sweep": _liquidity_sweep(h4_rows, direction),
         "notes": (
-            "Order Block H4 identifie avant le BOS ; "
-            "entree a l'ouverture de la bougie OB ; "
-            "biais Daily et structure H4 alignes."
+            "Biais D1 et structure H4 alignes ; "
+            "BOS avec displacement ; "
+            "entree a l'ouverture de l'Order Block."
         ),
     }
 
     signals.append(signal)
+
+    if isinstance(diagnostics, dict):
+        diagnostics.setdefault(symbol, []).append(
+            "Setup valide : BOS, Order Block et RR conformes."
+        )
+
+    elif isinstance(diagnostics, list):
+        diagnostics.append(
+            f"{symbol}: setup valide."
+        )
+
     return signals
 
 
 # ============================================================
-# FORMATAGE DES ALERTES
+# FORMATAGE TELEGRAM
 # ============================================================
 
 def format_message(signal):
-    """
-    Formate un signal pour Telegram ou les journaux.
-    """
     direction = signal.get("direction", "UNKNOWN")
     symbol = signal.get("symbol", "UNKNOWN")
 
@@ -678,40 +752,43 @@ def format_message(signal):
         "SELL": "VENTE",
     }.get(direction, direction)
 
-    entry = signal.get("entry")
-    stop_loss = signal.get("stop_loss")
-    take_profit = signal.get("take_profit")
-    rr = signal.get("rr")
+    rr = _number(signal.get("rr"))
 
-    lines = [
+    rr_text = (
+        f"1:{rr:.2f}"
+        if rr is not None
+        else "Indisponible"
+    )
+
+    return "\n".join([
         "TRADER AI PRO — SIGNAL SMC",
         "",
         f"Instrument : {symbol}",
         f"Direction : {direction_label}",
-        "Analyse : Daily (D1)",
+        "Biais : Daily (D1)",
         "Structure et Order Block : H4",
-        "Methode : Sniper Entry — ouverture de l'OB",
+        "Méthode : Sniper Entry — ouverture de l'OB",
         "",
         f"Zone OB : {signal.get('zone_low')} - "
         f"{signal.get('zone_high')}",
-        f"Entree : {entry}",
-        f"Stop Loss : {stop_loss}",
-        f"Take Profit : {take_profit}",
-        f"RR estime : 1:{rr:.2f}" if isinstance(rr, (int, float))
-        else f"RR estime : {rr}",
-        f"Prix observe : {signal.get('current_price')}",
+        f"Entrée : {signal.get('entry')}",
+        f"Stop Loss : {signal.get('stop_loss')}",
+        f"Take Profit : {signal.get('take_profit')}",
+        f"RR estimé : {rr_text}",
+        f"Prix observé : {signal.get('current_price')}",
         "",
         f"Biais D1 : {signal.get('d1_bias')}",
         f"Structure H4 : {signal.get('h4_structure')}",
-        f"BOS : {signal.get('bos_level')}",
+        f"Niveau BOS : {signal.get('bos_level')}",
+        f"Âge du BOS : {signal.get('bos_age')} bougies H4",
         f"ATR H4 : {signal.get('atr_h4')}",
-        f"Englobement H4 : {'Oui' if signal.get('engulfing') else 'Non'}",
-        f"Prise de liquidite : {'Oui' if signal.get('liquidity_sweep') else 'Non'}",
+        f"Englobement H4 : "
+        f"{'Oui' if signal.get('engulfing') else 'Non'}",
+        f"Prise de liquidité : "
+        f"{'Oui' if signal.get('liquidity_sweep') else 'Non'}",
         "",
         f"Note : {signal.get('notes', '')}",
         "",
-        "Scanner uniquement : aucun ordre automatique execute.",
-        "Signal a verifier avant toute decision de trading.",
-    ]
-
-    return "\n".join(lines)
+        "Scanner uniquement : aucun ordre automatique exécuté.",
+        "Vérifier le signal avant toute décision de trading.",
+    ])
