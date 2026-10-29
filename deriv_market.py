@@ -16,10 +16,12 @@ from typing import Any
 import websocket
 
 
+# L'endpoint public Deriv fonctionne dans le dernier rapport.
+# Les endpoints v3 restent disponibles en secours.
 URLS = [
+    "wss://api.derivws.com/trading/v1/options/ws/public",
     "wss://ws.derivws.com/websockets/v3?app_id=1089",
     "wss://ws.binaryws.com/websockets/v3?app_id=1089",
-    "wss://api.derivws.com/trading/v1/options/ws/public",
 ]
 
 VOLATILITY = re.compile(r"^(R_\d+|1HZ\d+V)$")
@@ -58,7 +60,7 @@ def _request(
     payload: dict[str, Any],
     timeout: int = DEFAULT_TIMEOUT,
 ) -> dict[str, Any]:
-    """Envoie une requête WebSocket et essaie les endpoints disponibles."""
+    """Envoie une requête WebSocket en essayant les endpoints disponibles."""
 
     errors: list[str] = []
 
@@ -83,13 +85,10 @@ def _request(
                 url,
                 timeout=timeout,
                 enable_multithread=True,
-                origin="https://app.deriv.com",
             )
 
-            ws.settimeout(timeout)
-            ws.send(json.dumps(payload))
-
             deadline = time.monotonic() + timeout
+            ws.send(json.dumps(payload))
 
             while time.monotonic() < deadline:
                 remaining = deadline - time.monotonic()
@@ -98,6 +97,7 @@ def _request(
                 try:
                     raw = ws.recv()
                 except websocket.WebSocketTimeoutException:
+                    errors.append(f"{url}: délai de réponse dépassé")
                     break
 
                 if not raw:
@@ -135,7 +135,6 @@ def _request(
 
             else:
                 errors.append(f"{url}: délai dépassé")
-                print("[DERIV] Délai dépassé.")
 
         except Exception as exc:
             message = f"{type(exc).__name__}: {exc}"
@@ -164,10 +163,8 @@ def get_current_price(
     symbol: str,
     timeout: int = DEFAULT_TIMEOUT,
 ) -> float | None:
-    """Retourne le dernier prix reçu, ou None si indisponible.
+    """Retourne le dernier prix reçu, ou None si indisponible."""
 
-    Il s'agit d'une cotation ponctuelle, pas d'un flux continu.
-    """
     if not _valid_symbol(symbol):
         print(f"[DERIV] Symbole invalide : {symbol}")
         return None
@@ -195,7 +192,7 @@ def get_current_price(
         return None
 
     if not math.isfinite(quote) or quote <= 0:
-        print(f"[DERIV] Prix non valide pour {symbol} : {quote}")
+        print(f"[DERIV] Prix non valide pour {symbol}: {quote}")
         return None
 
     print(f"[DERIV] Prix reçu — {symbol}: {quote}")
@@ -213,18 +210,26 @@ def get_candles(
     timeframe = str(timeframe).upper()
 
     if not _valid_symbol(symbol):
-        return {"error": f"Symbole non pris en charge : {symbol}"}
+        return {
+            "error": f"Symbole non pris en charge : {symbol}"
+        }
 
     if timeframe not in GRANULARITY:
-        return {"error": f"Timeframe non pris en charge : {timeframe}"}
+        return {
+            "error": f"Timeframe non pris en charge : {timeframe}"
+        }
 
     try:
         count = int(count)
     except (TypeError, ValueError):
-        return {"error": "Le nombre de bougies doit être un entier."}
+        return {
+            "error": "Le nombre de bougies doit être un entier."
+        }
 
     if count < 1:
-        return {"error": "Le nombre de bougies doit être positif."}
+        return {
+            "error": "Le nombre de bougies doit être positif."
+        }
 
     count = min(count, MAX_CANDLES)
     granularity = GRANULARITY[timeframe]
@@ -242,13 +247,17 @@ def get_candles(
     )
 
     if response.get("error"):
-        return {"error": _extract_error(response)}
+        return {
+            "error": _extract_error(response)
+        }
 
     raw_candles = response.get("candles")
 
     if not isinstance(raw_candles, list):
         return {
-            "error": f"Réponse Deriv sans liste de bougies valide pour {symbol}."
+            "error": (
+                f"Réponse Deriv sans liste de bougies valide pour {symbol}."
+            )
         }
 
     now = time.time()
@@ -293,29 +302,34 @@ def get_candles(
         if candle["high"] < candle["low"]:
             continue
 
-        if candle["high"] < max(candle["open"], candle["close"]):
+        if candle["high"] < max(
+            candle["open"],
+            candle["close"],
+        ):
             continue
 
-        if candle["low"] > min(candle["open"], candle["close"]):
+        if candle["low"] > min(
+            candle["open"],
+            candle["close"],
+        ):
             continue
 
-        # Ne conserve que les bougies entièrement clôturées.
+        # Écarte les bougies encore en formation.
         if epoch + granularity > now:
             continue
 
         candles.append(candle)
 
     candles.sort(key=lambda item: item["epoch"])
+    result = candles[-count:]
 
-    if not candles:
+    if not result:
         return {
             "error": (
                 f"Aucune bougie clôturée disponible pour "
                 f"{symbol} en {timeframe}."
             )
         }
-
-    result = candles[-count:]
 
     print(
         f"[DERIV] {symbol} {timeframe} : "
@@ -344,6 +358,10 @@ def get_synthetic_symbols(
     )
 
     if response.get("error"):
+        print(
+            "[DERIV] Impossible de récupérer la liste des indices : "
+            f"{_extract_error(response)}"
+        )
         return []
 
     symbols = response.get("active_symbols", [])
@@ -362,4 +380,11 @@ def get_synthetic_symbols(
         if _valid_symbol(symbol):
             result.append(symbol)
 
-    return sorted(set(result))
+    result = sorted(set(result))
+
+    print(
+        f"[DERIV] {len(result)} symboles synthétiques reconnus."
+    )
+
+    return result
+                
