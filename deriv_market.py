@@ -1,3 +1,4 @@
+
 """TRADER AI PRO — Connexion publique aux marchés Deriv.
 
 Récupère les bougies historiques et le prix courant des indices.
@@ -7,6 +8,7 @@ Ce module ne passe aucun ordre.
 from __future__ import annotations
 
 import json
+import math
 import re
 import time
 from typing import Any
@@ -14,10 +16,11 @@ from typing import Any
 import websocket
 
 
+# Priorité à l'API WebSocket v3 pour ticks et bougies historiques.
 URLS = [
-    "wss://api.derivws.com/trading/v1/options/ws/public",
     "wss://ws.derivws.com/websockets/v3?app_id=1089",
     "wss://ws.binaryws.com/websockets/v3?app_id=1089",
+    "wss://api.derivws.com/trading/v1/options/ws/public",
 ]
 
 VOLATILITY = re.compile(r"^(R_\d+|1HZ\d+V)$")
@@ -35,7 +38,7 @@ DEFAULT_TIMEOUT = 10
 
 
 def _valid_symbol(symbol: str) -> bool:
-    """Vérifie que le symbole correspond à un indice synthétique pris en charge."""
+    """Vérifie le format du symbole synthétique."""
     return bool(
         isinstance(symbol, str)
         and VOLATILITY.fullmatch(symbol.strip())
@@ -43,11 +46,11 @@ def _valid_symbol(symbol: str) -> bool:
 
 
 def _request(
-    payload: dict,
+    payload: dict[str, Any],
     timeout: int = DEFAULT_TIMEOUT,
-) -> dict:
-    """Envoie une requête WebSocket et essaie les endpoints disponibles."""
-    errors = []
+) -> dict[str, Any]:
+    """Essaie les endpoints WebSocket et retourne une réponse exploitable."""
+    errors: list[str] = []
 
     for url in URLS:
         ws = None
@@ -63,15 +66,20 @@ def _request(
             deadline = time.monotonic() + timeout
 
             while time.monotonic() < deadline:
-                ws.settimeout(max(0.5, deadline - time.monotonic()))
-                raw = ws.recv()
+                remaining = deadline - time.monotonic()
+                ws.settimeout(max(0.5, remaining))
+
+                try:
+                    raw = ws.recv()
+                except websocket.WebSocketTimeoutException:
+                    break
 
                 if not raw:
                     continue
 
                 try:
                     response = json.loads(raw)
-                except json.JSONDecodeError:
+                except (json.JSONDecodeError, TypeError):
                     continue
 
                 if not isinstance(response, dict):
@@ -79,45 +87,52 @@ def _request(
 
                 if response.get("error"):
                     error = response["error"]
-                    message = (
-                        error.get("message", str(error))
-                        if isinstance(error, dict)
-                        else str(error)
-                    )
-                    errors.append(f"{url}: {message}")
+                    if isinstance(error, dict):
+                        message = error.get(
+                            "message",
+                            str(error),
+                        )
+                        code = error.get("code", "")
+                        detail = f"{code}: {message}" if code else message
+                    else:
+                        detail = str(error)
+
+                    errors.append(f"{url}: {detail}")
                     break
 
-                # Une réponse Deriv utile contient normalement le type
-                # demandé, ou un objet "error" traité ci-dessus.
-                expected = (
-                    "ticks_history" in payload
-                    or "ticks" in payload
-                    or "active_symbols" in payload
-                )
+                # Accepter uniquement une réponse correspondant
+                # au type de données demandé.
+                if "ticks" in payload:
+                    if (
+                        response.get("msg_type") == "tick"
+                        and isinstance(response.get("tick"), dict)
+                    ):
+                        return response
 
-                if expected and any(
-                    key in response
-                    for key in (
-                        "history",
-                        "candles",
-                        "tick",
-                        "active_symbols",
-                    )
-                ):
-                    return response
+                elif "ticks_history" in payload:
+                    if (
+                        isinstance(response.get("candles"), list)
+                        or isinstance(response.get("history"), dict)
+                    ):
+                        return response
 
-                if response.get("msg_type") in (
-                    "ticks",
-                    "candles",
-                    "history",
-                    "active_symbols",
-                ):
-                    return response
+                elif "active_symbols" in payload:
+                    if isinstance(response.get("active_symbols"), list):
+                        return response
 
-            errors.append(f"{url}: aucune réponse exploitable")
+                # Ignorer les réponses d'initialisation non pertinentes.
+
+            else:
+                errors.append(f"{url}: délai dépassé sans réponse exploitable")
+                continue
+
+            if not errors or not errors[-1].startswith(url):
+                errors.append(f"{url}: aucune réponse exploitable")
 
         except Exception as exc:
-            errors.append(f"{url}: {type(exc).__name__}: {exc}")
+            errors.append(
+                f"{url}: {type(exc).__name__}: {exc}"
+            )
 
         finally:
             if ws is not None:
@@ -126,46 +141,46 @@ def _request(
                 except Exception:
                     pass
 
-    return {
-        "error": {
-            "message": "Échec des endpoints Deriv : " + " ; ".join(errors)
-        }
-    }
+    message = "Échec des endpoints Deriv : " + " ; ".join(errors)
+    return {"error": {"message": message}}
 
 
 def get_current_price(
     symbol: str,
     timeout: int = DEFAULT_TIMEOUT,
 ) -> float | None:
-    """Retourne le dernier prix coté par Deriv, ou None en cas d'échec.
-
-    Ce prix est une observation ponctuelle, pas un flux temps réel continu.
-    """
+    """Retourne le dernier prix reçu, ou None si la cotation échoue."""
     if not _valid_symbol(symbol):
         return None
 
     response = _request(
         {
-            "ticks": symbol,
+            "ticks": symbol.strip(),
             "subscribe": 0,
         },
         timeout=timeout,
     )
 
     if response.get("error"):
+        print(
+            f"[DERIV] Prix indisponible pour {symbol}: "
+            f"{response['error'].get('message', 'Erreur inconnue')}"
+        )
         return None
 
     tick = response.get("tick")
-
     if not isinstance(tick, dict):
+        print(f"[DERIV] Réponse sans tick valide pour {symbol}.")
         return None
 
     try:
         quote = float(tick["quote"])
     except (KeyError, TypeError, ValueError):
+        print(f"[DERIV] Cotation manquante ou invalide pour {symbol}.")
         return None
 
-    if quote <= 0:
+    if not math.isfinite(quote) or quote <= 0:
+        print(f"[DERIV] Cotation non valide pour {symbol}: {quote}")
         return None
 
     return quote
@@ -176,8 +191,8 @@ def get_candles(
     timeframe: str,
     count: int = 50,
     timeout: int = DEFAULT_TIMEOUT,
-) -> dict:
-    """Récupère les bougies historiques clôturées d'un indice synthétique."""
+) -> dict[str, Any]:
+    """Récupère les bougies historiques clôturées."""
     timeframe = str(timeframe).upper()
 
     if not _valid_symbol(symbol):
@@ -199,7 +214,7 @@ def get_candles(
 
     response = _request(
         {
-            "ticks_history": symbol,
+            "ticks_history": symbol.strip(),
             "adjust_start_time": 1,
             "count": count,
             "end": "latest",
@@ -210,21 +225,25 @@ def get_candles(
     )
 
     if response.get("error"):
-        return {
-            "error": response["error"].get(
-                "message",
-                "Erreur inconnue de l'API Deriv",
-            )
-        }
+        message = response["error"].get(
+            "message",
+            "Erreur inconnue de l'API Deriv",
+        )
+        return {"error": message}
 
     raw_candles = response.get("candles")
 
     if not isinstance(raw_candles, list):
-        return {"error": "Réponse Deriv sans liste de bougies valide."}
+        return {
+            "error": (
+                f"Réponse Deriv sans liste de bougies valide "
+                f"pour {symbol} en {timeframe}."
+            )
+        }
 
     now = time.time()
-    candles = []
-    seen = set()
+    candles: list[dict[str, float | int]] = []
+    seen: set[int] = set()
 
     for item in raw_candles:
         if not isinstance(item, dict):
@@ -239,7 +258,7 @@ def get_candles(
                 "low": float(item["low"]),
                 "close": float(item["close"]),
             }
-        except (KeyError, TypeError, ValueError):
+        except (KeyError, TypeError, ValueError, OverflowError):
             continue
 
         if epoch in seen:
@@ -254,7 +273,7 @@ def get_candles(
             candle["close"],
         ]
 
-        if any(value <= 0 for value in values):
+        if any(not math.isfinite(value) or value <= 0 for value in values):
             continue
 
         if candle["high"] < candle["low"]:
@@ -266,7 +285,7 @@ def get_candles(
         if candle["low"] > min(candle["open"], candle["close"]):
             continue
 
-        # Exclure la bougie encore en formation.
+        # Exclure les bougies qui ne sont pas encore clôturées.
         if epoch + granularity > now:
             continue
 
@@ -285,7 +304,7 @@ def get_candles(
     return {
         "symbol": symbol,
         "timeframe": timeframe,
-        "count": len(candles),
+        "count": len(candles[-count:]),
         "candles": candles[-count:],
     }
 
@@ -303,6 +322,10 @@ def get_synthetic_symbols(
     )
 
     if response.get("error"):
+        print(
+            "[DERIV] Impossible de récupérer les symboles : "
+            f"{response['error'].get('message', 'Erreur inconnue')}"
+        )
         return []
 
     symbols = response.get("active_symbols", [])
@@ -322,3 +345,4 @@ def get_synthetic_symbols(
             result.append(symbol)
 
     return sorted(set(result))
+    
