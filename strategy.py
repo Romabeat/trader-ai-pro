@@ -1,3 +1,4 @@
+
 """TRADER AI PRO — Stratégie SMC H4/H1.
 Détection anticipée des POI et suivi indicatif des setups.
 Aucun ordre n'est envoyé à Deriv.
@@ -9,8 +10,26 @@ from datetime import datetime, timezone
 from math import isfinite
 from typing import Any
 
+
 MIN_RR = 1.0
 MIN_CANDLES = 30
+
+
+INDEX_NAMES = {
+    "1HZ10V": "Volatility 10 (1s) Index",
+    "1HZ15V": "Volatility 15 (1s) Index",
+    "1HZ25V": "Volatility 25 (1s) Index",
+    "1HZ30V": "Volatility 30 (1s) Index",
+    "1HZ50V": "Volatility 50 (1s) Index",
+    "1HZ75V": "Volatility 75 (1s) Index",
+    "1HZ90V": "Volatility 90 (1s) Index",
+    "1HZ100V": "Volatility 100 (1s) Index",
+    "R_10": "Volatility 10 Index",
+    "R_25": "Volatility 25 Index",
+    "R_50": "Volatility 50 Index",
+    "R_75": "Volatility 75 Index",
+    "R_100": "Volatility 100 Index",
+}
 
 
 def _num(row: dict, *keys: str) -> float:
@@ -182,7 +201,11 @@ def _ob_candidate(
 
             first_index = max(0, impulse_index - 5)
 
-            for index in range(impulse_index - 1, first_index - 1, -1):
+            for index in range(
+                impulse_index - 1,
+                first_index - 1,
+                -1,
+            ):
                 candle = h1[index]
 
                 if direction == "BUY":
@@ -203,7 +226,7 @@ def _is_invalidated(
     zone_high: float,
     ob_index: int,
 ) -> bool:
-    """Invalide la zone si une clôture H1 la traverse complètement."""
+    """Invalide la zone si une clôture H1 la traverse."""
     for candle in h1[ob_index + 1:]:
         if direction == "BUY" and candle["c"] < zone_low:
             return True
@@ -273,12 +296,12 @@ def find_signals(
     Retourne au maximum une POI SMC.
 
     États :
-      POI_DETECTED : zone repérée avant le retour du prix.
-      PRICE_IN_ZONE : prix observé dans la zone.
+      POI_DETECTED : zone repérée, en attente d'un éventuel retour.
+      PRICE_IN_ZONE : prix courant dans la zone.
       CONFIRMED : prix dans la zone avec englobement ou sweep.
 
-    Le sweep reste facultatif.
-    Le RR minimum est de 1:1.
+    Un prix courant absent ne doit jamais être remplacé
+    par la dernière clôture H1.
     """
     if diagnostics is not None:
         diagnostics.clear()
@@ -334,14 +357,8 @@ def find_signals(
     ):
         return reject("Order Block invalidé par une clôture H1")
 
-    # Entrée planifiée au milieu de la zone, pas au prix actuel.
     entry = (zone_low + zone_high) / 2.0
-
-    if direction == "BUY":
-        stop_loss = zone_low
-    else:
-        stop_loss = zone_high
-
+    stop_loss = zone_low if direction == "BUY" else zone_high
     risk = abs(entry - stop_loss)
 
     if risk <= 0:
@@ -354,6 +371,7 @@ def find_signals(
             level for _, level in highs
             if level > entry
         ]
+
         if h4_high is not None and h4_high > entry:
             candidates.append(h4_high)
 
@@ -361,6 +379,7 @@ def find_signals(
             level for level in set(candidates)
             if (level - entry) / risk >= MIN_RR
         ]
+
         take_profit = min(valid_targets) if valid_targets else None
 
     else:
@@ -368,6 +387,7 @@ def find_signals(
             level for _, level in lows
             if level < entry
         ]
+
         if h4_low is not None and h4_low < entry:
             candidates.append(h4_low)
 
@@ -375,6 +395,7 @@ def find_signals(
             level for level in set(candidates)
             if (entry - level) / risk >= MIN_RR
         ]
+
         take_profit = max(valid_targets) if valid_targets else None
 
     if take_profit is None:
@@ -383,23 +404,24 @@ def find_signals(
     reward = abs(take_profit - entry)
     rr = reward / risk
 
-    try:
-        price = (
-            float(price_now)
-            if price_now is not None
-            else h1_rows[-1]["c"]
-        )
-    except (TypeError, ValueError):
-        return reject("Prix actuel invalide")
+    # Un prix manquant reste manquant : ne pas utiliser la clôture H1
+    # comme substitut à une cotation courante.
+    if price_now is None:
+        price = None
+    else:
+        try:
+            price = float(price_now)
+        except (TypeError, ValueError):
+            return reject("Prix actuel invalide")
 
-    if not isfinite(price):
-        return reject("Prix actuel non fini ou invalide")
+        if not isfinite(price):
+            return reject("Prix actuel non fini ou invalide")
 
-    price_inside = zone_low <= price <= zone_high
-    last = h1_rows[-1]
+    price_inside = (
+        price is not None
+        and zone_low <= price <= zone_high
+    )
 
-    # La confirmation est une confluence, pas une condition obligatoire
-    # pour détecter la POI.
     sweep = _liquidity_sweep(h1_rows, direction)
     engulfing = _engulfing(h1_rows, direction)
 
@@ -410,7 +432,9 @@ def find_signals(
     else:
         state = "POI_DETECTED"
 
+    last = h1_rows[-1]
     epoch = h1_rows[ob_index].get("epoch", ob_index)
+
     signal_id = (
         f"{symbol}-{direction}-POI-{epoch}-"
         f"{zone_low:.8f}-{zone_high:.8f}"
@@ -419,6 +443,7 @@ def find_signals(
     signal = {
         "signal_id": signal_id,
         "symbol": symbol,
+        "index_name": INDEX_NAMES.get(symbol, symbol),
         "direction": direction,
         "entry": entry,
         "stop_loss": stop_loss,
@@ -442,6 +467,12 @@ def find_signals(
 
     if diagnostics is not None:
         diagnostics["reason"] = f"POI détectée : {state}"
+
+        if price is None:
+            diagnostics["price_warning"] = (
+                "Prix courant indisponible ; confirmation impossible"
+            )
+
         diagnostics["direction"] = direction
         diagnostics["rr"] = round(rr, 3)
         diagnostics["status"] = state
@@ -458,12 +489,25 @@ def format_message(signal: dict) -> str:
     )
 
     state = signal.get("status", "POI_DETECTED")
+
     labels = {
-        "POI_DETECTED": "ZONE D'INTÉRÊT DÉTECTÉE",
-        "PRICE_IN_ZONE": "PRIX DANS LA ZONE",
+        "POI_DETECTED": "NOUVELLE POI SMC DÉTECTÉE",
+        "PRICE_IN_ZONE": "PRIX DANS LA ZONE POI",
         "CONFIRMED": "SETUP AVEC CONFIRMATION TECHNIQUE",
         "INVALIDATED": "ZONE INVALIDÉE",
     }
+
+    symbol = signal.get("symbol", "Inconnu")
+    index_name = signal.get(
+        "index_name",
+        INDEX_NAMES.get(symbol, symbol),
+    )
+
+    price = signal.get("price_now")
+    if price is None:
+        price_text = "INDISPONIBLE — cotation non reçue"
+    else:
+        price_text = f"{price:.8f}"
 
     sweep = (
         "Oui"
@@ -478,23 +522,27 @@ def format_message(signal: dict) -> str:
     )
 
     return (
-        "📊 TRADER AI PRO — SMC H4/H1\n\n"
-        f"État : {labels.get(state, state)}\n"
+        "🔎 TRADER AI PRO — SMC H4/H1\n\n"
+        f"{labels.get(state, state)}\n\n"
+        f"Indice : {index_name}\n"
+        f"Symbole Deriv : {symbol}\n"
         f"ID : {signal['signal_id']}\n"
-        f"Actif : {signal['symbol']}\n"
         f"Direction : {direction}\n"
+        f"Structure H4 : {signal['h4_structure']}\n"
         f"Zone POI H1 : {signal['zone_low']:.8f} – "
         f"{signal['zone_high']:.8f}\n"
         f"Entrée planifiée : {signal['entry']:.8f}\n"
-        f"Prix observé : {signal.get('price_now', 0):.8f}\n"
+        f"Prix observé : {price_text}\n"
         f"Stop-loss indicatif : {signal['stop_loss']:.8f}\n"
         f"Take-profit indicatif : {signal['take_profit']:.8f}\n"
         f"RR planifié : 1:{signal['rr']:.2f}\n"
-        f"Structure H4 : {signal['h4_structure']}\n"
         f"Englobement H1 : {engulfing}\n"
         f"Sweep de liquidité : {sweep}\n"
         f"Heure UTC : {signal['timestamp_utc']}\n\n"
-        "⚠️ Analyse indicative, non garantie. Vérifie le graphique "
-        "avant toute entrée. Exécution manuelle uniquement sur compte "
-        "démo. Aucun ordre automatique."
-                         )
+        "⚠️ Une POI détectée n'est pas une entrée exécutée. "
+        "Si le prix courant est indisponible, la confirmation "
+        "du retour dans la zone n'est pas possible.\n"
+        "Vérifie le graphique avant toute entrée. "
+        "Compte démo uniquement. Aucun ordre automatique."
+            )
+                                       
