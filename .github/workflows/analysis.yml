@@ -73,5 +73,4 @@ steps:
       fi
 
   - name: Executer l'analyse programmee
-    run: |
-      python -u scheduled_analysis.py
+    run: python -u scheduled_analysis.py
