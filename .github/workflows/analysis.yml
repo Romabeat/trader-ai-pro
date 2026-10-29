@@ -19,7 +19,7 @@ jobs:
 
     env:
       DRY_RUN: "true"
-      ENABLE_TELEGRAM_ALERTS: "false"
+      ENABLE_TELEGRAM_ALERTS: "true"
       PYTHONUNBUFFERED: "1"
 
     steps:
