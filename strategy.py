@@ -1,253 +1,197 @@
-
-"""TRADER AI PRO - Strategie multi-timeframe.
-Contexte D1, direction H4 et setup H1.
-La confirmation M30 et le RR minimal ne sont pas obligatoires.
-Les signaux sont indicatifs. Aucun ordre n'est execute.
+"""TRADER AI PRO — SMC indicatif, H4 structure + H1 entry.
+Aucun ordre n'est envoyé à Deriv. Ce module ne fait que détecter et formater des signaux.
 """
+from __future__ import annotations
 
-from analysis_engine import analyze_candles, normalize_candles
+from datetime import datetime, timezone
+from math import isfinite
+from typing import Any
 
-MIN_CANDLES = 30
-MAX_ENTRY_DRIFT = 0.005
+
+def _num(row: dict, *keys: str) -> float:
+    for key in keys:
+        value = row.get(key)
+        if value is not None:
+            try:
+                value = float(value)
+                if isfinite(value):
+                    return value
+            except (TypeError, ValueError):
+                pass
+    raise ValueError(f"Valeur OHLC manquante: {keys}")
 
 
-def _get_candles(data):
-    """Accepte une liste de bougies ou la reponse de get_candles."""
-    if isinstance(data, dict):
-        data = data.get("candles", [])
-
-    if not isinstance(data, list):
+def _normalize(rows: Any) -> list[dict]:
+    if not isinstance(rows, (list, tuple)):
         return []
-
-    return normalize_candles(data)
-
-
-def _direction(value):
-    """Convertit les tendances en BUY, SELL ou NEUTRAL."""
-    if not isinstance(value, str):
-        return "NEUTRAL"
-
-    value = value.strip().upper()
-
-    if value in (
-        "BUY", "BULLISH", "UP", "LONG",
-        "HAUSSIERE", "HAUSSIER",
-    ):
-        return "BUY"
-
-    if value in (
-        "SELL", "BEARISH", "DOWN", "SHORT",
-        "BAISSIERE", "BAISSIER",
-    ):
-        return "SELL"
-
-    return "NEUTRAL"
-
-
-def _analyze(candles):
-    """Execute l'analyse technique."""
-    if len(candles) < MIN_CANDLES:
-        return {}
-
-    try:
-        result = analyze_candles(candles)
-    except (TypeError, ValueError, KeyError, IndexError):
-        return {}
-
-    return result if isinstance(result, dict) else {}
-
-
-def _extract_setup(result):
-    """Extrait et valide le setup H1 produit par le moteur."""
-    if not isinstance(result, dict):
-        return None
-
-    setup = result.get("signal")
-
-    if not isinstance(setup, dict):
-        return None
-
-    direction = _direction(setup.get("direction"))
-
-    if direction not in ("BUY", "SELL"):
-        return None
-
-    try:
-        entry = float(setup["entry"])
-        stop_loss = float(setup["stop_loss"])
-        take_profit = float(setup["take_profit"])
-    except (KeyError, TypeError, ValueError):
-        return None
-
-    if min(entry, stop_loss, take_profit) <= 0:
-        return None
-
-    if direction == "BUY":
-        if not stop_loss < entry < take_profit:
-            return None
-    else:
-        if not take_profit < entry < stop_loss:
-            return None
-
-    risk = abs(entry - stop_loss)
-    reward = abs(take_profit - entry)
-
-    if risk <= 0:
-        return None
-
-    # Aucun RR minimal : on calcule simplement le ratio réel.
-    rr = reward / risk
-
-    return {
-        "direction": direction,
-        "entry": entry,
-        "stop_loss": stop_loss,
-        "take_profit": take_profit,
-        "rr": rr,
-        "reason": setup.get("reason", ""),
-        "bar_time": setup.get("bar_time", 0),
-        "level": setup.get("level"),
-    }
-
-
-def find_signals(
-    symbol,
-    h1,
-    h2=None,
-    h4=None,
-    d1=None,
-    price_now=None,
-    m30=None,
-):
-    """Recherche un setup H1 concordant avec H4 et D1.
-    M30 est facultatif et aucune confirmation M30 n'est exigée.
-    Aucun ratio Reward/Risk minimal n'est impose.
-    """
-
-    candles_h1 = _get_candles(h1)
-    candles_h4 = _get_candles(h4)
-    candles_d1 = _get_candles(d1)
-
-    # Seuls H1, H4 et D1 sont obligatoires.
-    if any(
-        len(candles) < MIN_CANDLES
-        for candles in (candles_h1, candles_h4, candles_d1)
-    ):
-        return []
-
-    analysis_d1 = _analyze(candles_d1)
-    analysis_h4 = _analyze(candles_h4)
-    analysis_h1 = _analyze(candles_h1)
-
-    direction_d1 = _direction(analysis_d1.get("trend"))
-    direction_h4 = _direction(analysis_h4.get("trend"))
-    direction_h1 = _direction(analysis_h1.get("trend"))
-
-    # H4 doit fournir une direction exploitable.
-    if direction_h4 not in ("BUY", "SELL"):
-        return []
-
-    # D1 ne doit pas contredire H4 lorsqu'il donne une direction claire.
-    if (
-        direction_d1 in ("BUY", "SELL")
-        and direction_d1 != direction_h4
-    ):
-        return []
-
-    # H1 doit être dans le même sens que H4.
-    if direction_h1 != direction_h4:
-        return []
-
-    # Le moteur H1 doit fournir un setup avec des niveaux valides.
-    setup = _extract_setup(analysis_h1)
-
-    if setup is None:
-        return []
-
-    if setup["direction"] != direction_h4:
-        return []
-
-    entry = setup["entry"]
-
-    # Si un prix actuel est fourni, éviter une entrée trop éloignée.
-    if price_now is not None:
+    out = []
+    for i, row in enumerate(rows):
+        if not isinstance(row, dict):
+            continue
         try:
-            current_price = float(price_now)
-        except (TypeError, ValueError):
-            return []
+            candle = {
+                "o": _num(row, "o", "open"),
+                "h": _num(row, "h", "high"),
+                "l": _num(row, "l", "low"),
+                "c": _num(row, "c", "close"),
+                "epoch": row.get("epoch", row.get("time", row.get("timestamp", i))),
+            }
+            if candle["h"] >= candle["l"] and candle["h"] >= max(candle["o"], candle["c"]) and candle["l"] <= min(candle["o"], candle["c"]):
+                out.append(candle)
+        except ValueError:
+            continue
+    return out
 
-        if current_price <= 0:
-            return []
 
-        drift = abs(current_price - entry) / entry
+def _pivots(rows: list[dict], radius: int = 2) -> tuple[list[tuple[int, float]], list[tuple[int, float]]]:
+    highs, lows = [], []
+    for i in range(radius, len(rows) - radius):
+        h, lo = rows[i]["h"], rows[i]["l"]
+        if all(h > rows[j]["h"] for j in range(i-radius, i+radius+1) if j != i):
+            highs.append((i, h))
+        if all(lo < rows[j]["l"] for j in range(i-radius, i+radius+1) if j != i):
+            lows.append((i, lo))
+    return highs, lows
 
-        if drift > MAX_ENTRY_DRIFT:
-            return []
 
-    stop_loss = setup["stop_loss"]
-    take_profit = setup["take_profit"]
+def _structure(h4: list[dict]) -> tuple[str, float | None, float | None]:
+    highs, lows = _pivots(h4, 2)
+    if len(highs) < 2 or len(lows) < 2:
+        return "NEUTRE", highs[-1][1] if highs else None, lows[-1][1] if lows else None
+    close = h4[-1]["c"]
+    last_high, last_low = highs[-1][1], lows[-1][1]
+    if close > last_high and highs[-1][1] > highs[-2][1] and lows[-1][1] > lows[-2][1]:
+        return "HAUSSIERE", last_high, last_low
+    if close < last_low and highs[-1][1] < highs[-2][1] and lows[-1][1] < lows[-2][1]:
+        return "BAISSIERE", last_high, last_low
+    # Structure progressive sans cassure récente : direction de swing, mais moins forte.
+    if highs[-1][1] > highs[-2][1] and lows[-1][1] > lows[-2][1]:
+        return "HAUSSIERE", last_high, last_low
+    if highs[-1][1] < highs[-2][1] and lows[-1][1] < lows[-2][1]:
+        return "BAISSIERE", last_high, last_low
+    return "NEUTRE", last_high, last_low
 
-    risk = abs(entry - stop_loss)
-    reward = abs(take_profit - entry)
 
-    if risk <= 0:
+def _ob_candidate(h1: list[dict], direction: str) -> tuple[float, float, int] | None:
+    """Repère une bougie opposée précédant une impulsion qui casse un pivot récent."""
+    if len(h1) < 25:
+        return None
+    highs, lows = _pivots(h1[:-1], 2)
+    if direction == "BUY":
+        candidates = [(i, p) for i, p in highs if i >= len(h1) - 18]
+        if not candidates:
+            return None
+        pivot_i, pivot = candidates[-1]
+        for impulse_i in range(max(pivot_i + 1, len(h1) - 8), len(h1)):
+            candle = h1[impulse_i]
+            prior = h1[impulse_i - 1]
+            if candle["c"] > pivot and candle["c"] > candle["o"]:
+                for j in range(impulse_i - 1, max(-1, impulse_i - 6), -1):
+                    if h1[j]["c"] < h1[j]["o"]:
+                        return h1[j]["l"], h1[j]["h"], j
+    else:
+        candidates = [(i, p) for i, p in lows if i >= len(h1) - 18]
+        if not candidates:
+            return None
+        pivot_i, pivot = candidates[-1]
+        for impulse_i in range(max(pivot_i + 1, len(h1) - 8), len(h1)):
+            candle = h1[impulse_i]
+            if candle["c"] < pivot and candle["c"] < candle["o"]:
+                for j in range(impulse_i - 1, max(-1, impulse_i - 6), -1):
+                    if h1[j]["c"] > h1[j]["o"]:
+                        return h1[j]["l"], h1[j]["h"], j
+    return None
+
+
+def _liquidity_sweep(h1: list[dict], direction: str) -> bool:
+    highs, lows = _pivots(h1[:-1], 2)
+    last = h1[-1]
+    if direction == "BUY" and lows:
+        level = lows[-1][1]
+        return last["l"] < level and last["c"] > level
+    if direction == "SELL" and highs:
+        level = highs[-1][1]
+        return last["h"] > level and last["c"] < level
+    return False
+
+
+def find_signals(symbol: str, d1=None, h4=None, h1=None, m30=None, price_now=None) -> list[dict]:
+    """Retourne une liste vide ou un seul signal confirmé par structure H4 et retour dans OB H1."""
+    h4_rows, h1_rows = _normalize(h4), _normalize(h1)
+    if len(h4_rows) < 30 or len(h1_rows) < 30:
+        return []
+    trend, h4_high, h4_low = _structure(h4_rows)
+    if trend not in ("HAUSSIERE", "BAISSIERE"):
+        return []
+    direction = "BUY" if trend == "HAUSSIERE" else "SELL"
+    ob = _ob_candidate(h1_rows, direction)
+    if not ob:
+        return []
+    zone_low, zone_high, ob_index = ob
+    last = h1_rows[-1]
+    price = float(price_now) if price_now is not None else last["c"]
+    # Signal uniquement au retour réel dans la zone de l'OB.
+    overlaps = last["l"] <= zone_high and last["h"] >= zone_low
+    price_inside = zone_low <= price <= zone_high
+    if not overlaps or not price_inside:
         return []
 
+    highs, lows = _pivots(h1_rows[:-1], 2)
+    if direction == "BUY":
+        targets = [p for _, p in highs if p > price]
+        tp = min(targets) if targets else (h4_high if h4_high and h4_high > price else None)
+        sl = zone_low
+    else:
+        targets = [p for _, p in lows if p < price]
+        tp = max(targets) if targets else (h4_low if h4_low and h4_low < price else None)
+        sl = zone_high
+    if tp is None or (direction == "BUY" and not (sl < price < tp)) or (direction == "SELL" and not (tp < price < sl)):
+        return []
+    risk = abs(price - sl)
+    reward = abs(tp - price)
+    if risk <= 0 or reward <= 0:
+        return []
+    # Filtre anti-bruit : cible au moins aussi éloignée que le stop.
     rr = reward / risk
-
+    if rr < 1.0:
+        return []
+    sweep = _liquidity_sweep(h1_rows, direction)
+    epoch = last.get("epoch")
+    signal_id = f"{symbol}-{direction}-{epoch}-{price:.8f}-{zone_low:.8f}-{zone_high:.8f}"
     return [{
+        "signal_id": signal_id,
         "symbol": symbol,
-        "direction": setup["direction"],
-        "signal": setup["direction"],
-        "entry": entry,
-        "stop_loss": stop_loss,
-        "take_profit": take_profit,
-        "rr": round(rr, 2),
-        "timeframe": "H1",
-        "confirmation_timeframe": "Aucune confirmation M30 obligatoire",
-        "trend_h4": direction_h4,
-        "trend_d1": direction_d1,
-        "trend_h1": direction_h1,
-        "status": "CONFIRMED",
-        "reason": setup["reason"],
-        "bar_time": setup["bar_time"],
+        "direction": direction,
+        "entry": price,
+        "stop_loss": sl,
+        "take_profit": tp,
+        "rr": rr,
+        "zone_low": zone_low,
+        "zone_high": zone_high,
+        "h4_structure": trend,
+        "liquidity_sweep": sweep,
+        "candle_time": str(epoch),
+        "timeframe": "H4 structure / H1 entrée",
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }]
 
 
-def format_message(signal):
-    """Formate le signal pour Telegram."""
-    if not isinstance(signal, dict):
-        return "Signal invalide."
-
-    symbol = signal.get("symbol", "Inconnu")
-    direction = signal.get(
-        "direction",
-        signal.get("signal", "UNKNOWN"),
-    )
-
-    entry = signal.get("entry")
-    stop_loss = signal.get("stop_loss")
-    take_profit = signal.get("take_profit")
-    rr = signal.get("rr", "N/A")
-    reason = signal.get("reason", "")
-
-    message = (
-        "TRADER AI PRO\n"
-        "--------------------\n"
-        f"Actif : {symbol}\n"
-        f"Direction : {direction}\n"
-        f"Entree : {entry}\n"
-        f"Stop Loss : {stop_loss}\n"
-        f"Take Profit : {take_profit}\n"
-        f"Risk/Reward : 1:{rr}\n"
-        "Analyse : D1 + H4 + H1\n"
-        "Confirmation M30 : non obligatoire\n"
-        "RR minimal : aucun\n"
-        "Signal indicatif - aucun ordre execute."
-    )
-
-    if reason:
-        message += f"\nConfluences : {reason}"
-
-    return message
-        
+def format_message(signal: dict) -> str:
+    direction = "ACHAT (BUY)" if signal["direction"] == "BUY" else "VENTE (SELL)"
+    sweep = "Oui — confluence présente" if signal.get("liquidity_sweep") else "Non détecté"
+    return (
+        "📊 TRADER AI PRO — SIGNAL SMC\n\n"
+        f"ID: {signal['signal_id']}\n"
+        f"Actif: {signal['symbol']}\n"
+        f"Direction: {direction}\n"
+        f"Entrée indicative: {signal['entry']:.8f}\n"
+        f"Order Block H1: {signal['zone_low']:.8f} – {signal['zone_high']:.8f}\n"
+        f"Stop-loss indicatif: {signal['stop_loss']:.8f}\n"
+        f"Take-profit (liquidité/structure opposée): {signal['take_profit']:.8f}\n"
+        f"RR estimé: 1:{signal['rr']:.2f}\n"
+        f"Structure H4: {signal['h4_structure']}\n"
+        f"Balayage de liquidité: {sweep}\n"
+        f"Heure UTC: {signal['timestamp_utc']}\n\n"
+        "⚠️ Signal indicatif, non garanti. Vérifie le graphique avant toute entrée. "
+        "Exécution manuelle uniquement sur compte démo. Aucun ordre automatique."
+                )
