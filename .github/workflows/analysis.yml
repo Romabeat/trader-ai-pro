@@ -1,9 +1,13 @@
+
 name: Test
 
-on: workflow_dispatch
+on:
+  workflow_dispatch:
 
 jobs:
-test:
-runs-on: ubuntu-latest
-steps:
-- run: echo "Bonjour Trader AI Pro"
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Vérifier le workflow
+        run: echo "Bonjour Trader AI Pro"
+        
