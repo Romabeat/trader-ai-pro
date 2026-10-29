@@ -1,5 +1,6 @@
-"""TRADER AI PRO — Strategie SMC H4/H1.
-Signaux indicatifs uniquement. Aucun ordre n'est envoyé à Deriv.
+"""TRADER AI PRO — Stratégie SMC H4/H1.
+Détection anticipée des POI et suivi indicatif des setups.
+Aucun ordre n'est envoyé à Deriv.
 """
 
 from __future__ import annotations
@@ -7,7 +8,6 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from math import isfinite
 from typing import Any
-
 
 MIN_RR = 1.0
 MIN_CANDLES = 30
@@ -24,11 +24,12 @@ def _num(row: dict, *keys: str) -> float:
                 return number
         except (TypeError, ValueError):
             continue
+
     raise ValueError(f"Valeur OHLC manquante : {keys}")
 
 
 def _normalize(rows: Any) -> list[dict]:
-    """Normalise les bougies et élimine les données incohérentes."""
+    """Normalise les bougies OHLC."""
     if not isinstance(rows, (list, tuple)):
         return []
 
@@ -50,13 +51,11 @@ def _normalize(rows: Any) -> list[dict]:
                 ),
             }
 
-            valid = (
+            if (
                 candle["h"] >= candle["l"]
                 and candle["h"] >= max(candle["o"], candle["c"])
                 and candle["l"] <= min(candle["o"], candle["c"])
-            )
-
-            if valid:
+            ):
                 result.append(candle)
 
         except (ValueError, TypeError):
@@ -69,7 +68,7 @@ def _pivots(
     rows: list[dict],
     radius: int = 2,
 ) -> tuple[list[tuple[int, float]], list[tuple[int, float]]]:
-    """Détecte les sommets et creux locaux confirmés."""
+    """Identifie les sommets et creux locaux confirmés."""
     highs = []
     lows = []
 
@@ -103,21 +102,17 @@ def _pivots(
 def _structure(
     h4: list[dict],
 ) -> tuple[str, float | None, float | None]:
-    """Détermine la tendance à partir des swings H4."""
+    """Détermine la structure de marché à partir des swings H4."""
     highs, lows = _pivots(h4, 2)
 
+    last_high = highs[-1][1] if highs else None
+    last_low = lows[-1][1] if lows else None
+
     if len(highs) < 2 or len(lows) < 2:
-        return (
-            "NEUTRE",
-            highs[-1][1] if highs else None,
-            lows[-1][1] if lows else None,
-        )
+        return "NEUTRE", last_high, last_low
 
     previous_high = highs[-2][1]
-    last_high = highs[-1][1]
     previous_low = lows[-2][1]
-    last_low = lows[-1][1]
-    last_close = h4[-1]["c"]
 
     higher_high = last_high > previous_high
     higher_low = last_low > previous_low
@@ -130,7 +125,8 @@ def _structure(
     if lower_high and lower_low:
         return "BAISSIERE", last_high, last_low
 
-    # Une cassure seule ne suffit pas à confirmer une tendance.
+    last_close = h4[-1]["c"]
+
     if last_close > last_high and higher_low:
         return "HAUSSIERE", last_high, last_low
 
@@ -144,18 +140,7 @@ def _ob_candidate(
     h1: list[dict],
     direction: str,
 ) -> tuple[float, float, int] | None:
-    """
-    Recherche un Order Block potentiel.
-
-    BUY : dernière bougie baissière avant une impulsion haussière
-    qui casse un sommet confirmé.
-
-    SELL : dernière bougie haussière avant une impulsion baissière
-    qui casse un creux confirmé.
-
-    Recherche élargie aux pivots récents et aux impulsions récentes.
-    La validité de la zone doit ensuite être confirmée par le prix.
-    """
+    """Recherche un Order Block avant une cassure de structure H1."""
     if len(h1) < MIN_CANDLES:
         return None
 
@@ -175,12 +160,9 @@ def _ob_candidate(
             if index >= total - 35
         ]
 
-    # Examiner les pivots les plus récents en premier.
     for pivot_index, pivot_level in reversed(pivots):
-
         start = max(pivot_index + 1, total - 20)
 
-        # La dernière bougie est réservée à la vérification du retour.
         for impulse_index in range(total - 2, start - 1, -1):
             impulse = h1[impulse_index]
 
@@ -198,32 +180,45 @@ def _ob_candidate(
             if not broke_structure:
                 continue
 
-            # Recherche de la bougie opposée précédant l'impulsion.
             first_index = max(0, impulse_index - 5)
 
             for index in range(impulse_index - 1, first_index - 1, -1):
                 candle = h1[index]
 
                 if direction == "BUY":
-                    opposite_candle = candle["c"] < candle["o"]
+                    opposite = candle["c"] < candle["o"]
                 else:
-                    opposite_candle = candle["c"] > candle["o"]
+                    opposite = candle["c"] > candle["o"]
 
-                if opposite_candle:
-                    return (
-                        candle["l"],
-                        candle["h"],
-                        index,
-                    )
+                if opposite:
+                    return candle["l"], candle["h"], index
 
     return None
+
+
+def _is_invalidated(
+    h1: list[dict],
+    direction: str,
+    zone_low: float,
+    zone_high: float,
+    ob_index: int,
+) -> bool:
+    """Invalide la zone si une clôture H1 la traverse complètement."""
+    for candle in h1[ob_index + 1:]:
+        if direction == "BUY" and candle["c"] < zone_low:
+            return True
+
+        if direction == "SELL" and candle["c"] > zone_high:
+            return True
+
+    return False
 
 
 def _liquidity_sweep(
     h1: list[dict],
     direction: str,
 ) -> bool:
-    """Détecte un éventuel balayage de liquidité sur la dernière bougie."""
+    """Détecte un balayage de liquidité éventuel."""
     if len(h1) < 6:
         return False
 
@@ -241,6 +236,30 @@ def _liquidity_sweep(
     return False
 
 
+def _engulfing(h1: list[dict], direction: str) -> bool:
+    """Détecte un englobement simple sur les deux dernières bougies."""
+    if len(h1) < 2:
+        return False
+
+    previous = h1[-2]
+    last = h1[-1]
+
+    if direction == "BUY":
+        return (
+            previous["c"] < previous["o"]
+            and last["c"] > last["o"]
+            and last["o"] <= previous["c"]
+            and last["c"] >= previous["o"]
+        )
+
+    return (
+        previous["c"] > previous["o"]
+        and last["c"] < last["o"]
+        and last["o"] >= previous["c"]
+        and last["c"] <= previous["o"]
+    )
+
+
 def find_signals(
     symbol: str,
     d1=None,
@@ -251,16 +270,15 @@ def find_signals(
     diagnostics: dict | None = None,
 ) -> list[dict]:
     """
-    Retourne au maximum un signal SMC.
+    Retourne au maximum une POI SMC.
 
-    diagnostics, s'il est fourni, reçoit :
-    - reason : résultat ou motif de rejet ;
-    - structure : structure H4 observée ;
-    - order_block : zone détectée, si disponible ;
-    - rr : ratio risque/rendement calculé, si disponible.
+    États :
+      POI_DETECTED : zone repérée avant le retour du prix.
+      PRICE_IN_ZONE : prix observé dans la zone.
+      CONFIRMED : prix dans la zone avec englobement ou sweep.
 
-    Le balayage de liquidité est une confluence facultative.
-    Le RR minimal reste fixé à 1:1.
+    Le sweep reste facultatif.
+    Le RR minimum est de 1:1.
     """
     if diagnostics is not None:
         diagnostics.clear()
@@ -290,19 +308,13 @@ def find_signals(
         diagnostics["structure"] = trend
 
     if trend not in ("HAUSSIERE", "BAISSIERE"):
-        return reject(
-            "Structure H4 neutre : swings insuffisants ou contradictoires"
-        )
+        return reject("Structure H4 neutre ou contradictoire")
 
     direction = "BUY" if trend == "HAUSSIERE" else "SELL"
-
     ob = _ob_candidate(h1_rows, direction)
 
     if ob is None:
-        return reject(
-            f"Structure H4 {trend}, mais aucun Order Block H1 "
-            "correspondant détecté dans la fenêtre étudiée"
-        )
+        return reject("Aucun Order Block H1 valide détecté")
 
     zone_low, zone_high, ob_index = ob
 
@@ -313,13 +325,69 @@ def find_signals(
             "index": ob_index,
         }
 
-    last = h1_rows[-1]
+    if _is_invalidated(
+        h1_rows,
+        direction,
+        zone_low,
+        zone_high,
+        ob_index,
+    ):
+        return reject("Order Block invalidé par une clôture H1")
+
+    # Entrée planifiée au milieu de la zone, pas au prix actuel.
+    entry = (zone_low + zone_high) / 2.0
+
+    if direction == "BUY":
+        stop_loss = zone_low
+    else:
+        stop_loss = zone_high
+
+    risk = abs(entry - stop_loss)
+
+    if risk <= 0:
+        return reject("Risque nul : zone d'entrée invalide")
+
+    highs, lows = _pivots(h1_rows[:-1], 2)
+
+    if direction == "BUY":
+        candidates = [
+            level for _, level in highs
+            if level > entry
+        ]
+        if h4_high is not None and h4_high > entry:
+            candidates.append(h4_high)
+
+        valid_targets = [
+            level for level in set(candidates)
+            if (level - entry) / risk >= MIN_RR
+        ]
+        take_profit = min(valid_targets) if valid_targets else None
+
+    else:
+        candidates = [
+            level for _, level in lows
+            if level < entry
+        ]
+        if h4_low is not None and h4_low < entry:
+            candidates.append(h4_low)
+
+        valid_targets = [
+            level for level in set(candidates)
+            if (entry - level) / risk >= MIN_RR
+        ]
+        take_profit = max(valid_targets) if valid_targets else None
+
+    if take_profit is None:
+        return reject("Aucune cible technique avec un RR minimum de 1:1")
+
+    reward = abs(take_profit - entry)
+    rr = reward / risk
 
     try:
         price = (
             float(price_now)
             if price_now is not None
-            else last["c"]
+            else h1_rows[-1]["c"]
         )
     except (TypeError, ValueError):
         return reject("Prix actuel invalide")
@@ -327,107 +395,32 @@ def find_signals(
     if not isfinite(price):
         return reject("Prix actuel non fini ou invalide")
 
-    overlaps = (
-        last["l"] <= zone_high
-        and last["h"] >= zone_low
-    )
     price_inside = zone_low <= price <= zone_high
+    last = h1_rows[-1]
 
-    if not overlaps:
-        return reject(
-            "Order Block détecté, mais la dernière bougie "
-            "ne touche pas la zone"
-        )
-
-    if not price_inside:
-        return reject(
-            "La dernière bougie touche la zone, mais le prix "
-            "d'entrée indicatif est en dehors de l'Order Block"
-        )
-
-    highs, lows = _pivots(h1_rows[:-1], 2)
-
-    if direction == "BUY":
-        targets = [
-            level for _, level in highs
-            if level > price
-        ]
-
-        take_profit = (
-            min(targets)
-            if targets
-            else (
-                h4_high
-                if h4_high is not None and h4_high > price
-                else None
-            )
-        )
-        stop_loss = zone_low
-
-    else:
-        targets = [
-            level for _, level in lows
-            if level < price
-        ]
-
-        take_profit = (
-            max(targets)
-            if targets
-            else (
-                h4_low
-                if h4_low is not None and h4_low < price
-                else None
-            )
-        )
-        stop_loss = zone_high
-
-    if take_profit is None:
-        return reject(
-            "Aucune cible technique exploitable trouvée"
-        )
-
-    if direction == "BUY":
-        valid_levels = stop_loss < price < take_profit
-    else:
-        valid_levels = take_profit < price < stop_loss
-
-    if not valid_levels:
-        return reject(
-            "Entrée, stop-loss et take-profit mal ordonnés"
-        )
-
-    risk = abs(price - stop_loss)
-    reward = abs(take_profit - price)
-
-    if risk <= 0 or reward <= 0:
-        return reject(
-            "Risque ou récompense nul : niveaux invalides"
-        )
-
-    rr = reward / risk
-
-    if diagnostics is not None:
-        diagnostics["rr"] = round(rr, 3)
-
-    if rr < MIN_RR:
-        return reject(
-            f"RR insuffisant : {rr:.2f}, minimum requis : "
-            f"{MIN_RR:.2f}"
-        )
-
+    # La confirmation est une confluence, pas une condition obligatoire
+    # pour détecter la POI.
     sweep = _liquidity_sweep(h1_rows, direction)
-    epoch = last.get("epoch")
+    engulfing = _engulfing(h1_rows, direction)
 
+    if price_inside and (sweep or engulfing):
+        state = "CONFIRMED"
+    elif price_inside:
+        state = "PRICE_IN_ZONE"
+    else:
+        state = "POI_DETECTED"
+
+    epoch = h1_rows[ob_index].get("epoch", ob_index)
     signal_id = (
-        f"{symbol}-{direction}-{epoch}-"
-        f"{price:.8f}-{zone_low:.8f}-{zone_high:.8f}"
+        f"{symbol}-{direction}-POI-{epoch}-"
+        f"{zone_low:.8f}-{zone_high:.8f}"
     )
 
     signal = {
         "signal_id": signal_id,
         "symbol": symbol,
         "direction": direction,
-        "entry": price,
+        "entry": entry,
         "stop_loss": stop_loss,
         "take_profit": take_profit,
         "rr": rr,
@@ -435,49 +428,73 @@ def find_signals(
         "zone_high": zone_high,
         "h4_structure": trend,
         "liquidity_sweep": sweep,
-        "candle_time": str(epoch),
-        "timeframe": "H4 structure / H1 entrée",
+        "engulfing": engulfing,
+        "status": state,
+        "price_now": price,
+        "price_inside_zone": price_inside,
+        "candle_time": str(last.get("epoch", "")),
+        "poi_epoch": str(epoch),
+        "timeframe": "H4 structure / H1 POI",
         "timestamp_utc": datetime.now(timezone.utc).isoformat(
             timespec="seconds"
         ),
     }
 
     if diagnostics is not None:
-        diagnostics["reason"] = "Signal confirmé"
+        diagnostics["reason"] = f"POI détectée : {state}"
         diagnostics["direction"] = direction
+        diagnostics["rr"] = round(rr, 3)
+        diagnostics["status"] = state
 
     return [signal]
 
 
 def format_message(signal: dict) -> str:
-    """Formate un signal pour une lecture humaine."""
+    """Formate une alerte POI destinée à Telegram."""
     direction = (
         "ACHAT (BUY)"
         if signal["direction"] == "BUY"
         else "VENTE (SELL)"
     )
 
+    state = signal.get("status", "POI_DETECTED")
+    labels = {
+        "POI_DETECTED": "ZONE D'INTÉRÊT DÉTECTÉE",
+        "PRICE_IN_ZONE": "PRIX DANS LA ZONE",
+        "CONFIRMED": "SETUP AVEC CONFIRMATION TECHNIQUE",
+        "INVALIDATED": "ZONE INVALIDÉE",
+    }
+
     sweep = (
-        "Oui — confluence présente"
+        "Oui"
         if signal.get("liquidity_sweep")
+        else "Non détecté (facultatif)"
+    )
+
+    engulfing = (
+        "Oui"
+        if signal.get("engulfing")
         else "Non détecté"
     )
 
     return (
-        "📊 TRADER AI PRO — SIGNAL SMC\n\n"
-        f"ID: {signal['signal_id']}\n"
-        f"Actif: {signal['symbol']}\n"
-        f"Direction: {direction}\n"
-        f"Entrée indicative: {signal['entry']:.8f}\n"
-        f"Order Block H1: {signal['zone_low']:.8f} – "
+        "📊 TRADER AI PRO — SMC H4/H1\n\n"
+        f"État : {labels.get(state, state)}\n"
+        f"ID : {signal['signal_id']}\n"
+        f"Actif : {signal['symbol']}\n"
+        f"Direction : {direction}\n"
+        f"Zone POI H1 : {signal['zone_low']:.8f} – "
         f"{signal['zone_high']:.8f}\n"
-        f"Stop-loss indicatif: {signal['stop_loss']:.8f}\n"
-        f"Take-profit indicatif: {signal['take_profit']:.8f}\n"
-        f"RR estimé: 1:{signal['rr']:.2f}\n"
-        f"Structure H4: {signal['h4_structure']}\n"
-        f"Balayage de liquidité: {sweep}\n"
-        f"Heure UTC: {signal['timestamp_utc']}\n\n"
-        "⚠️ Signal indicatif, non garanti. Vérifie le graphique "
-        "avant toute entrée. Exécution manuelle uniquement "
-        "sur compte démo. Aucun ordre automatique."
-)
+        f"Entrée planifiée : {signal['entry']:.8f}\n"
+        f"Prix observé : {signal.get('price_now', 0):.8f}\n"
+        f"Stop-loss indicatif : {signal['stop_loss']:.8f}\n"
+        f"Take-profit indicatif : {signal['take_profit']:.8f}\n"
+        f"RR planifié : 1:{signal['rr']:.2f}\n"
+        f"Structure H4 : {signal['h4_structure']}\n"
+        f"Englobement H1 : {engulfing}\n"
+        f"Sweep de liquidité : {sweep}\n"
+        f"Heure UTC : {signal['timestamp_utc']}\n\n"
+        "⚠️ Analyse indicative, non garantie. Vérifie le graphique "
+        "avant toute entrée. Exécution manuelle uniquement sur compte "
+        "démo. Aucun ordre automatique."
+                         )
