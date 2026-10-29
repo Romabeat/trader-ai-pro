@@ -1,11 +1,9 @@
-name: Trader AI Pro
+name: Test
 
-on:
-workflow_dispatch:
+on: workflow_dispatch
 
 jobs:
 test:
 runs-on: ubuntu-latest
 steps:
-- name: Afficher un message
-run: echo "Workflow YAML valide"
+- run: echo "Bonjour Trader AI Pro"
