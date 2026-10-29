@@ -1,6 +1,11 @@
 """TRADER AI PRO - Scanner SMC H4/H1.
-Analyse technique indicative, alertes Telegram optionnelles,
-journal SQLite. Aucun ordre n'est envoyé à Deriv.
+
+Analyse technique indicative, diagnostics des signaux,
+alertes Telegram optionnelles et journal SQLite.
+
+IMPORTANT :
+- Aucun ordre automatique n'est envoyé à Deriv.
+- Les décisions et exécutions restent manuelles.
 """
 
 from __future__ import annotations
@@ -29,8 +34,10 @@ ENABLE_TELEGRAM_ALERTS = (
     == "true"
 )
 
-# Ce programme ne contient aucune fonction d'exécution d'ordres.
-DRY_RUN = os.environ.get("DRY_RUN", "true").strip().lower() != "false"
+DRY_RUN = (
+    os.environ.get("DRY_RUN", "true").strip().lower()
+    != "false"
+)
 
 DATABASE_PATH = Path(
     os.environ.get(
@@ -55,8 +62,6 @@ SYMBOLS = [
     "R_100",
 ]
 
-TIMEFRAMES = ("H4", "H1")
-
 CANDLE_COUNT = 100
 REQUEST_TIMEOUT = 15
 PAUSE_BETWEEN_SYMBOLS = 1
@@ -67,19 +72,26 @@ PAUSE_BETWEEN_SYMBOLS = 1
 # ============================================================
 
 def log(message: str) -> None:
-    """Affiche un message horodaté dans les logs."""
+    timestamp = time.strftime(
+        "%Y-%m-%d %H:%M:%S UTC",
+        time.gmtime(),
+    )
     print(
-        f"[TRADER AI PRO] {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())} "
-        f"{message}",
+        f"[TRADER AI PRO] {timestamp} {message}",
         flush=True,
     )
 
 
 def connect_db() -> sqlite3.Connection:
-    """Initialise la base de données et ses tables."""
-    DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    DATABASE_PATH.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
-    db = sqlite3.connect(str(DATABASE_PATH), timeout=20)
+    db = sqlite3.connect(
+        str(DATABASE_PATH),
+        timeout=20,
+    )
 
     db.execute("PRAGMA journal_mode=WAL")
 
@@ -87,14 +99,14 @@ def connect_db() -> sqlite3.Connection:
         """
         CREATE TABLE IF NOT EXISTS signals (
             signal_id TEXT PRIMARY KEY,
-            created_at TEXT NOT NULL,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
             symbol TEXT NOT NULL,
             direction TEXT NOT NULL,
-            entry REAL NOT NULL,
-            stop_loss REAL NOT NULL,
-            take_profit REAL NOT NULL,
-            rr REAL NOT NULL,
-            status TEXT NOT NULL DEFAULT 'ENVOYE',
+            entry REAL,
+            stop_loss REAL,
+            take_profit REAL,
+            rr REAL,
+            status TEXT DEFAULT 'ENVOYE',
             outcome TEXT,
             result_r REAL,
             notes TEXT,
@@ -107,7 +119,7 @@ def connect_db() -> sqlite3.Connection:
         """
         CREATE TABLE IF NOT EXISTS run_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
             event TEXT NOT NULL,
             detail TEXT
         )
@@ -121,83 +133,75 @@ def connect_db() -> sqlite3.Connection:
 def log_event(
     db: sqlite3.Connection,
     event: str,
-    detail: dict,
+    detail: dict | str,
 ) -> None:
-    """Enregistre un événement du scanner."""
+    if not isinstance(detail, str):
+        detail = json.dumps(
+            detail,
+            ensure_ascii=False,
+            default=str,
+        )
+
     db.execute(
-        "INSERT INTO run_log(event, detail) VALUES (?, ?)",
-        (
-            event,
-            json.dumps(detail, ensure_ascii=False),
-        ),
+        """
+        INSERT INTO run_log (event, detail)
+        VALUES (?, ?)
+        """,
+        (event, detail),
     )
     db.commit()
 
 
 # ============================================================
-# DONNÉES DE MARCHÉ DERIV
+# DONNÉES DE MARCHÉ
 # ============================================================
 
 def fetch_candles(
     symbol: str,
     timeframe: str,
-) -> list[dict] | None:
-    """
-    Récupère les bougies depuis deriv_market.py.
-
-    get_candles() renvoie un dictionnaire contenant la clé
-    'candles'. Cette fonction extrait la liste attendue
-    par strategy.py.
-    """
+) -> list | None:
     try:
-        result = get_candles(
+        response = get_candles(
             symbol,
             timeframe,
             count=CANDLE_COUNT,
             timeout=REQUEST_TIMEOUT,
         )
 
-        if not isinstance(result, dict):
+        if not isinstance(response, dict):
             log(
                 f"{symbol} {timeframe}: "
-                "réponse Deriv invalide."
+                "réponse de marché invalide."
             )
             return None
 
-        if result.get("error"):
+        candles = response.get("candles")
+
+        if not isinstance(candles, list):
             log(
                 f"{symbol} {timeframe}: "
-                f"{result['error']}"
+                "champ candles absent ou invalide."
             )
             return None
 
-        rows = result.get("candles")
-
-        if not isinstance(rows, list):
+        if len(candles) < 30:
             log(
                 f"{symbol} {timeframe}: "
-                "liste de bougies absente."
-            )
-            return None
-
-        if len(rows) < 30:
-            log(
-                f"{symbol} {timeframe}: "
-                f"données insuffisantes ({len(rows)} bougies)."
+                f"données insuffisantes ({len(candles)} bougies)."
             )
             return None
 
         log(
             f"{symbol} {timeframe}: "
-            f"{len(rows)} bougies récupérées."
+            f"{len(candles)} bougies reçues."
         )
 
-        return rows
+        return candles
 
     except Exception as exc:
         log(
             f"{symbol} {timeframe}: "
-            f"erreur données: {type(exc).__name__}: {exc}"
+            f"erreur de récupération: {exc}"
         )
         return None
 
@@ -207,18 +211,16 @@ def fetch_candles(
 # ============================================================
 
 def send_telegram(message: str) -> bool:
-    """Envoie un message Telegram uniquement si les alertes sont activées."""
     if not ENABLE_TELEGRAM_ALERTS:
         log(
-            "Telegram désactivé : "
-            "ENABLE_TELEGRAM_ALERTS n'est pas true."
+            "Alerte Telegram désactivée par la configuration."
         )
         return False
 
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         log(
-            "ERREUR : secrets TELEGRAM_TOKEN ou "
-            "TELEGRAM_CHAT_ID manquants."
+            "ERREUR TELEGRAM: TELEGRAM_TOKEN ou "
+            "TELEGRAM_CHAT_ID manquant dans les secrets."
         )
         return False
 
@@ -227,34 +229,34 @@ def send_telegram(message: str) -> bool:
         f"bot{TELEGRAM_TOKEN}/sendMessage"
     )
 
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "disable_web_page_preview": True,
+    }
+
     try:
         response = requests.post(
             url,
-            json={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": message,
-                "disable_web_page_preview": True,
-            },
+            json=payload,
             timeout=REQUEST_TIMEOUT,
         )
-
         response.raise_for_status()
-        payload = response.json()
 
-        if not payload.get("ok"):
+        result = response.json()
+
+        if not result.get("ok", False):
             log(
-                "Erreur Telegram API : "
-                f"{payload.get('description', 'réponse invalide')}"
+                "Échec Telegram: l'API n'a pas confirmé "
+                "l'envoi du message."
             )
             return False
 
+        log("Alerte Telegram envoyée avec succès.")
         return True
 
     except (requests.RequestException, ValueError) as exc:
-        log(
-            "Erreur d'envoi Telegram : "
-            f"{type(exc).__name__}: {exc}"
-        )
+        log(f"Erreur d'envoi Telegram: {exc}")
         return False
 
 
@@ -266,9 +268,13 @@ def already_recorded(
     db: sqlite3.Connection,
     signal_id: str,
 ) -> bool:
-    """Vérifie si un signal est déjà présent dans la base."""
     row = db.execute(
-        "SELECT 1 FROM signals WHERE signal_id = ?",
+        """
+        SELECT 1
+        FROM signals
+        WHERE signal_id = ?
+        LIMIT 1
+        """,
         (signal_id,),
     ).fetchone()
 
@@ -280,12 +286,10 @@ def store_signal(
     signal: dict,
     message: str,
 ) -> None:
-    """Enregistre un signal après confirmation de son envoi."""
     db.execute(
         """
-        INSERT INTO signals (
+        INSERT OR IGNORE INTO signals (
             signal_id,
-            created_at,
             symbol,
             direction,
             entry,
@@ -293,19 +297,21 @@ def store_signal(
             take_profit,
             rr,
             status,
+            notes,
             message
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ENVOYE', ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
-            signal["signal_id"],
-            signal["timestamp_utc"],
-            signal["symbol"],
-            signal["direction"],
-            signal["entry"],
-            signal["stop_loss"],
-            signal["take_profit"],
-            signal["rr"],
+            str(signal.get("signal_id", "")),
+            str(signal.get("symbol", "")),
+            str(signal.get("direction", "")),
+            signal.get("entry"),
+            signal.get("stop_loss"),
+            signal.get("take_profit"),
+            signal.get("rr"),
+            "ENVOYE",
+            "Signal technique indicatif; exécution manuelle.",
             message,
         ),
     )
@@ -314,21 +320,64 @@ def store_signal(
         db,
         "SIGNAL_SENT",
         {
-            "signal_id": signal["signal_id"],
-            "symbol": signal["symbol"],
-            "direction": signal["direction"],
+            "signal_id": signal.get("signal_id"),
+            "symbol": signal.get("symbol"),
+            "direction": signal.get("direction"),
+            "rr": signal.get("rr"),
         },
     )
 
     db.commit()
 
 
+# ============================================================
+# DIAGNOSTICS DE STRATÉGIE
+# ============================================================
+
+def log_diagnostics(
+    symbol: str,
+    diagnostics: dict,
+) -> None:
+    reason = diagnostics.get(
+        "reason",
+        "Aucun motif détaillé fourni par strategy.py",
+    )
+
+    structure = diagnostics.get(
+        "structure",
+        "inconnue",
+    )
+
+    rr = diagnostics.get(
+        "rr",
+        "N/A",
+    )
+
+    order_block = diagnostics.get("order_block")
+
+    log(
+        f"{symbol}: aucun signal SMC confirmé | "
+        f"Motif: {reason} | "
+        f"Structure H4: {structure} | "
+        f"RR: {rr}"
+    )
+
+    if order_block is not None:
+        log(
+            f"{symbol}: diagnostic Order Block: "
+            f"{json.dumps(order_block, ensure_ascii=False, default=str)}"
+        )
+
+
+# ============================================================
+# ANALYSE D'UN ACTIF
+# ============================================================
+
 def analyze_symbol(
     db: sqlite3.Connection,
     symbol: str,
 ) -> tuple[int, int]:
-    """Analyse un actif et traite les éventuels signaux."""
-    log(f"Analyse de {symbol}...")
+    log(f"Début de l'analyse de {symbol}.")
 
     h4 = fetch_candles(symbol, "H4")
     h1 = fetch_candles(symbol, "H1")
@@ -338,144 +387,232 @@ def analyze_symbol(
             f"{symbol}: analyse ignorée, "
             "données H4 ou H1 indisponibles."
         )
-        return 0, 1
+
+        log_event(
+            db,
+            "DATA_ERROR",
+            {
+                "symbol": symbol,
+                "h4_available": h4 is not None,
+                "h1_available": h1 is not None,
+            },
+        )
+
+        return 0, 0
+
+    diagnostics: dict = {}
 
     try:
         signals = find_signals(
             symbol=symbol,
             h4=h4,
             h1=h1,
+            diagnostics=diagnostics,
         )
-    except Exception as exc:
-        log(
-            f"{symbol}: erreur du moteur SMC : "
-            f"{type(exc).__name__}: {exc}"
-        )
-        return 0, 1
 
-    if not signals:
-        log(f"{symbol}: aucun signal SMC confirmé.")
+    except TypeError as exc:
+        log(
+            f"{symbol}: erreur de compatibilité avec "
+            f"strategy.py: {exc}"
+        )
+        log(
+            "Vérifie que strategy.py contient bien "
+            "find_signals(..., diagnostics=None)."
+        )
+
+        log_event(
+            db,
+            "STRATEGY_COMPATIBILITY_ERROR",
+            {
+                "symbol": symbol,
+                "error": str(exc),
+            },
+        )
+
         return 0, 0
 
+    except Exception as exc:
+        log(
+            f"{symbol}: erreur pendant l'analyse "
+            f"de stratégie: {exc}"
+        )
+
+        log_event(
+            db,
+            "STRATEGY_ERROR",
+            {
+                "symbol": symbol,
+                "error": str(exc),
+            },
+        )
+
+        return 0, 0
+
+    if not signals:
+        log_diagnostics(symbol, diagnostics)
+
+        log_event(
+            db,
+            "NO_SIGNAL",
+            {
+                "symbol": symbol,
+                "diagnostics": diagnostics,
+            },
+        )
+
+        return 0, 0
+
+    detected = 0
     sent = 0
 
     for signal in signals:
-        signal_id = signal.get("signal_id")
+        detected += 1
+
+        signal_id = str(
+            signal.get("signal_id", "")
+        ).strip()
 
         if not signal_id:
-            log(f"{symbol}: signal ignoré, identifiant absent.")
+            log(
+                f"{symbol}: signal rejeté, "
+                "identifiant signal_id manquant."
+            )
             continue
 
         if already_recorded(db, signal_id):
             log(
-                f"{symbol}: doublon ignoré "
-                f"({signal_id})."
-            )
-            continue
-
-        message = format_message(signal)
-
-        if not ENABLE_TELEGRAM_ALERTS:
-            log(
-                f"{symbol}: signal détecté, "
-                "mais Telegram est désactivé. "
-                "Aucun message envoyé."
-            )
-            continue
-
-        if not send_telegram(message):
-            log(
-                f"{symbol}: envoi non confirmé. "
-                "Signal non marqué comme envoyé."
+                f"{symbol}: signal déjà enregistré, "
+                f"ignoré pour éviter un doublon ({signal_id})."
             )
             continue
 
         try:
-            store_signal(db, signal, message)
-            sent += 1
-
+            message = format_message(signal)
+        except Exception as exc:
             log(
-                f"{symbol}: signal envoyé et journalisé "
-                f"({signal_id})."
+                f"{symbol}: impossible de formater "
+                f"le signal: {exc}"
             )
+            continue
 
-        except sqlite3.IntegrityError:
+        if not ENABLE_TELEGRAM_ALERTS:
             log(
-                f"{symbol}: doublon empêché "
-                "par la base de données."
+                f"{symbol}: signal détecté mais Telegram "
+                "est désactivé. Aucun message envoyé."
             )
+            log(message)
+            continue
 
-        except sqlite3.Error as exc:
+        if not send_telegram(message):
             log(
-                f"{symbol}: erreur SQLite après envoi : "
-                f"{exc}. Vérifier le journal."
+                f"{symbol}: signal détecté, mais l'envoi "
+                "Telegram a échoué. Signal non enregistré "
+                "comme envoyé."
             )
+            continue
 
-    return sent, 0
+        store_signal(
+            db,
+            signal,
+            message,
+        )
+
+        sent += 1
+
+    return detected, sent
 
 
 # ============================================================
-# SCAN PRINCIPAL
+# PROGRAMME PRINCIPAL
 # ============================================================
 
 def main() -> None:
-    log("=" * 55)
+    log("=" * 60)
     log("DÉMARRAGE DE TRADER AI PRO")
-    log("Scanner SMC H4/H1")
+    log(f"Actifs à analyser: {len(SYMBOLS)}")
+    log(f"Nombre de bougies demandé: {CANDLE_COUNT}")
     log(
-        "Alertes Telegram : "
-        f"{'ACTIVÉES' if ENABLE_TELEGRAM_ALERTS else 'DÉSACTIVÉES'}"
+        "Alertes Telegram: "
+        + (
+            "ACTIVÉES"
+            if ENABLE_TELEGRAM_ALERTS
+            else "DÉSACTIVÉES"
+        )
     )
-    log("Exécution automatique des ordres : DÉSACTIVÉE")
-    log("=" * 55)
+    log(
+        "Exécution automatique des ordres: "
+        "DÉSACTIVÉE"
+    )
+
+    if ENABLE_TELEGRAM_ALERTS:
+        if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+            log(
+                "Configuration Telegram: "
+                "secrets présents."
+            )
+        else:
+            log(
+                "ATTENTION: Telegram est activé, "
+                "mais un ou plusieurs secrets sont absents."
+            )
 
     if not DRY_RUN:
         log(
-            "AVERTISSEMENT : DRY_RUN=false détecté. "
-            "Ce programme ne contient cependant aucune "
-            "fonction d'exécution d'ordres."
+            "ATTENTION: DRY_RUN=false. "
+            "Ce scanner ne contient toutefois aucune "
+            "fonction d'envoi d'ordre à Deriv."
         )
 
-    try:
-        db = connect_db()
-    except sqlite3.Error as exc:
-        log(f"Impossible d'ouvrir la base SQLite : {exc}")
-        raise
+    db = connect_db()
 
+    total_detected = 0
     total_sent = 0
     total_errors = 0
 
     try:
         for index, symbol in enumerate(SYMBOLS):
-            sent, errors = analyze_symbol(db, symbol)
+            try:
+                detected, sent = analyze_symbol(
+                    db,
+                    symbol,
+                )
 
-            total_sent += sent
-            total_errors += errors
+                total_detected += detected
+                total_sent += sent
+
+            except Exception as exc:
+                total_errors += 1
+
+                log(
+                    f"Erreur inattendue sur {symbol}: {exc}"
+                )
+
+                log_event(
+                    db,
+                    "UNEXPECTED_ERROR",
+                    {
+                        "symbol": symbol,
+                        "error": str(exc),
+                    },
+                )
 
             if index < len(SYMBOLS) - 1:
                 time.sleep(PAUSE_BETWEEN_SYMBOLS)
 
-        log_event(
-            db,
-            "SCAN_FINISHED",
-            {
-                "sent": total_sent,
-                "errors": total_errors,
-                "symbols_scanned": len(SYMBOLS),
-                "telegram_enabled": ENABLE_TELEGRAM_ALERTS,
-            },
-        )
-
     finally:
         db.close()
 
-    log("=" * 55)
-    log("SCAN TERMINÉ")
-    log(f"Actifs analysés : {len(SYMBOLS)}")
-    log(f"Signaux envoyés : {total_sent}")
-    log(f"Erreurs de données ou d'analyse : {total_errors}")
-    log("Aucun ordre n'a été envoyé à Deriv.")
-    log("=" * 55)
+    log("=" * 60)
+    log("ANALYSE TERMINÉE")
+    log(f"Actifs analysés: {len(SYMBOLS)}")
+    log(f"Signaux détectés: {total_detected}")
+    log(f"Alertes envoyées: {total_sent}")
+    log(f"Erreurs inattendues: {total_errors}")
+    log(
+        "Ordres envoyés à Deriv: 0 "
+        "(exécution manuelle uniquement)"
+    )
+    log("=" * 60)
 
 
 if __name__ == "__main__":
