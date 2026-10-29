@@ -2,10 +2,10 @@
 Trader AI Pro - Strategie SMC D1/H4
 ------------------------------------
 D1 : biais directionnel.
-H4 : structure, BOS, displacement et Order Block.
+H4 : BOS, displacement et Order Block.
 Entree : ouverture de la bougie de l'Order Block.
 SL : au-dela de la zone avec marge ATR.
-TP : cible structurelle H4.
+TP : cible structurelle situee au-dela du prix actuel.
 RR minimum : 1.5.
 
 Scanner uniquement : aucun ordre n'est execute.
@@ -24,6 +24,7 @@ MIN_D1_CANDLES = 100
 MIN_H4_CANDLES = 200
 
 PIVOT_RADIUS = 2
+
 OB_LOOKBACK = 40
 OB_SEARCH_BACK = 5
 
@@ -33,10 +34,7 @@ SL_ATR_BUFFER = 0.10
 MIN_BODY_RATIO = 0.55
 MIN_DISPLACEMENT_ATR = 0.80
 
-# Eviter les configurations trop anciennes.
 MAX_BOS_AGE = 20
-
-# Eviter une entree devenue trop eloignee du prix.
 MAX_ENTRY_DISTANCE_ATR = 1.5
 
 
@@ -60,31 +58,21 @@ def _first_value(row, keys):
 
 
 def _diagnose(diagnostics, symbol, reason):
-    """
-    Compatible avec un dictionnaire ou une liste.
-
-    Avec un dictionnaire :
-        diagnostics[symbol] = [motifs de rejet]
-
-    Avec une liste :
-        ajout d'un message texte.
-    """
     if diagnostics is None:
         return
-
-    message = f"{symbol}: {reason}"
 
     if isinstance(diagnostics, dict):
         diagnostics.setdefault(symbol, []).append(reason)
 
     elif isinstance(diagnostics, list):
-        diagnostics.append(message)
+        diagnostics.append(f"{symbol}: {reason}")
 
 
 def _normalize(candles):
     """
-    Accepte les formats open/high/low/close et o/h/l/c.
-    Les bougies doivent etre chronologiques.
+    Normalise les bougies et verifie leur coherence.
+    Les donnees numeriques d'epoch doivent etre strictement
+    chronologiques lorsqu'elles sont disponibles.
     """
     result = []
 
@@ -119,22 +107,16 @@ def _normalize(candles):
             "epoch": epoch,
         })
 
-    # Refuser un historique mal ordonne plutot que d'inverser
-    # silencieusement les bougies.
-    epochs = [
-        _number(row["epoch"])
-        for row in result
-    ]
+    numeric_epochs = [_number(row["epoch"]) for row in result]
 
-    valid_epochs = [
-        value for value in epochs
-        if value is not None
-    ]
-
-    if len(valid_epochs) == len(result) and len(result) > 1:
+    # Ne pas inverser silencieusement un historique mal ordonne.
+    if (
+        len(result) > 1
+        and all(value is not None for value in numeric_epochs)
+    ):
         if any(
-            valid_epochs[i] >= valid_epochs[i + 1]
-            for i in range(len(valid_epochs) - 1)
+            numeric_epochs[i] >= numeric_epochs[i + 1]
+            for i in range(len(numeric_epochs) - 1)
         ):
             return []
 
@@ -157,12 +139,10 @@ def _atr(rows, period=ATR_PERIOD):
     if len(rows) < period + 1:
         return None
 
-    ranges = []
-
-    for i in range(len(rows) - period, len(rows)):
-        ranges.append(
-            _true_range(rows[i], rows[i - 1]["c"])
-        )
+    ranges = [
+        _true_range(rows[i], rows[i - 1]["c"])
+        for i in range(len(rows) - period, len(rows))
+    ]
 
     if not ranges:
         return None
@@ -219,6 +199,10 @@ def _pivots(rows, radius=PIVOT_RADIUS):
 
 
 def _structure(rows):
+    """
+    Renvoie une tendance swing confirmee.
+    NEUTRAL ne signifie pas qu'aucun BOS exploitable n'existe.
+    """
     highs, lows = _pivots(rows)
 
     if len(highs) < 2 or len(lows) < 2:
@@ -250,16 +234,18 @@ def _daily_bias(d1):
 
 
 # ============================================================
-# BREAK OF STRUCTURE
+# BREAK OF STRUCTURE ET DISPLACEMENT
 # ============================================================
 
 def _find_bos(rows, direction, atr_value):
     """
-    Recherche une cassure confirmee par cloture et accompagnee
-    d'un displacement.
+    Cherche le BOS le plus recent dans le sens du biais D1.
 
-    Les pivots de reference sont calcules uniquement sur les
-    bougies precedant la bougie de cassure.
+    La cassure doit :
+    - etre confirmee par la cloture ;
+    - franchir un pivot precedemment confirme ;
+    - presenter un corps suffisamment important ;
+    - respecter le seuil de displacement ATR.
     """
     start = max(
         PIVOT_RADIUS * 2 + 1,
@@ -283,6 +269,8 @@ def _find_bos(rows, direction, atr_value):
         if body < MIN_DISPLACEMENT_ATR * atr_value:
             continue
 
+        # Seules les bougies precedant le BOS servent a
+        # determiner les pivots de reference.
         previous_rows = rows[:i]
         highs, lows = _pivots(previous_rows)
 
@@ -290,18 +278,19 @@ def _find_bos(rows, direction, atr_value):
             candidates = [
                 (index, level)
                 for index, level in highs
-                if rows[index]["h"] < candle["c"]
+                if candle["c"] > level
             ]
         else:
             candidates = [
                 (index, level)
                 for index, level in lows
-                if rows[index]["l"] > candle["c"]
+                if candle["c"] < level
             ]
 
         if not candidates:
             continue
 
+        # Le pivot casse le plus recent est la reference.
         pivot_index, broken_level = candidates[-1]
 
         return {
@@ -320,6 +309,10 @@ def _find_bos(rows, direction, atr_value):
 # ============================================================
 
 def _find_order_block(rows, bos, direction):
+    """
+    Recherche la derniere bougie opposee avant l'impulsion BOS.
+    L'entree theorique est l'ouverture de cette bougie.
+    """
     impulse_index = bos["index"]
     first_index = max(0, impulse_index - OB_SEARCH_BACK)
 
@@ -349,20 +342,14 @@ def _find_order_block(rows, bos, direction):
 
 def _is_invalidated(rows, ob, direction):
     """
-    Verifie les clotures ulterieures a l'Order Block.
-    Une cloture au-dela de la zone invalide le setup.
+    Une cloture ulterieure au-dela de la limite invalide
+    l'Order Block.
     """
     for candle in rows[ob["index"] + 1:]:
-        if (
-            direction == "BUY"
-            and candle["c"] < ob["zone_low"]
-        ):
+        if direction == "BUY" and candle["c"] < ob["zone_low"]:
             return True
 
-        if (
-            direction == "SELL"
-            and candle["c"] > ob["zone_high"]
-        ):
+        if direction == "SELL" and candle["c"] > ob["zone_high"]:
             return True
 
     return False
@@ -422,7 +409,17 @@ def _engulfing(rows, direction):
 # TAKE PROFIT STRUCTUREL
 # ============================================================
 
-def _target_from_structure(rows, direction, entry, stop_loss):
+def _target_from_structure(
+    rows,
+    direction,
+    entry,
+    stop_loss,
+    current_price,
+):
+    """
+    La cible doit respecter le RR minimum et rester au-dela
+    du prix actuel. Cela evite de signaler un TP deja depasse.
+    """
     highs, lows = _pivots(rows)
 
     risk = abs(entry - stop_loss)
@@ -434,7 +431,7 @@ def _target_from_structure(rows, direction, entry, stop_loss):
         candidates = sorted({
             level
             for _, level in highs
-            if level > entry
+            if level > entry and level > current_price
         })
 
         for target in candidates:
@@ -448,7 +445,7 @@ def _target_from_structure(rows, direction, entry, stop_loss):
             {
                 level
                 for _, level in lows
-                if level < entry
+                if level < entry and level < current_price
             },
             reverse=True,
         )
@@ -476,28 +473,19 @@ def find_signals(
     diagnostics=None,
 ):
     """
-    Compatible avec l'interface de scheduled_analysis.py.
-
-    diagnostics accepte un dictionnaire ou une liste.
+    Interface compatible avec scheduled_analysis.py.
     Retourne toujours une liste de signaux.
+    Aucun ordre n'est execute.
     """
-
     signals = []
 
     def reject(reason):
-        _diagnose(
-            diagnostics,
-            symbol,
-            reason,
-        )
+        _diagnose(diagnostics, symbol, reason)
 
     d1_rows = _normalize(d1)
     h4_rows = _normalize(h4)
 
-    # --------------------------------------------------------
     # 1. Historique
-    # --------------------------------------------------------
-
     if len(d1_rows) < MIN_D1_CANDLES:
         reject(
             f"Historique D1 insuffisant : "
@@ -512,88 +500,52 @@ def find_signals(
         )
         return signals
 
-    # --------------------------------------------------------
-    # 2. Biais Daily
-    # --------------------------------------------------------
-
+    # 2. Biais D1
     bias = _daily_bias(d1_rows)
 
     if bias == "NEUTRAL":
         reject(
-            "Biais D1 neutre : structure directionnelle non confirmee."
+            "Biais D1 neutre : structure swing non confirmee."
         )
         return signals
 
     direction = "BUY" if bias == "BULLISH" else "SELL"
 
-    # --------------------------------------------------------
-    # 3. Structure H4
-    # --------------------------------------------------------
-
+    # 3. Structure H4 informative, sans rejet automatique
+    # lorsqu'elle est neutre. Le BOS doit toujours confirmer
+    # une cassure dans le sens du biais D1.
     h4_structure = _structure(h4_rows)
 
-    if h4_structure != bias:
-        reject(
-            f"Desaccord D1/H4 : D1={bias}, H4={h4_structure}."
-        )
-        return signals
-
-    # --------------------------------------------------------
     # 4. ATR H4
-    # --------------------------------------------------------
-
     atr_value = _atr(h4_rows)
 
     if atr_value is None:
         reject("ATR H4 indisponible ou invalide.")
         return signals
 
-    # --------------------------------------------------------
-    # 5. BOS et displacement
-    # --------------------------------------------------------
-
-    bos = _find_bos(
-        h4_rows,
-        direction,
-        atr_value,
-    )
+    # 5. BOS dans le sens du biais D1
+    bos = _find_bos(h4_rows, direction, atr_value)
 
     if bos is None:
         reject(
-            "Aucun BOS H4 recent avec displacement suffisant."
+            f"Aucun BOS H4 recent avec displacement en direction "
+            f"du biais D1 ({direction})."
         )
         return signals
 
     if bos["age"] > MAX_BOS_AGE:
-        reject(
-            f"BOS trop ancien : {bos['age']} bougies H4."
-        )
+        reject(f"BOS trop ancien : {bos['age']} bougies H4.")
         return signals
 
-    # --------------------------------------------------------
     # 6. Order Block
-    # --------------------------------------------------------
-
-    ob = _find_order_block(
-        h4_rows,
-        bos,
-        direction,
-    )
+    ob = _find_order_block(h4_rows, bos, direction)
 
     if ob is None:
-        reject(
-            "Aucune bougie opposee valide avant le BOS."
-        )
+        reject("Aucune bougie opposee trouvee avant le BOS.")
         return signals
 
-    if _is_invalidated(
-        h4_rows,
-        ob,
-        direction,
-    ):
-        reject(
-            "Order Block invalide par une cloture ulterieure."
-        )
+    if _is_invalidated(h4_rows, ob, direction):
+        reject("Order Block invalide par une cloture ulterieure.")
         return signals
 
     zone_low = ob["zone_low"]
@@ -604,10 +556,7 @@ def find_signals(
         reject("Zone Order Block invalide.")
         return signals
 
-    # --------------------------------------------------------
-    # 7. Prix actuel et entree sniper
-    # --------------------------------------------------------
-
+    # 7. Prix actuel
     current_price = _number(price_now)
 
     if current_price is None or current_price <= 0:
@@ -615,31 +564,24 @@ def find_signals(
         return signals
 
     distance = abs(current_price - entry)
+    max_distance = MAX_ENTRY_DISTANCE_ATR * atr_value
 
-    if distance > MAX_ENTRY_DISTANCE_ATR * atr_value:
+    if distance > max_distance:
         reject(
-            "Prix trop eloigne de l'entree sniper : "
-            f"{distance:.5f}, limite "
-            f"{MAX_ENTRY_DISTANCE_ATR * atr_value:.5f}."
+            f"Prix trop eloigne de l'entree sniper : "
+            f"{distance:.5f}, limite {max_distance:.5f}."
         )
         return signals
 
     if direction == "BUY" and current_price <= entry:
-        reject(
-            "BUY : prix au niveau de l'entree ou en dessous."
-        )
+        reject("BUY : le prix doit etre au-dessus de l'entree.")
         return signals
 
     if direction == "SELL" and current_price >= entry:
-        reject(
-            "SELL : prix au niveau de l'entree ou au-dessus."
-        )
+        reject("SELL : le prix doit etre en dessous de l'entree.")
         return signals
 
-    # --------------------------------------------------------
     # 8. Stop Loss
-    # --------------------------------------------------------
-
     buffer = atr_value * SL_ATR_BUFFER
 
     if direction == "BUY":
@@ -650,36 +592,30 @@ def find_signals(
     risk = abs(entry - stop_loss)
 
     if risk <= 0:
-        reject("Risque invalide : impossible de calculer le SL.")
+        reject("Risque invalide : calcul du SL impossible.")
         return signals
 
-    # --------------------------------------------------------
-    # 9. Take Profit et RR
-    # --------------------------------------------------------
-
+    # 9. Take Profit : cible encore devant le prix actuel
     take_profit, rr = _target_from_structure(
         h4_rows,
         direction,
         entry,
         stop_loss,
+        current_price,
     )
 
     if take_profit is None or rr is None:
         reject(
-            "Aucune cible structurelle ne respecte le RR minimum."
+            "Aucune cible structurelle encore accessible "
+            "ne respecte le RR minimum."
         )
         return signals
 
     if rr < MIN_RR:
-        reject(
-            f"RR insuffisant : {rr:.2f}, minimum {MIN_RR:.2f}."
-        )
+        reject(f"RR insuffisant : {rr:.2f}, minimum {MIN_RR:.2f}.")
         return signals
 
-    # --------------------------------------------------------
-    # 10. Identifiant unique
-    # --------------------------------------------------------
-
+    # 10. Identifiant du signal
     epoch = ob["candle"].get("epoch")
 
     if epoch is None:
@@ -692,10 +628,7 @@ def find_signals(
         f"{zone_low:.8f}-{zone_high:.8f}"
     )
 
-    # --------------------------------------------------------
     # 11. Signal final
-    # --------------------------------------------------------
-
     signal = {
         "signal_id": signal_id,
         "symbol": symbol,
@@ -709,7 +642,7 @@ def find_signals(
         "current_price": current_price,
         "h4_structure": h4_structure,
         "d1_bias": bias,
-        "timeframe": "D1 bias / H4 structure / H4 POI",
+        "timeframe": "D1 bias / H4 BOS / H4 POI",
         "order_block_index": ob["index"],
         "bos_index": bos["index"],
         "bos_level": bos["broken_level"],
@@ -718,23 +651,18 @@ def find_signals(
         "engulfing": _engulfing(h4_rows, direction),
         "liquidity_sweep": _liquidity_sweep(h4_rows, direction),
         "notes": (
-            "Biais D1 et structure H4 alignes ; "
-            "BOS avec displacement ; "
-            "entree a l'ouverture de l'Order Block."
+            "Biais D1 confirme ; BOS H4 avec displacement ; "
+            "Order Block valide ; cible structurelle accessible."
         ),
     }
 
     signals.append(signal)
 
-    if isinstance(diagnostics, dict):
-        diagnostics.setdefault(symbol, []).append(
-            "Setup valide : BOS, Order Block et RR conformes."
-        )
-
-    elif isinstance(diagnostics, list):
-        diagnostics.append(
-            f"{symbol}: setup valide."
-        )
+    _diagnose(
+        diagnostics,
+        symbol,
+        "Setup valide : biais D1, BOS H4, Order Block et RR conformes.",
+    )
 
     return signals
 
@@ -754,11 +682,7 @@ def format_message(signal):
 
     rr = _number(signal.get("rr"))
 
-    rr_text = (
-        f"1:{rr:.2f}"
-        if rr is not None
-        else "Indisponible"
-    )
+    rr_text = f"1:{rr:.2f}" if rr is not None else "Indisponible"
 
     return "\n".join([
         "TRADER AI PRO — SIGNAL SMC",
@@ -766,12 +690,12 @@ def format_message(signal):
         f"Instrument : {symbol}",
         f"Direction : {direction_label}",
         "Biais : Daily (D1)",
-        "Structure et Order Block : H4",
+        "BOS et Order Block : H4",
         "Méthode : Sniper Entry — ouverture de l'OB",
         "",
         f"Zone OB : {signal.get('zone_low')} - "
         f"{signal.get('zone_high')}",
-        f"Entrée : {signal.get('entry')}",
+        f"Entrée théorique : {signal.get('entry')}",
         f"Stop Loss : {signal.get('stop_loss')}",
         f"Take Profit : {signal.get('take_profit')}",
         f"RR estimé : {rr_text}",
@@ -790,5 +714,5 @@ def format_message(signal):
         f"Note : {signal.get('notes', '')}",
         "",
         "Scanner uniquement : aucun ordre automatique exécuté.",
-        "Vérifier le signal avant toute décision de trading.",
+        "Vérifier la validité du setup avant toute décision.",
     ])
