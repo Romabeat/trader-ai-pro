@@ -1,8 +1,12 @@
+"""
+TRADER AI PRO — Connexion publique aux marchés Deriv.
 
-"""TRADER AI PRO — Connexion publique aux marchés Deriv.
+Fonctions :
+- Récupération des bougies historiques clôturées.
+- Récupération du prix courant.
+- Détection des indices synthétiques compatibles.
 
-Récupère les bougies historiques et le prix courant des indices.
-Ce module ne passe aucun ordre.
+Aucun ordre de trading n'est exécuté.
 """
 
 from __future__ import annotations
@@ -16,8 +20,10 @@ from typing import Any
 import websocket
 
 
-# L'endpoint public Deriv fonctionne dans le dernier rapport.
-# Les endpoints v3 restent disponibles en secours.
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
 URLS = [
     "wss://api.derivws.com/trading/v1/options/ws/public",
     "wss://ws.derivws.com/websockets/v3?app_id=1089",
@@ -38,8 +44,12 @@ MAX_CANDLES = 5000
 DEFAULT_TIMEOUT = 10
 
 
+# ============================================================
+# VALIDATION
+# ============================================================
+
 def _valid_symbol(symbol: str) -> bool:
-    """Vérifie que le symbole est pris en charge."""
+    """Vérifie si le symbole respecte le format pris en charge."""
     return bool(
         isinstance(symbol, str)
         and VOLATILITY.fullmatch(symbol.strip())
@@ -56,11 +66,21 @@ def _extract_error(response: dict[str, Any]) -> str:
     return str(error)
 
 
+# ============================================================
+# CONNEXION WEBSOCKET
+# ============================================================
+
 def _request(
     payload: dict[str, Any],
     timeout: int = DEFAULT_TIMEOUT,
 ) -> dict[str, Any]:
-    """Envoie une requête WebSocket en essayant les endpoints disponibles."""
+    """
+    Envoie une requête WebSocket en essayant les endpoints
+    configurés successivement.
+
+    Retourne le dictionnaire reçu ou un dictionnaire contenant
+    une clé 'error' en cas d'échec.
+    """
 
     errors: list[str] = []
 
@@ -88,16 +108,21 @@ def _request(
             )
 
             deadline = time.monotonic() + timeout
+
             ws.send(json.dumps(payload))
 
             while time.monotonic() < deadline:
                 remaining = deadline - time.monotonic()
+
                 ws.settimeout(max(0.5, remaining))
 
                 try:
                     raw = ws.recv()
+
                 except websocket.WebSocketTimeoutException:
-                    errors.append(f"{url}: délai de réponse dépassé")
+                    errors.append(
+                        f"{url}: délai de réponse dépassé"
+                    )
                     break
 
                 if not raw:
@@ -105,6 +130,7 @@ def _request(
 
                 try:
                     response = json.loads(raw)
+
                 except (json.JSONDecodeError, TypeError):
                     continue
 
@@ -113,8 +139,12 @@ def _request(
 
                 if response.get("error"):
                     message = _extract_error(response)
+
                     errors.append(f"{url}: {message}")
-                    print(f"[DERIV] Erreur API : {message}")
+
+                    print(
+                        f"[DERIV] Erreur API : {message}"
+                    )
                     break
 
                 if request_type:
@@ -138,8 +168,12 @@ def _request(
 
         except Exception as exc:
             message = f"{type(exc).__name__}: {exc}"
+
             errors.append(f"{url}: {message}")
-            print(f"[DERIV] Connexion échouée : {message}")
+
+            print(
+                f"[DERIV] Connexion échouée : {message}"
+            )
 
         finally:
             if ws is not None:
@@ -148,9 +182,14 @@ def _request(
                 except Exception:
                     pass
 
-    summary = " | ".join(errors) or "Aucune réponse exploitable."
+    summary = (
+        " | ".join(errors)
+        or "Aucune réponse exploitable."
+    )
 
-    print(f"[DERIV] Échec de toutes les connexions : {summary}")
+    print(
+        f"[DERIV] Échec de toutes les connexions : {summary}"
+    )
 
     return {
         "error": {
@@ -159,14 +198,24 @@ def _request(
     }
 
 
+# ============================================================
+# PRIX COURANT
+# ============================================================
+
 def get_current_price(
     symbol: str,
     timeout: int = DEFAULT_TIMEOUT,
 ) -> float | None:
-    """Retourne le dernier prix reçu, ou None si indisponible."""
+    """
+    Retourne le dernier prix reçu.
+
+    Retourne None si le prix est indisponible ou invalide.
+    """
 
     if not _valid_symbol(symbol):
-        print(f"[DERIV] Symbole invalide : {symbol}")
+        print(
+            f"[DERIV] Symbole invalide : {symbol}"
+        )
         return None
 
     response = _request(
@@ -182,22 +231,36 @@ def get_current_price(
     tick = response.get("tick")
 
     if not isinstance(tick, dict):
-        print(f"[DERIV] Réponse sans cotation pour {symbol}.")
+        print(
+            f"[DERIV] Réponse sans cotation pour {symbol}."
+        )
         return None
 
     try:
         quote = float(tick["quote"])
+
     except (KeyError, TypeError, ValueError):
-        print(f"[DERIV] Prix absent ou invalide pour {symbol}.")
+        print(
+            f"[DERIV] Prix absent ou invalide pour {symbol}."
+        )
         return None
 
     if not math.isfinite(quote) or quote <= 0:
-        print(f"[DERIV] Prix non valide pour {symbol}: {quote}")
+        print(
+            f"[DERIV] Prix non valide pour {symbol}: {quote}"
+        )
         return None
 
-    print(f"[DERIV] Prix reçu — {symbol}: {quote}")
+    print(
+        f"[DERIV] Prix reçu — {symbol}: {quote}"
+    )
+
     return quote
 
+
+# ============================================================
+# BOUGIES HISTORIQUES
+# ============================================================
 
 def get_candles(
     symbol: str,
@@ -205,33 +268,64 @@ def get_candles(
     count: int = 50,
     timeout: int = DEFAULT_TIMEOUT,
 ) -> dict[str, Any]:
-    """Récupère les bougies historiques clôturées d'un indice."""
+    """
+    Récupère les bougies historiques clôturées.
+
+    Format de retour en cas de succès :
+
+    {
+        "symbol": "R_50",
+        "timeframe": "H4",
+        "count": 200,
+        "candles": [
+            {
+                "epoch": 1234567890,
+                "open": 100.0,
+                "high": 105.0,
+                "low": 98.0,
+                "close": 103.0
+            }
+        ]
+    }
+
+    En cas d'erreur, retourne un dictionnaire contenant 'error'.
+    """
 
     timeframe = str(timeframe).upper()
 
     if not _valid_symbol(symbol):
         return {
-            "error": f"Symbole non pris en charge : {symbol}"
+            "error": (
+                f"Symbole non pris en charge : {symbol}"
+            )
         }
 
     if timeframe not in GRANULARITY:
         return {
-            "error": f"Timeframe non pris en charge : {timeframe}"
+            "error": (
+                f"Timeframe non pris en charge : {timeframe}"
+            )
         }
 
     try:
         count = int(count)
+
     except (TypeError, ValueError):
         return {
-            "error": "Le nombre de bougies doit être un entier."
+            "error": (
+                "Le nombre de bougies doit être un entier."
+            )
         }
 
     if count < 1:
         return {
-            "error": "Le nombre de bougies doit être positif."
+            "error": (
+                "Le nombre de bougies doit être positif."
+            )
         }
 
     count = min(count, MAX_CANDLES)
+
     granularity = GRANULARITY[timeframe]
 
     response = _request(
@@ -256,11 +350,13 @@ def get_candles(
     if not isinstance(raw_candles, list):
         return {
             "error": (
-                f"Réponse Deriv sans liste de bougies valide pour {symbol}."
+                "Réponse Deriv sans liste de bougies valide "
+                f"pour {symbol}."
             )
         }
 
     now = time.time()
+
     candles: list[dict[str, float | int]] = []
     seen: set[int] = set()
 
@@ -278,6 +374,7 @@ def get_candles(
                 "low": float(item["low"]),
                 "close": float(item["close"]),
             }
+
         except (KeyError, TypeError, ValueError):
             continue
 
@@ -314,13 +411,17 @@ def get_candles(
         ):
             continue
 
-        # Écarte les bougies encore en formation.
+        # Exclut les bougies encore en formation.
         if epoch + granularity > now:
             continue
 
         candles.append(candle)
 
-    candles.sort(key=lambda item: item["epoch"])
+    # Ordre chronologique : plus ancienne vers plus récente.
+    candles.sort(
+        key=lambda item: item["epoch"]
+    )
+
     result = candles[-count:]
 
     if not result:
@@ -344,10 +445,16 @@ def get_candles(
     }
 
 
+# ============================================================
+# INDICES SYNTHÉTIQUES DISPONIBLES
+# ============================================================
+
 def get_synthetic_symbols(
     timeout: int = DEFAULT_TIMEOUT,
 ) -> list[str]:
-    """Retourne les symboles synthétiques reconnus par le scanner."""
+    """
+    Retourne les symboles synthétiques reconnus par le scanner.
+    """
 
     response = _request(
         {
@@ -359,7 +466,8 @@ def get_synthetic_symbols(
 
     if response.get("error"):
         print(
-            "[DERIV] Impossible de récupérer la liste des indices : "
+            "[DERIV] Impossible de récupérer la liste "
+            "des indices : "
             f"{_extract_error(response)}"
         )
         return []
@@ -387,4 +495,3 @@ def get_synthetic_symbols(
     )
 
     return result
-                
