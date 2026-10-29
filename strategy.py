@@ -1,449 +1,639 @@
+"""
+Trader AI Pro - Strategie SMC D1/H4
+------------------------------------
+D1 : filtre directionnel
+H4 : structure, BOS, displacement et Order Block
+Entree : ouverture de la bougie de l'Order Block
+RR minimum : 1.5
 
-"""TRADER AI PRO — Stratégie SMC H4/H1.
-Détection anticipée des POI et suivi indicatif des setups.
-Aucun ordre n'est envoyé à Deriv.
+Scanner uniquement : aucun ordre n'est execute.
 """
 
-from __future__ import annotations
-
-from datetime import datetime, timezone
 from math import isfinite
-from typing import Any
 
 
-MIN_RR = 1.0
-MIN_CANDLES = 30
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+MIN_RR = 1.5
+MIN_D1_CANDLES = 100
+MIN_H4_CANDLES = 200
+
+PIVOT_RADIUS = 2
+OB_LOOKBACK = 40
+OB_SEARCH_BACK = 5
+
+ATR_PERIOD = 14
+SL_ATR_BUFFER = 0.10
+
+MIN_BODY_RATIO = 0.55
+MIN_DISPLACEMENT_ATR = 0.80
+
+# Le prix doit rester du bon cote de l'entree en attente.
+# BUY : prix actuel au-dessus de l'entree.
+# SELL : prix actuel en dessous de l'entree.
 
 
-INDEX_NAMES = {
-    "1HZ10V": "Volatility 10 (1s) Index",
-    "1HZ15V": "Volatility 15 (1s) Index",
-    "1HZ25V": "Volatility 25 (1s) Index",
-    "1HZ30V": "Volatility 30 (1s) Index",
-    "1HZ50V": "Volatility 50 (1s) Index",
-    "1HZ75V": "Volatility 75 (1s) Index",
-    "1HZ90V": "Volatility 90 (1s) Index",
-    "1HZ100V": "Volatility 100 (1s) Index",
-    "R_10": "Volatility 10 Index",
-    "R_25": "Volatility 25 Index",
-    "R_50": "Volatility 50 Index",
-    "R_75": "Volatility 75 Index",
-    "R_100": "Volatility 100 Index",
-}
+# ============================================================
+# NORMALISATION DES BOUGIES
+# ============================================================
+
+def _number(value):
+    try:
+        result = float(value)
+        return result if isfinite(result) else None
+    except (TypeError, ValueError):
+        return None
 
 
-def _num(row: dict, *keys: str) -> float:
+def _first_value(row, keys):
     for key in keys:
-        value = row.get(key)
-        if value is None:
-            continue
-        try:
-            number = float(value)
-            if isfinite(number):
-                return number
-        except (TypeError, ValueError):
-            continue
-
-    raise ValueError(f"Valeur OHLC manquante : {keys}")
+        if key in row and row[key] is not None:
+            return row[key]
+    return None
 
 
-def _normalize(rows: Any) -> list[dict]:
-    """Normalise les bougies OHLC."""
-    if not isinstance(rows, (list, tuple)):
-        return []
+def _normalize(candles):
+    """
+    Accepte notamment les formats :
+    open/high/low/close
+    o/h/l/c
+    OHLC issus d'API de marche.
 
+    Retourne une liste de bougies normalisees.
+    """
     result = []
 
-    for index, row in enumerate(rows):
+    if not isinstance(candles, (list, tuple)):
+        return result
+
+    for row in candles:
         if not isinstance(row, dict):
             continue
 
-        try:
-            candle = {
-                "o": _num(row, "o", "open"),
-                "h": _num(row, "h", "high"),
-                "l": _num(row, "l", "low"),
-                "c": _num(row, "c", "close"),
-                "epoch": row.get(
-                    "epoch",
-                    row.get("time", row.get("timestamp", index)),
-                ),
-            }
+        o = _number(_first_value(row, ("open", "o", "Open")))
+        h = _number(_first_value(row, ("high", "h", "High")))
+        l = _number(_first_value(row, ("low", "l", "Low")))
+        c = _number(_first_value(row, ("close", "c", "Close")))
 
-            if (
-                candle["h"] >= candle["l"]
-                and candle["h"] >= max(candle["o"], candle["c"])
-                and candle["l"] <= min(candle["o"], candle["c"])
-            ):
-                result.append(candle)
-
-        except (ValueError, TypeError):
+        if None in (o, h, l, c):
             continue
 
+        if h < l or h < max(o, c) or l > min(o, c):
+            continue
+
+        epoch = _first_value(
+            row,
+            ("epoch", "time", "timestamp", "datetime")
+        )
+
+        result.append({
+            "o": o,
+            "h": h,
+            "l": l,
+            "c": c,
+            "epoch": epoch,
+        })
+
+    # Les donnees doivent etre chronologiques.
+    # On ne les inverse pas automatiquement : le module de marche
+    # doit fournir les bougies de la plus ancienne a la plus recente.
     return result
 
 
-def _pivots(
-    rows: list[dict],
-    radius: int = 2,
-) -> tuple[list[tuple[int, float]], list[tuple[int, float]]]:
-    """Identifie les sommets et creux locaux confirmés."""
+# ============================================================
+# INDICATEURS
+# ============================================================
+
+def _true_range(current, previous_close):
+    return max(
+        current["h"] - current["l"],
+        abs(current["h"] - previous_close),
+        abs(current["l"] - previous_close),
+    )
+
+
+def _atr(rows, period=ATR_PERIOD):
+    if len(rows) < period + 1:
+        return None
+
+    ranges = []
+
+    for i in range(len(rows) - period, len(rows)):
+        previous_close = rows[i - 1]["c"]
+        ranges.append(_true_range(rows[i], previous_close))
+
+    if not ranges:
+        return None
+
+    value = sum(ranges) / len(ranges)
+
+    if value <= 0 or not isfinite(value):
+        return None
+
+    return value
+
+
+def _body_ratio(candle):
+    candle_range = candle["h"] - candle["l"]
+
+    if candle_range <= 0:
+        return 0.0
+
+    return abs(candle["c"] - candle["o"]) / candle_range
+
+
+def _is_bullish(candle):
+    return candle["c"] > candle["o"]
+
+
+def _is_bearish(candle):
+    return candle["c"] < candle["o"]
+
+
+# ============================================================
+# PIVOTS ET STRUCTURE
+# ============================================================
+
+def _pivots(rows, radius=PIVOT_RADIUS):
+    """
+    Identifie les pivots locaux.
+
+    Un pivot n'est confirme qu'apres la cloture des bougies
+    situees a sa droite.
+    """
     highs = []
     lows = []
 
-    if len(rows) < radius * 2 + 1:
+    if len(rows) < 2 * radius + 1:
         return highs, lows
 
     for i in range(radius, len(rows) - radius):
-        high = rows[i]["h"]
-        low = rows[i]["l"]
+        candle = rows[i]
 
-        other_highs = [
-            rows[j]["h"]
-            for j in range(i - radius, i + radius + 1)
-            if j != i
-        ]
-        other_lows = [
-            rows[j]["l"]
-            for j in range(i - radius, i + radius + 1)
-            if j != i
-        ]
+        left = rows[i - radius:i]
+        right = rows[i + 1:i + radius + 1]
 
-        if all(high > value for value in other_highs):
-            highs.append((i, high))
+        if all(candle["h"] > x["h"] for x in left + right):
+            highs.append((i, candle["h"]))
 
-        if all(low < value for value in other_lows):
-            lows.append((i, low))
+        if all(candle["l"] < x["l"] for x in left + right):
+            lows.append((i, candle["l"]))
 
     return highs, lows
 
 
-def _structure(
-    h4: list[dict],
-) -> tuple[str, float | None, float | None]:
-    """Détermine la structure de marché à partir des swings H4."""
-    highs, lows = _pivots(h4, 2)
-
-    last_high = highs[-1][1] if highs else None
-    last_low = lows[-1][1] if lows else None
+def _structure(rows):
+    """
+    Determine une structure haussiere, baissiere ou neutre
+    a partir des deux derniers pivots hauts et bas confirmes.
+    """
+    highs, lows = _pivots(rows)
 
     if len(highs) < 2 or len(lows) < 2:
-        return "NEUTRE", last_high, last_low
+        return "NEUTRAL"
 
     previous_high = highs[-2][1]
-    previous_low = lows[-2][1]
+    latest_high = highs[-1][1]
 
-    higher_high = last_high > previous_high
-    higher_low = last_low > previous_low
-    lower_high = last_high < previous_high
-    lower_low = last_low < previous_low
+    previous_low = lows[-2][1]
+    latest_low = lows[-1][1]
+
+    higher_high = latest_high > previous_high
+    higher_low = latest_low > previous_low
+
+    lower_high = latest_high < previous_high
+    lower_low = latest_low < previous_low
 
     if higher_high and higher_low:
-        return "HAUSSIERE", last_high, last_low
+        return "BULLISH"
 
     if lower_high and lower_low:
-        return "BAISSIERE", last_high, last_low
+        return "BEARISH"
 
-    last_close = h4[-1]["c"]
-
-    if last_close > last_high and higher_low:
-        return "HAUSSIERE", last_high, last_low
-
-    if last_close < last_low and lower_high:
-        return "BAISSIERE", last_high, last_low
-
-    return "NEUTRE", last_high, last_low
+    return "NEUTRAL"
 
 
-def _ob_candidate(
-    h1: list[dict],
-    direction: str,
-) -> tuple[float, float, int] | None:
-    """Recherche un Order Block avant une cassure de structure H1."""
-    if len(h1) < MIN_CANDLES:
-        return None
+def _daily_bias(d1):
+    """
+    Le Daily doit presenter une structure identifiable.
+    En cas de structure neutre, aucun signal n'est autorise.
+    """
+    return _structure(d1)
 
-    highs, lows = _pivots(h1[:-1], 2)
-    total = len(h1)
 
-    if direction == "BUY":
-        pivots = [
-            (index, level)
-            for index, level in highs
-            if index >= total - 35
-        ]
-    else:
-        pivots = [
-            (index, level)
-            for index, level in lows
-            if index >= total - 35
-        ]
+# ============================================================
+# RECHERCHE DE BOS ET D'ORDER BLOCK
+# ============================================================
 
-    for pivot_index, pivot_level in reversed(pivots):
-        start = max(pivot_index + 1, total - 20)
+def _find_bos(rows, direction, atr_value):
+    """
+    Recherche une cassure de structure accompagnee d'une bougie
+    impulsive.
 
-        for impulse_index in range(total - 2, start - 1, -1):
-            impulse = h1[impulse_index]
+    La cassure est comparee aux pivots confirmes AVANT la bougie
+    de cassure, afin d'eviter d'utiliser des informations futures.
+    """
+    start = max(PIVOT_RADIUS * 2 + 1, len(rows) - OB_LOOKBACK)
 
-            if direction == "BUY":
-                broke_structure = (
-                    impulse["c"] > pivot_level
-                    and impulse["c"] > impulse["o"]
-                )
-            else:
-                broke_structure = (
-                    impulse["c"] < pivot_level
-                    and impulse["c"] < impulse["o"]
-                )
+    for i in range(len(rows) - 1, start - 1, -1):
+        candle = rows[i]
 
-            if not broke_structure:
+        # La bougie doit montrer un deplacement directionnel.
+        if direction == "BUY":
+            if not _is_bullish(candle):
+                continue
+        else:
+            if not _is_bearish(candle):
                 continue
 
-            first_index = max(0, impulse_index - 5)
+        if _body_ratio(candle) < MIN_BODY_RATIO:
+            continue
 
-            for index in range(
-                impulse_index - 1,
-                first_index - 1,
-                -1,
-            ):
-                candle = h1[index]
+        body = abs(candle["c"] - candle["o"])
 
-                if direction == "BUY":
-                    opposite = candle["c"] < candle["o"]
-                else:
-                    opposite = candle["c"] > candle["o"]
+        if body < MIN_DISPLACEMENT_ATR * atr_value:
+            continue
 
-                if opposite:
-                    return candle["l"], candle["h"], index
+        # Les pivots sont calcules uniquement avec les bougies
+        # precedant la bougie de cassure.
+        previous_rows = rows[:i]
+        highs, lows = _pivots(previous_rows)
+
+        if direction == "BUY":
+            candidates = [
+                (index, level)
+                for index, level in highs
+                if index < i and candle["c"] > level
+            ]
+        else:
+            candidates = [
+                (index, level)
+                for index, level in lows
+                if index < i and candle["c"] < level
+            ]
+
+        if not candidates:
+            continue
+
+        # Le pivot casse le plus recent est privilegie.
+        broken_pivot_index, broken_level = candidates[-1]
+
+        return {
+            "index": i,
+            "broken_level": broken_level,
+            "pivot_index": broken_pivot_index,
+            "impulse": candle,
+        }
 
     return None
 
 
-def _is_invalidated(
-    h1: list[dict],
-    direction: str,
-    zone_low: float,
-    zone_high: float,
-    ob_index: int,
-) -> bool:
-    """Invalide la zone si une clôture H1 la traverse."""
-    for candle in h1[ob_index + 1:]:
-        if direction == "BUY" and candle["c"] < zone_low:
+def _find_order_block(rows, bos, direction):
+    """
+    Recherche la derniere bougie opposee precedant l'impulsion
+    ayant casse la structure.
+
+    BUY  : derniere bougie baissiere.
+    SELL : derniere bougie haussiere.
+
+    La bougie de l'Order Block est identifiee par son ouverture,
+    son plus haut et son plus bas.
+    """
+    impulse_index = bos["index"]
+
+    first_index = max(0, impulse_index - OB_SEARCH_BACK)
+
+    for i in range(impulse_index - 1, first_index - 1, -1):
+        candle = rows[i]
+
+        if direction == "BUY" and _is_bearish(candle):
+            return {
+                "index": i,
+                "candle": candle,
+                "zone_low": candle["l"],
+                "zone_high": candle["h"],
+                "entry": candle["o"],
+            }
+
+        if direction == "SELL" and _is_bullish(candle):
+            return {
+                "index": i,
+                "candle": candle,
+                "zone_low": candle["l"],
+                "zone_high": candle["h"],
+                "entry": candle["o"],
+            }
+
+    return None
+
+
+def _is_invalidated(rows, ob, direction):
+    """
+    Invalidation conservatrice :
+    une cloture ulterieure a l'Order Block au-dela de la zone
+    rend la configuration inutilisable.
+    """
+    candle_index = ob["index"]
+
+    for candle in rows[candle_index + 1:]:
+        if direction == "BUY" and candle["c"] < ob["zone_low"]:
             return True
 
-        if direction == "SELL" and candle["c"] > zone_high:
+        if direction == "SELL" and candle["c"] > ob["zone_high"]:
             return True
 
     return False
 
 
-def _liquidity_sweep(
-    h1: list[dict],
-    direction: str,
-) -> bool:
-    """Détecte un balayage de liquidité éventuel."""
-    if len(h1) < 6:
+# ============================================================
+# LIQUIDITE ET ENGLOBEMENT
+# ============================================================
+
+def _liquidity_sweep(rows, direction, lookback=20):
+    """
+    Detection simple d'une prise de liquidite sur les bougies
+    recentes. Cette information reste un filtre secondaire.
+    """
+    if len(rows) < lookback + 2:
         return False
 
-    highs, lows = _pivots(h1[:-1], 2)
-    last = h1[-1]
+    previous = rows[-lookback - 1:-1]
+    latest = rows[-1]
 
-    if direction == "BUY" and lows:
-        level = lows[-1][1]
-        return last["l"] < level and last["c"] > level
+    if direction == "BUY":
+        previous_low = min(c["l"] for c in previous)
+        return latest["l"] < previous_low and latest["c"] > previous_low
 
-    if direction == "SELL" and highs:
-        level = highs[-1][1]
-        return last["h"] > level and last["c"] < level
-
-    return False
+    previous_high = max(c["h"] for c in previous)
+    return latest["h"] > previous_high and latest["c"] < previous_high
 
 
-def _engulfing(h1: list[dict], direction: str) -> bool:
-    """Détecte un englobement simple sur les deux dernières bougies."""
-    if len(h1) < 2:
+def _engulfing(rows, direction):
+    if len(rows) < 2:
         return False
 
-    previous = h1[-2]
-    last = h1[-1]
+    previous = rows[-2]
+    latest = rows[-1]
 
     if direction == "BUY":
         return (
-            previous["c"] < previous["o"]
-            and last["c"] > last["o"]
-            and last["o"] <= previous["c"]
-            and last["c"] >= previous["o"]
+            _is_bearish(previous)
+            and _is_bullish(latest)
+            and latest["o"] <= previous["c"]
+            and latest["c"] >= previous["o"]
         )
 
     return (
-        previous["c"] > previous["o"]
-        and last["c"] < last["o"]
-        and last["o"] >= previous["c"]
-        and last["c"] <= previous["o"]
+        _is_bullish(previous)
+        and _is_bearish(latest)
+        and latest["o"] >= previous["c"]
+        and latest["c"] <= previous["o"]
     )
 
 
+# ============================================================
+# OBJECTIF STRUCTUREL ET GESTION DU RISQUE
+# ============================================================
+
+def _target_from_structure(rows, direction, entry, stop_loss):
+    """
+    Recherche un pivot H4 dans le sens du trade.
+
+    Le premier objectif structurel valide doit egalement offrir
+    un RR d'au moins MIN_RR.
+    """
+    highs, lows = _pivots(rows)
+
+    risk = abs(entry - stop_loss)
+
+    if risk <= 0:
+        return None, None
+
+    if direction == "BUY":
+        candidates = sorted(
+            {
+                level
+                for _, level in highs
+                if level > entry
+            }
+        )
+
+        for target in candidates:
+            reward = target - entry
+            rr = reward / risk
+
+            if rr >= MIN_RR:
+                return target, rr
+
+    else:
+        candidates = sorted(
+            {
+                level
+                for _, level in lows
+                if level < entry
+            },
+            reverse=True,
+        )
+
+        for target in candidates:
+            reward = entry - target
+            rr = reward / risk
+
+            if rr >= MIN_RR:
+                return target, rr
+
+    return None, None
+
+
+# ============================================================
+# CONSTRUCTION DU SIGNAL
+# ============================================================
+
 def find_signals(
-    symbol: str,
+    symbol,
     d1=None,
     h4=None,
     h1=None,
     m30=None,
     price_now=None,
-    diagnostics: dict | None = None,
-) -> list[dict]:
+    diagnostics=None,
+):
     """
-    Retourne au maximum une POI SMC.
+    API conservee pour rester compatible avec le scanner.
 
-    États :
-      POI_DETECTED : zone repérée, en attente d'un éventuel retour.
-      PRICE_IN_ZONE : prix courant dans la zone.
-      CONFIRMED : prix dans la zone avec englobement ou sweep.
+    Parametres principaux :
+        d1 : 100 bougies Daily
+        h4 : 200 bougies H4
+        price_now : dernier prix disponible
 
-    Un prix courant absent ne doit jamais être remplacé
-    par la dernière clôture H1.
+    h1 et m30 sont conserves pour compatibilite, mais ne sont
+    pas utilises par cette strategie D1/H4.
     """
-    if diagnostics is not None:
-        diagnostics.clear()
-        diagnostics["reason"] = "Analyse non terminée"
+    signals = []
 
-    def reject(reason: str) -> list[dict]:
-        if diagnostics is not None:
-            diagnostics["reason"] = reason
-        return []
+    def reject(reason):
+        if isinstance(diagnostics, list):
+            diagnostics.append(f"{symbol}: {reason}")
 
+    d1_rows = _normalize(d1)
     h4_rows = _normalize(h4)
-    h1_rows = _normalize(h1)
 
-    if len(h4_rows) < MIN_CANDLES:
-        return reject(
-            f"Données H4 insuffisantes : {len(h4_rows)} bougies valides"
+    if len(d1_rows) < MIN_D1_CANDLES:
+        reject(
+            f"Historique D1 insuffisant : {len(d1_rows)}/"
+            f"{MIN_D1_CANDLES} bougies."
         )
+        return signals
 
-    if len(h1_rows) < MIN_CANDLES:
-        return reject(
-            f"Données H1 insuffisantes : {len(h1_rows)} bougies valides"
+    if len(h4_rows) < MIN_H4_CANDLES:
+        reject(
+            f"Historique H4 insuffisant : {len(h4_rows)}/"
+            f"{MIN_H4_CANDLES} bougies."
         )
+        return signals
 
-    trend, h4_high, h4_low = _structure(h4_rows)
+    # --------------------------------------------------------
+    # 1. Biais Daily
+    # --------------------------------------------------------
 
-    if diagnostics is not None:
-        diagnostics["structure"] = trend
+    bias = _daily_bias(d1_rows)
 
-    if trend not in ("HAUSSIERE", "BAISSIERE"):
-        return reject("Structure H4 neutre ou contradictoire")
+    if bias == "NEUTRAL":
+        reject("Structure Daily neutre ou insuffisamment claire.")
+        return signals
 
-    direction = "BUY" if trend == "HAUSSIERE" else "SELL"
-    ob = _ob_candidate(h1_rows, direction)
+    direction = "BUY" if bias == "BULLISH" else "SELL"
+
+    # --------------------------------------------------------
+    # 2. Volatilite H4
+    # --------------------------------------------------------
+
+    atr_value = _atr(h4_rows)
+
+    if atr_value is None:
+        reject("ATR H4 indisponible.")
+        return signals
+
+    # --------------------------------------------------------
+    # 3. Structure H4 et BOS
+    # --------------------------------------------------------
+
+    h4_structure = _structure(h4_rows)
+
+    if h4_structure != bias:
+        reject(
+            "Desaccord entre le biais Daily et la structure H4."
+        )
+        return signals
+
+    bos = _find_bos(h4_rows, direction, atr_value)
+
+    if bos is None:
+        reject("Aucun BOS H4 accompagne d'un deplacement valide.")
+        return signals
+
+    # --------------------------------------------------------
+    # 4. Order Block H4
+    # --------------------------------------------------------
+
+    ob = _find_order_block(h4_rows, bos, direction)
 
     if ob is None:
-        return reject("Aucun Order Block H1 valide détecté")
+        reject("Aucun Order Block valide avant le BOS.")
+        return signals
 
-    zone_low, zone_high, ob_index = ob
+    if _is_invalidated(h4_rows, ob, direction):
+        reject("Order Block H4 deja invalide.")
+        return signals
 
-    if diagnostics is not None:
-        diagnostics["order_block"] = {
-            "low": zone_low,
-            "high": zone_high,
-            "index": ob_index,
-        }
+    zone_low = ob["zone_low"]
+    zone_high = ob["zone_high"]
+    entry = ob["entry"]
 
-    if _is_invalidated(
-        h1_rows,
-        direction,
-        zone_low,
-        zone_high,
-        ob_index,
-    ):
-        return reject("Order Block invalidé par une clôture H1")
+    if zone_high <= zone_low:
+        reject("Dimensions de l'Order Block invalides.")
+        return signals
 
-    entry = (zone_low + zone_high) / 2.0
-    stop_loss = zone_low if direction == "BUY" else zone_high
+    # --------------------------------------------------------
+    # 5. Verification du prix actuel
+    # --------------------------------------------------------
+
+    current_price = _number(price_now)
+
+    if current_price is None or current_price <= 0:
+        reject("Prix actuel indisponible : entree non validee.")
+        return signals
+
+    # Refuser une entree deja depassee.
+    if direction == "BUY" and current_price <= entry:
+        reject("Entree BUY deja atteinte ou depassee.")
+        return signals
+
+    if direction == "SELL" and current_price >= entry:
+        reject("Entree SELL deja atteinte ou depassee.")
+        return signals
+
+    # --------------------------------------------------------
+    # 6. Stop Loss avec marge ATR
+    # --------------------------------------------------------
+
+    buffer = atr_value * SL_ATR_BUFFER
+
+    if direction == "BUY":
+        stop_loss = zone_low - buffer
+    else:
+        stop_loss = zone_high + buffer
+
     risk = abs(entry - stop_loss)
 
     if risk <= 0:
-        return reject("Risque nul : zone d'entrée invalide")
+        reject("Risque nul ou invalide.")
+        return signals
 
-    highs, lows = _pivots(h1_rows[:-1], 2)
+    # --------------------------------------------------------
+    # 7. Take Profit structurel et RR
+    # --------------------------------------------------------
 
-    if direction == "BUY":
-        candidates = [
-            level for _, level in highs
-            if level > entry
-        ]
-
-        if h4_high is not None and h4_high > entry:
-            candidates.append(h4_high)
-
-        valid_targets = [
-            level for level in set(candidates)
-            if (level - entry) / risk >= MIN_RR
-        ]
-
-        take_profit = min(valid_targets) if valid_targets else None
-
-    else:
-        candidates = [
-            level for _, level in lows
-            if level < entry
-        ]
-
-        if h4_low is not None and h4_low < entry:
-            candidates.append(h4_low)
-
-        valid_targets = [
-            level for level in set(candidates)
-            if (entry - level) / risk >= MIN_RR
-        ]
-
-        take_profit = max(valid_targets) if valid_targets else None
-
-    if take_profit is None:
-        return reject("Aucune cible technique avec un RR minimum de 1:1")
-
-    reward = abs(take_profit - entry)
-    rr = reward / risk
-
-    # Un prix manquant reste manquant : ne pas utiliser la clôture H1
-    # comme substitut à une cotation courante.
-    if price_now is None:
-        price = None
-    else:
-        try:
-            price = float(price_now)
-        except (TypeError, ValueError):
-            return reject("Prix actuel invalide")
-
-        if not isfinite(price):
-            return reject("Prix actuel non fini ou invalide")
-
-    price_inside = (
-        price is not None
-        and zone_low <= price <= zone_high
+    take_profit, rr = _target_from_structure(
+        h4_rows,
+        direction,
+        entry,
+        stop_loss,
     )
 
-    sweep = _liquidity_sweep(h1_rows, direction)
-    engulfing = _engulfing(h1_rows, direction)
+    if take_profit is None or rr is None:
+        reject("Aucun objectif structurel ne respecte le RR minimum.")
+        return signals
 
-    if price_inside and (sweep or engulfing):
-        state = "CONFIRMED"
-    elif price_inside:
-        state = "PRICE_IN_ZONE"
-    else:
-        state = "POI_DETECTED"
+    if rr < MIN_RR:
+        reject(f"RR insuffisant : {rr:.2f}.")
+        return signals
 
-    last = h1_rows[-1]
-    epoch = h1_rows[ob_index].get("epoch", ob_index)
+    # --------------------------------------------------------
+    # 8. Identifiant de signal
+    # --------------------------------------------------------
+
+    epoch = ob["candle"].get("epoch")
+
+    if epoch is None:
+        epoch = bos["index"]
+
+    safe_epoch = str(epoch).replace(" ", "_").replace(":", "-")
 
     signal_id = (
-        f"{symbol}-{direction}-POI-{epoch}-"
+        f"{symbol}-{direction}-D1H4-POI-{safe_epoch}-"
         f"{zone_low:.8f}-{zone_high:.8f}"
     )
+
+    # --------------------------------------------------------
+    # 9. Signal final
+    # --------------------------------------------------------
 
     signal = {
         "signal_id": signal_id,
         "symbol": symbol,
-        "index_name": INDEX_NAMES.get(symbol, symbol),
         "direction": direction,
         "entry": entry,
         "stop_loss": stop_loss,
@@ -451,98 +641,77 @@ def find_signals(
         "rr": rr,
         "zone_low": zone_low,
         "zone_high": zone_high,
-        "h4_structure": trend,
-        "liquidity_sweep": sweep,
-        "engulfing": engulfing,
-        "status": state,
-        "price_now": price,
-        "price_inside_zone": price_inside,
-        "candle_time": str(last.get("epoch", "")),
-        "poi_epoch": str(epoch),
-        "timeframe": "H4 structure / H1 POI",
-        "timestamp_utc": datetime.now(timezone.utc).isoformat(
-            timespec="seconds"
+        "current_price": current_price,
+        "h4_structure": h4_structure,
+        "d1_bias": bias,
+        "timeframe": "D1 bias / H4 structure / H4 POI",
+        "order_block_index": ob["index"],
+        "bos_index": bos["index"],
+        "bos_level": bos["broken_level"],
+        "atr_h4": atr_value,
+        "engulfing": _engulfing(h4_rows, direction),
+        "liquidity_sweep": _liquidity_sweep(h4_rows, direction),
+        "notes": (
+            "Order Block H4 identifie avant le BOS ; "
+            "entree a l'ouverture de la bougie OB ; "
+            "biais Daily et structure H4 alignes."
         ),
     }
 
-    if diagnostics is not None:
-        diagnostics["reason"] = f"POI détectée : {state}"
-
-        if price is None:
-            diagnostics["price_warning"] = (
-                "Prix courant indisponible ; confirmation impossible"
-            )
-
-        diagnostics["direction"] = direction
-        diagnostics["rr"] = round(rr, 3)
-        diagnostics["status"] = state
-
-    return [signal]
+    signals.append(signal)
+    return signals
 
 
-def format_message(signal: dict) -> str:
-    """Formate une alerte POI destinée à Telegram."""
-    direction = (
-        "ACHAT (BUY)"
-        if signal["direction"] == "BUY"
-        else "VENTE (SELL)"
-    )
+# ============================================================
+# FORMATAGE DES ALERTES
+# ============================================================
 
-    state = signal.get("status", "POI_DETECTED")
+def format_message(signal):
+    """
+    Formate un signal pour Telegram ou les journaux.
+    """
+    direction = signal.get("direction", "UNKNOWN")
+    symbol = signal.get("symbol", "UNKNOWN")
 
-    labels = {
-        "POI_DETECTED": "NOUVELLE POI SMC DÉTECTÉE",
-        "PRICE_IN_ZONE": "PRIX DANS LA ZONE POI",
-        "CONFIRMED": "SETUP AVEC CONFIRMATION TECHNIQUE",
-        "INVALIDATED": "ZONE INVALIDÉE",
-    }
+    direction_label = {
+        "BUY": "ACHAT",
+        "SELL": "VENTE",
+    }.get(direction, direction)
 
-    symbol = signal.get("symbol", "Inconnu")
-    index_name = signal.get(
-        "index_name",
-        INDEX_NAMES.get(symbol, symbol),
-    )
+    entry = signal.get("entry")
+    stop_loss = signal.get("stop_loss")
+    take_profit = signal.get("take_profit")
+    rr = signal.get("rr")
 
-    price = signal.get("price_now")
-    if price is None:
-        price_text = "INDISPONIBLE — cotation non reçue"
-    else:
-        price_text = f"{price:.8f}"
+    lines = [
+        "TRADER AI PRO — SIGNAL SMC",
+        "",
+        f"Instrument : {symbol}",
+        f"Direction : {direction_label}",
+        "Analyse : Daily (D1)",
+        "Structure et Order Block : H4",
+        "Methode : Sniper Entry — ouverture de l'OB",
+        "",
+        f"Zone OB : {signal.get('zone_low')} - "
+        f"{signal.get('zone_high')}",
+        f"Entree : {entry}",
+        f"Stop Loss : {stop_loss}",
+        f"Take Profit : {take_profit}",
+        f"RR estime : 1:{rr:.2f}" if isinstance(rr, (int, float))
+        else f"RR estime : {rr}",
+        f"Prix observe : {signal.get('current_price')}",
+        "",
+        f"Biais D1 : {signal.get('d1_bias')}",
+        f"Structure H4 : {signal.get('h4_structure')}",
+        f"BOS : {signal.get('bos_level')}",
+        f"ATR H4 : {signal.get('atr_h4')}",
+        f"Englobement H4 : {'Oui' if signal.get('engulfing') else 'Non'}",
+        f"Prise de liquidite : {'Oui' if signal.get('liquidity_sweep') else 'Non'}",
+        "",
+        f"Note : {signal.get('notes', '')}",
+        "",
+        "Scanner uniquement : aucun ordre automatique execute.",
+        "Signal a verifier avant toute decision de trading.",
+    ]
 
-    sweep = (
-        "Oui"
-        if signal.get("liquidity_sweep")
-        else "Non détecté (facultatif)"
-    )
-
-    engulfing = (
-        "Oui"
-        if signal.get("engulfing")
-        else "Non détecté"
-    )
-
-    return (
-        "🔎 TRADER AI PRO — SMC H4/H1\n\n"
-        f"{labels.get(state, state)}\n\n"
-        f"Indice : {index_name}\n"
-        f"Symbole Deriv : {symbol}\n"
-        f"ID : {signal['signal_id']}\n"
-        f"Direction : {direction}\n"
-        f"Structure H4 : {signal['h4_structure']}\n"
-        f"Zone POI H1 : {signal['zone_low']:.8f} – "
-        f"{signal['zone_high']:.8f}\n"
-        f"Entrée planifiée : {signal['entry']:.8f}\n"
-        f"Prix observé : {price_text}\n"
-        f"Stop-loss indicatif : {signal['stop_loss']:.8f}\n"
-        f"Take-profit indicatif : {signal['take_profit']:.8f}\n"
-        f"RR planifié : 1:{signal['rr']:.2f}\n"
-        f"Englobement H1 : {engulfing}\n"
-        f"Sweep de liquidité : {sweep}\n"
-        f"Heure UTC : {signal['timestamp_utc']}\n\n"
-        "⚠️ Une POI détectée n'est pas une entrée exécutée. "
-        "Si le prix courant est indisponible, la confirmation "
-        "du retour dans la zone n'est pas possible.\n"
-        "Vérifie le graphique avant toute entrée. "
-        "Compte démo uniquement. Aucun ordre automatique."
-            )
-                                       
+    return "\n".join(lines)
