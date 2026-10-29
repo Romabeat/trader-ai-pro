@@ -57,8 +57,7 @@ steps:
       python -m py_compile analysis_engine.py strategy.py deriv_market.py scheduled_analysis.py app.py test_compatibility.py trade_journal.py
 
   - name: Lancer les tests de compatibilite
-    run: |
-      python -m unittest test_compatibility -v
+    run: python -m unittest test_compatibility -v
 
   - name: Verifier la configuration Telegram
     run: |
@@ -69,7 +68,7 @@ steps:
         echo "::warning::Le secret TELEGRAM_CHAT_ID est absent."
       fi
       if [ -n "$TELEGRAM_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
-        echo "Configuration Telegram présente."
+        echo "Configuration Telegram presente."
       fi
 
   - name: Executer l'analyse programmee
