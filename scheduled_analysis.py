@@ -1,276 +1,144 @@
-"""
-TRADER AI PRO - Analyse automatique Deriv.
+"""Scanner programmé Trader AI Pro : Telegram réel, journal SQLite, aucune exécution d'ordres."""
+from __future__ import annotations
 
-- Analyse multi-timeframe : D1, H4, H1 et M30.
-- Envoie des alertes Telegram uniquement si le mode test est désactivé.
-- N'exécute aucun ordre de trading.
-"""
-
+import json
 import os
+import sqlite3
 import time
-import requests
+from pathlib import Path
 
+import requests
 from deriv_market import get_candles
 from strategy import find_signals, format_message
 
-
-# ============================================================
-# CONFIGURATION
-# ============================================================
-
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
-
-# Le mode test reste actif sauf si DRY_RUN vaut exactement "false".
+ENABLE_TELEGRAM_ALERTS = os.environ.get("ENABLE_TELEGRAM_ALERTS", "false").strip().lower() == "true"
+# DRY_RUN concerne uniquement l'exécution d'ordres : aucune fonction d'ordre n'existe dans ce projet.
 DRY_RUN = os.environ.get("DRY_RUN", "true").strip().lower() != "false"
-
+DATABASE_PATH = Path(os.environ.get("TRADER_DB_PATH", "state/trader_ai_pro.sqlite3"))
+SYMBOLS = ["1HZ10V", "1HZ15V", "1HZ25V", "1HZ30V", "1HZ50V", "1HZ75V", "1HZ90V",
+           "1HZ100V", "R_10", "R_25", "R_50", "R_75", "R_100"]
+TIMEFRAMES = ("H4", "H1")
 CANDLE_COUNT = 100
-TIMEFRAMES = ("D1", "H4", "H1", "M30")
-
-SYMBOLS = [
-    "1HZ10V",
-    "1HZ15V",
-    "1HZ25V",
-    "1HZ30V",
-    "1HZ50V",
-    "1HZ75V",
-    "1HZ90V",
-    "1HZ100V",
-    "R_10",
-    "R_25",
-    "R_50",
-    "R_75",
-    "R_100",
-]
-
 REQUEST_TIMEOUT = 15
 PAUSE_BETWEEN_SYMBOLS = 1
 
 
-# ============================================================
-# JOURNALISATION
-# ============================================================
-
-def log(message):
-    """Affiche un message avec l'heure UTC."""
-    timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
-    print(f"[{timestamp} UTC] {message}", flush=True)
+def log(message: str) -> None:
+    print(f"[TRADER AI PRO] {message}", flush=True)
 
 
-# ============================================================
-# RECUPERATION DES BOUGIES
-# ============================================================
-
-def fetch_candles(symbol, timeframe):
-    """Recupere et valide les bougies d'un actif."""
-    try:
-        response = get_candles(
-            symbol,
-            timeframe,
-            count=CANDLE_COUNT,
-        )
-    except Exception as exc:
-        log(
-            f"[ERREUR] Recuperation {symbol} "
-            f"{timeframe}: {type(exc).__name__}: {exc}"
-        )
-        return []
-
-    if isinstance(response, dict):
-        error = response.get("error")
-
-        if error:
-            log(f"[ERREUR] {symbol} {timeframe}: {error}")
-
-        candles = response.get("candles", [])
-    elif isinstance(response, list):
-        candles = response
-    else:
-        log(
-            f"[ERREUR] Reponse inattendue pour "
-            f"{symbol} {timeframe}: {type(response).__name__}"
-        )
-        return []
-
-    if not isinstance(candles, list):
-        log(f"[ERREUR] Liste de bougies invalide : {symbol} {timeframe}")
-        return []
-
-    if len(candles) < 30:
-        log(
-            f"[INFO] Pas assez de bougies pour "
-            f"{symbol} {timeframe}: {len(candles)}"
-        )
-        return []
-
-    return candles
+def connect_db() -> sqlite3.Connection:
+    DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(DATABASE_PATH, timeout=20)
+    db.execute("PRAGMA journal_mode=WAL")
+    db.execute(""" CREATE TABLE IF NOT EXISTS signals ( signal_id TEXT PRIMARY KEY, created_at TEXT NOT NULL, symbol TEXT NOT NULL, direction TEXT NOT NULL, entry REAL NOT NULL, stop_loss REAL NOT NULL, take_profit REAL NOT NULL, rr REAL NOT NULL, status TEXT NOT NULL DEFAULT 'ENVOYE', outcome TEXT, result_r REAL, notes TEXT, message TEXT ) """)
+    db.execute(""" CREATE TABLE IF NOT EXISTS run_log ( id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, event TEXT NOT NULL, detail TEXT ) """)
+    db.commit()
+    return db
 
 
-# ============================================================
-# TELEGRAM
-# ============================================================
-
-def send_telegram(message):
-    """Envoie une alerte Telegram si le mode test est desactive."""
-    if DRY_RUN:
-        log("[MODE TEST] Alerte non envoyee :")
-        log(message)
+def send_telegram(message: str) -> bool:
+    if not ENABLE_TELEGRAM_ALERTS:
+        log("Telegram désactivé (ENABLE_TELEGRAM_ALERTS n'est pas true).")
         return False
-
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        log(
-            "[ERREUR] TELEGRAM_TOKEN ou TELEGRAM_CHAT_ID "
-            "manquant dans les secrets."
-        )
+        log("ERREUR: secrets TELEGRAM_TOKEN / TELEGRAM_CHAT_ID manquants.")
         return False
-
-    url = (
-        "https://api.telegram.org/bot"
-        f"{TELEGRAM_TOKEN}/sendMessage"
-    )
-
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
         response = requests.post(
             url,
-            json={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": message,
-            },
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "disable_web_page_preview": True},
             timeout=REQUEST_TIMEOUT,
         )
-
-        if response.status_code != 200:
-            log(
-                f"[ERREUR TELEGRAM] HTTP {response.status_code}: "
-                f"{response.text[:300]}"
-            )
+        response.raise_for_status()
+        payload = response.json()
+        if not payload.get("ok"):
+            log(f"Erreur Telegram API: {payload.get('description', 'réponse non valide')}")
             return False
-
-        result = response.json()
-
-        if not result.get("ok", False):
-            log(f"[ERREUR TELEGRAM] {result}")
-            return False
-
-        log("[OK] Alerte Telegram envoyee.")
         return True
-
     except (requests.RequestException, ValueError) as exc:
-        log(f"[ERREUR TELEGRAM] {type(exc).__name__}: {exc}")
+        log(f"Erreur d'envoi Telegram: {exc}")
         return False
 
 
-# ============================================================
-# ANALYSE D'UN ACTIF
-# ============================================================
-
-def analyze_symbol(symbol):
-    """Analyse un actif sur les quatre unites de temps."""
-    log(f"Debut de l'analyse : {symbol}")
-
-    market_data = {}
-
-    for timeframe in TIMEFRAMES:
-        candles = fetch_candles(symbol, timeframe)
-
-        if not candles:
-            log(
-                f"[INFO] Analyse ignoree pour {symbol} : "
-                f"donnees {timeframe} indisponibles."
-            )
-            return 0
-
-        market_data[timeframe] = candles
-
+def fetch_candles(symbol: str, timeframe: str) -> list[dict] | None:
     try:
-        signals = find_signals(
-            symbol=symbol,
-            d1=market_data["D1"],
-            h4=market_data["H4"],
-            h1=market_data["H1"],
-            m30=market_data["M30"],
-        )
+        rows = get_candles(symbol, timeframe, count=CANDLE_COUNT, timeout=REQUEST_TIMEOUT)
+        if not isinstance(rows, list) or len(rows) < 30:
+            log(f"{symbol} {timeframe}: données insuffisantes.")
+            return None
+        return rows
     except Exception as exc:
-        log(
-            f"[ERREUR] Analyse de {symbol}: "
-            f"{type(exc).__name__}: {exc}"
-        )
-        return 0
+        log(f"{symbol} {timeframe}: erreur données: {exc}")
+        return None
 
+
+def already_recorded(db: sqlite3.Connection, signal_id: str) -> bool:
+    return db.execute("SELECT 1 FROM signals WHERE signal_id = ?", (signal_id,)).fetchone() is not None
+
+
+def store_signal(db: sqlite3.Connection, signal: dict, message: str) -> None:
+    db.execute(
+        """INSERT INTO signals (signal_id, created_at, symbol, direction, entry, stop_loss, take_profit, rr, status, message) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ENVOYE', ?)""",
+        (signal["signal_id"], signal["timestamp_utc"], signal["symbol"], signal["direction"],
+         signal["entry"], signal["stop_loss"], signal["take_profit"], signal["rr"], message),
+    )
+    db.execute("INSERT INTO run_log(event, detail) VALUES (?, ?)",
+               ("SIGNAL_SENT", json.dumps({"signal_id": signal["signal_id"], "symbol": signal["symbol"]})))
+    db.commit()
+
+
+def analyze_symbol(db: sqlite3.Connection, symbol: str) -> tuple[int, int]:
+    h4 = fetch_candles(symbol, "H4")
+    h1 = fetch_candles(symbol, "H1")
+    if h4 is None or h1 is None:
+        return 0, 1
+    signals = find_signals(symbol=symbol, h4=h4, h1=h1)
     if not signals:
-        log(f"Aucun signal confirme pour {symbol}.")
-        return 0
-
-    if isinstance(signals, dict):
-        signals = [signals]
-
-    sent_count = 0
-
+        log(f"{symbol}: aucun signal SMC confirmé.")
+        return 0, 0
+    sent = 0
     for signal in signals:
-        if not isinstance(signal, dict):
-            log(f"[AVERTISSEMENT] Signal invalide pour {symbol}.")
+        if already_recorded(db, signal["signal_id"]):
+            log(f"{symbol}: doublon ignoré ({signal['signal_id']}).")
             continue
-
-        try:
-            message = format_message(signal)
-        except Exception as exc:
-            log(
-                f"[ERREUR] Formatage du signal {symbol}: "
-                f"{type(exc).__name__}: {exc}"
-            )
-            continue
-
-        log(f"[SIGNAL] Signal detecte pour {symbol}.")
-
+        message = format_message(signal)
         if send_telegram(message):
-            sent_count += 1
+            try:
+                store_signal(db, signal, message)
+                sent += 1
+                log(f"{symbol}: signal envoyé et journalisé ({signal['signal_id']}).")
+            except sqlite3.IntegrityError:
+                log(f"{symbol}: doublon empêché par la base de données.")
+        else:
+            log(f"{symbol}: signal non journalisé car Telegram n'a pas confirmé l'envoi.")
+    return sent, 0
 
-    return sent_count
 
-
-# ============================================================
-# LANCEMENT GENERAL
-# ============================================================
-
-def main():
-    """Execute un cycle complet d'analyse."""
-    log("=" * 55)
-    log("TRADER AI PRO - DEMARRAGE")
-    log(f"Mode test : {'ACTIVE' if DRY_RUN else 'DESACTIVE'}")
-    log(f"Nombre d'actifs : {len(SYMBOLS)}")
-    log(f"Unites de temps : {', '.join(TIMEFRAMES)}")
-    log("=" * 55)
-
-    total_signals_sent = 0
-    successful_analyses = 0
-    failed_analyses = 0
-
-    for index, symbol in enumerate(SYMBOLS):
-        try:
-            sent = analyze_symbol(symbol)
-            total_signals_sent += sent
-            successful_analyses += 1
-
-        except Exception as exc:
-            failed_analyses += 1
-            log(
-                f"[ERREUR INATTENDUE] {symbol}: "
-                f"{type(exc).__name__}: {exc}"
-            )
-
-        if index < len(SYMBOLS) - 1:
-            time.sleep(PAUSE_BETWEEN_SYMBOLS)
-
-    log("=" * 55)
-    log("TRADER AI PRO - FIN DU CYCLE")
-    log(f"Actifs traites : {successful_analyses}")
-    log(f"Erreurs inattendues : {failed_analyses}")
-    log(f"Alertes Telegram envoyees : {total_signals_sent}")
-
-    if DRY_RUN:
-        log("Mode test actif : aucune alerte Telegram reelle envoyee.")
-
-    log("=" * 55)
+def main() -> None:
+    log("Démarrage du scan SMC H4/H1.")
+    log(f"Alertes Telegram activées: {ENABLE_TELEGRAM_ALERTS}; exécution automatique des ordres: DÉSACTIVÉE.")
+    if not DRY_RUN:
+        log("AVERTISSEMENT: DRY_RUN=false détecté, mais ce programme ne contient aucune fonction d'exécution d'ordres.")
+    db = connect_db()
+    total_sent = errors = 0
+    try:
+        for index, symbol in enumerate(SYMBOLS):
+            sent, err = analyze_symbol(db, symbol)
+            total_sent += sent
+            errors += err
+            if index < len(SYMBOLS) - 1:
+                time.sleep(PAUSE_BETWEEN_SYMBOLS)
+        db.execute("INSERT INTO run_log(event, detail) VALUES (?, ?)",
+                   ("SCAN_FINISHED", json.dumps({"sent": total_sent, "errors": errors})))
+        db.commit()
+    finally:
+        db.close()
+    log(f"Fin du scan. Signaux envoyés: {total_sent}; erreurs de données: {errors}.")
+    log("Aucun ordre n'a été envoyé à Deriv.")
 
 
 if __name__ == "__main__":
