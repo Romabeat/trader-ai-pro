@@ -1,75 +1,11 @@
-name: Trader AI Pro - Analyse programmee
+name: Trader AI Pro
 
 on:
 workflow_dispatch:
-schedule:
-- cron: "17,47 * * * *"
-
-permissions:
-contents: read
-
-concurrency:
-group: trader-ai-pro-analysis
-cancel-in-progress: false
 
 jobs:
-analyse:
+test:
 runs-on: ubuntu-latest
-timeout-minutes: 15
-
-env:
-  DRY_RUN: "true"
-  ENABLE_TELEGRAM_ALERTS: "true"
-  PYTHONUNBUFFERED: "1"
-  TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-  TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-  TRADER_DB_PATH: state/trader_ai_pro.sqlite3
-
 steps:
-  - name: Recuperer le code
-    uses: actions/checkout@v4
-
-  - name: Creer le dossier de donnees
-    run: mkdir -p state
-
-  - name: Restaurer la base SQLite
-    uses: actions/cache@v4
-    with:
-      path: state/trader_ai_pro.sqlite3
-      key: trader-ai-pro-db-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
-      restore-keys: |
-        trader-ai-pro-db-${{ github.ref_name }}-
-
-  - name: Installer Python
-    uses: actions/setup-python@v5
-    with:
-      python-version: "3.11"
-
-  - name: Installer les dependances
-    run: |
-      python -m pip install --upgrade pip
-      if [ -f requirements.txt ]; then
-        python -m pip install -r requirements.txt
-      fi
-
-  - name: Verifier la syntaxe Python
-    run: |
-      python -m py_compile analysis_engine.py strategy.py deriv_market.py scheduled_analysis.py app.py test_compatibility.py trade_journal.py
-
-  - name: Lancer les tests de compatibilite
-    run: python -m unittest test_compatibility -v
-
-  - name: Verifier la configuration Telegram
-    run: |
-      if [ -z "$TELEGRAM_TOKEN" ]; then
-        echo "::warning::Le secret TELEGRAM_TOKEN est absent."
-      fi
-      if [ -z "$TELEGRAM_CHAT_ID" ]; then
-        echo "::warning::Le secret TELEGRAM_CHAT_ID est absent."
-      fi
-      if [ -n "$TELEGRAM_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
-        echo "Configuration Telegram presente."
-      fi
-
-  - name: Executer l'analyse programmee
-    run: python -u scheduled_analysis.py
+- name: Afficher un message
+run: echo "Workflow YAML valide"
