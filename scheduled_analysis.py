@@ -36,7 +36,7 @@ from strategy import find_signals, format_message
 
 BOT_NAME = "TRADER AI PRO"
 
-D1_CANDLE_COUNT = 100
+D1_CANDLE_COUNT = 200
 H4_CANDLE_COUNT = 200
 H2_CANDLE_COUNT = 200
 H1_CANDLE_COUNT = 200
