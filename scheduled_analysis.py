@@ -1,14 +1,15 @@
 """
 TRADER AI PRO — SCANNER TRENDLINE + CONFLUENCE
 
-Nouvelle stratégie indépendante de l'ancienne :
-- Tendances et droites de tendance.
+Stratégie :
+- Analyse des tendances.
+- Droites de tendance.
 - Supports et résistances horizontaux.
 - Recherche de confluences.
 - Entrées anticipées.
 - Analyse D1, H4, H2 et H1.
 - Alertes Telegram uniquement.
-- Aucun ordre exécuté automatiquement.
+- Aucune exécution automatique d'ordres.
 """
 
 from __future__ import annotations
@@ -35,7 +36,6 @@ from strategy import find_signals, format_message
 
 BOT_NAME = "TRADER AI PRO"
 
-# Historique demandé pour chaque unité de temps.
 D1_CANDLE_COUNT = 100
 H4_CANDLE_COUNT = 200
 H2_CANDLE_COUNT = 200
@@ -55,7 +55,7 @@ DRY_RUN = (
     os.getenv("DRY_RUN", "true").strip().lower() != "false"
 )
 
-# Sécurité : aucune exécution automatique.
+# Sécurité : aucun ordre automatique.
 AUTO_EXECUTION_ENABLED = False
 
 ENABLE_TELEGRAM_ALERTS = (
@@ -126,12 +126,7 @@ def connect_db() -> sqlite3.Connection:
 
 
 def init_db() -> None:
-    """
-    Initialise les tables nécessaires.
-
-    Les anciennes tables éventuellement présentes ne sont
-    pas utilisées comme déclencheurs de la nouvelle stratégie.
-    """
+    """Initialise les tables du scanner."""
 
     with connect_db() as connection:
         connection.execute("""
@@ -224,16 +219,17 @@ def finish_analysis_run(
             ),
         )
 
+        connection.commit()
 
-def store_signal(signal: dict[str, Any], message: str) -> bool:
+
+def store_signal(
+    signal: dict[str, Any],
+    message: str,
+) -> bool:
     """
-    Enregistre un signal.
+    Enregistre un signal valide.
 
-    Retourne True si le signal est nouveau.
-    Retourne False s'il a déjà été enregistré ou si ses
-    paramètres sont invalides.
-
-    Aucun RR minimum arbitraire n'est imposé ici.
+    Aucun RR minimum arbitraire n'est imposé.
     """
 
     try:
@@ -247,9 +243,7 @@ def store_signal(signal: dict[str, Any], message: str) -> bool:
         rr = float(signal["rr"])
 
     except (KeyError, TypeError, ValueError):
-        logger.warning(
-            "Signal ignoré : champs absents ou invalides."
-        )
+        logger.warning("Signal ignoré : données manquantes.")
         return False
 
     if not signal_id or not symbol:
@@ -258,28 +252,18 @@ def store_signal(signal: dict[str, Any], message: str) -> bool:
     if direction not in ("BUY", "SELL"):
         return False
 
-    numbers = [
-        entry,
-        stop_loss,
-        take_profit,
-        rr,
-    ]
+    values = [entry, stop_loss, take_profit, rr]
 
-    if any(not math.isfinite(value) for value in numbers):
+    if any(not math.isfinite(value) for value in values):
         return False
 
     if min(entry, stop_loss, take_profit) <= 0 or rr <= 0:
-        logger.warning(
-            "Signal ignoré : niveaux ou RR invalides pour %s.",
-            symbol,
-        )
         return False
 
-    # Vérifie la cohérence directionnelle du risque et de l'objectif.
     if direction == "BUY":
-        if not (stop_loss < entry < take_profit):
+        if not stop_loss < entry < take_profit:
             logger.warning(
-                "Signal BUY incohérent pour %s.",
+                "Niveaux BUY incohérents pour %s.",
                 symbol,
             )
             return False
@@ -289,9 +273,9 @@ def store_signal(signal: dict[str, Any], message: str) -> bool:
         )
 
     else:
-        if not (take_profit < entry < stop_loss):
+        if not take_profit < entry < stop_loss:
             logger.warning(
-                "Signal SELL incohérent pour %s.",
+                "Niveaux SELL incohérents pour %s.",
                 symbol,
             )
             return False
@@ -303,7 +287,6 @@ def store_signal(signal: dict[str, Any], message: str) -> bool:
     if not math.isfinite(calculated_rr) or calculated_rr <= 0:
         return False
 
-    # Utilise le RR recalculé à partir des niveaux réels.
     rr = round(calculated_rr, 4)
 
     with connect_db() as connection:
@@ -411,16 +394,12 @@ def send_telegram(message: str) -> bool:
 
 
 # ============================================================
-# RÉCUPÉRATION DES BOUGIES
+# NORMALISATION DES BOUGIES
 # ============================================================
 
 def normalize_candles(
     candles: Any,
 ) -> list[dict[str, Any]]:
-    """
-    Normalise les bougies et supprime les doublons d'époque.
-    """
-
     if isinstance(candles, dict):
         candles = candles.get("candles", [])
 
@@ -436,7 +415,6 @@ def normalize_candles(
 
         try:
             epoch = int(item["epoch"])
-
             opening = float(item["open"])
             high = float(item["high"])
             low = float(item["low"])
@@ -477,28 +455,35 @@ def normalize_candles(
     return result
 
 
+# ============================================================
+# RÉCUPÉRATION DES BOUGIES
+# ============================================================
+
 def fetch_candles(
     symbol: str,
     timeframe: str,
     required_count: int,
 ) -> list[dict[str, Any]]:
-    """
-    Récupère les bougies d'une unité de temps.
+    try:
+        response = get_candles(
+            symbol,
+            timeframe,
+            count=required_count + 1,
+            timeout=REQUEST_TIMEOUT,
+        )
 
-    Les bougies encore en formation sont exclues par
-    deriv_market.py.
-    """
-
-    response = get_candles(
-        symbol,
-        timeframe,
-        count=required_count + 1,
-        timeout=REQUEST_TIMEOUT,
-    )
+    except Exception as exc:
+        logger.warning(
+            "%s %s : erreur de récupération : %s",
+            symbol,
+            timeframe,
+            exc,
+        )
+        return []
 
     if not isinstance(response, dict):
         logger.warning(
-            "%s %s : réponse Deriv inattendue.",
+            "%s %s : réponse Deriv invalide.",
             symbol,
             timeframe,
         )
@@ -513,7 +498,9 @@ def fetch_candles(
         )
         return []
 
-    candles = normalize_candles(response.get("candles", []))
+    candles = normalize_candles(
+        response.get("candles", [])
+    )
 
     if len(candles) < required_count:
         logger.warning(
@@ -541,7 +528,9 @@ def fetch_candles(
 # PRIX COURANT
 # ============================================================
 
-def fetch_current_price(symbol: str) -> float | None:
+def fetch_current_price(
+    symbol: str,
+) -> float | None:
     try:
         response = get_current_price(
             symbol,
@@ -590,27 +579,21 @@ def fetch_current_price(symbol: str) -> float | None:
 # ANALYSE D'UN INDICE
 # ============================================================
 
-def analyze_symbol(symbol: str) -> list[dict[str, Any]]:
+def analyze_symbol(
+    symbol: str,
+) -> list[dict[str, Any]]:
     logger.info("=" * 60)
     logger.info("Analyse de %s", symbol)
-    logger.info("Stratégie : TRENDLINE + CONFLUENCE")
 
-    candles_by_timeframe: dict[str, list[dict[str, Any]]] = {}
+    candles_by_timeframe = {}
 
-    # On récupère les quatre unités de temps.
-    # La stratégie choisit ensuite la première unité qui
-    # présente une configuration valide.
     for timeframe, count in TIMEFRAMES.items():
-        candles = fetch_candles(
+        candles_by_timeframe[timeframe] = fetch_candles(
             symbol,
             timeframe,
             count,
         )
 
-        candles_by_timeframe[timeframe] = candles
-
-    # Le prix courant est nécessaire pour éviter de proposer
-    # une entrée devenue trop éloignée.
     current_price = fetch_current_price(symbol)
 
     if current_price is None:
@@ -661,9 +644,10 @@ def analyze_symbol(symbol: str) -> list[dict[str, Any]]:
         if not isinstance(signal, dict):
             continue
 
-        # Le scanner n'accepte que les signaux issus de la
-        # nouvelle stratégie.
-        if signal.get("strategy") != "TRENDLINE_SUPPORT_RESISTANCE":
+        if (
+            signal.get("strategy")
+            != "TRENDLINE_SUPPORT_RESISTANCE"
+        ):
             logger.warning(
                 "%s : signal ignoré, stratégie non conforme.",
                 symbol,
@@ -685,12 +669,9 @@ def analyze_symbol(symbol: str) -> list[dict[str, Any]]:
 # TRAITEMENT DES SIGNAUX
 # ============================================================
 
-def process_signal(signal: dict[str, Any]) -> bool:
-    """
-    Enregistre le signal avant l'envoi Telegram pour éviter
-    qu'une erreur d'envoi provoque des répétitions à chaque run.
-    """
-
+def process_signal(
+    signal: dict[str, Any],
+) -> bool:
     try:
         message = format_message(signal)
 
@@ -714,12 +695,6 @@ def process_signal(signal: dict[str, Any]) -> bool:
     )
 
     # Aucun ordre n'est envoyé à Deriv.
-    if AUTO_EXECUTION_ENABLED:
-        logger.critical(
-            "Sécurité : ce scanner ne contient aucune fonction "
-            "d'exécution d'ordre."
-        )
-
     if ENABLE_TELEGRAM_ALERTS:
         send_telegram(message)
 
@@ -734,15 +709,21 @@ def main() -> None:
     started_at = utc_now()
 
     logger.info("=" * 65)
-    logger.info("%s — SCANNER TRENDLINE + CONFLUENCE", BOT_NAME)
+    logger.info(
+        "%s — SCANNER TRENDLINE + CONFLUENCE",
+        BOT_NAME,
+    )
     logger.info("=" * 65)
 
     logger.info("Début : %s", started_at)
     logger.info("Timeframes : D1 → H4 → H2 → H1")
-    logger.info("Bougies D1 : %s", D1_CANDLE_COUNT)
-    logger.info("Bougies H4 : %s", H4_CANDLE_COUNT)
-    logger.info("Bougies H2 : %s", H2_CANDLE_COUNT)
-    logger.info("Bougies H1 : %s", H1_CANDLE_COUNT)
+
+    for timeframe, count in TIMEFRAMES.items():
+        logger.info(
+            "Bougies %s : %s",
+            timeframe,
+            count,
+        )
 
     logger.info(
         "Alertes Telegram : %s",
@@ -757,18 +738,8 @@ def main() -> None:
     logger.info("DRY_RUN : %s", DRY_RUN)
     logger.info("Exécution automatique : DÉSACTIVÉE")
     logger.info("Nombre d'indices : %s", len(SYMBOLS))
+    logger.info("RR minimum imposé : aucun")
 
-    logger.info(
-        "Stratégie active : tendances, trendlines, "
-        "supports, résistances et confluences."
-    )
-
-    logger.info(
-        "RR minimum imposé : aucun."
-    )
-
-    # Protection supplémentaire : cette application est un
-    # scanner d'alertes, jamais un exécuteur d'ordres.
     if AUTO_EXECUTION_ENABLED:
         raise RuntimeError(
             "L'exécution automatique doit rester désactivée."
@@ -783,7 +754,10 @@ def main() -> None:
     errors = []
 
     try:
-        for index, symbol in enumerate(SYMBOLS, start=1):
+        for index, symbol in enumerate(
+            SYMBOLS,
+            start=1,
+        ):
             logger.info(
                 "[%s/%s] %s",
                 index,
@@ -814,7 +788,7 @@ def main() -> None:
         status = "PARTIAL" if errors else "SUCCESS"
 
         details = (
-            f"Stratégie=TRENDLINE+CONFLUENCE; "
+            "Stratégie=TRENDLINE+CONFLUENCE; "
             f"erreurs={len(errors)}; "
             f"alertes_nouvelles={signals_found}"
         )
@@ -832,4 +806,22 @@ def main() -> None:
 
     except Exception as exc:
         finish_analysis_run(
-            run_id=run
+            run_id=run_id,
+            status="FAILED",
+            symbols_checked=symbols_checked,
+            signals_found=signals_found,
+            details=str(exc),
+        )
+        raise
+
+    logger.info("=" * 65)
+    logger.info("ANALYSE TERMINÉE")
+    logger.info("Indices analysés : %s", symbols_checked)
+    logger.info("Nouveaux signaux : %s", signals_found)
+    logger.info("Erreurs : %s", len(errors))
+    logger.info("Exécution automatique : DÉSACTIVÉE")
+    logger.info("=" * 65)
+
+
+if __name__ == "__main__":
+    main()
