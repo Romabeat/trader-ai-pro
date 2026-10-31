@@ -1,55 +1,59 @@
 """
 TRADER AI PRO — STRATEGIE TRENDLINE + CONFLUENCE
 
-Principes :
-- Analyse D1, H4, H2 et H1.
-- Priorité : D1 -> H4 -> H2 -> H1.
-- Identification des tendances et trendlines.
-- Identification des supports et résistances horizontaux.
-- Recherche de confluences entre trendline et niveau horizontal.
-- Détection anticipée des configurations.
-- Aucun RR minimum imposé.
-- Aucun ordre exécuté automatiquement.
+Strategie :
+- Analyse des unites de temps : D1, H4, H2, H1.
+- Priorite : D1 -> H4 -> H2 -> H1.
+- Detection des tendances haussieres et baissieres.
+- Detection des trendlines a partir des pivots.
+- Detection des supports et resistances horizontaux.
+- Recherche de confluence entre trendline et niveau horizontal.
+- Detection anticipee : pas besoin d'attendre le contact exact.
+- Aucun RR minimum impose.
+- Alertes uniquement : aucun ordre automatique.
 
-Cette stratégie est indépendante de SMC, BOS et Order Blocks.
+Interface attendue par scheduled_analysis.py :
+    find_signals(...)
+    format_message(...)
+
+Compatible avec des bougies sous forme de dictionnaires.
 """
-
-from __future__ import annotations
 
 import hashlib
 import math
-from typing import Any
+from collections import defaultdict
 
-
-# ============================================================
-# CONFIGURATION
-# ============================================================
 
 STRATEGY_NAME = "TRENDLINE_SUPPORT_RESISTANCE"
 
 TIMEFRAME_PRIORITY = ("D1", "H4", "H2", "H1")
 
-PIVOT_RADIUS = 3
+# Nombre minimal de bougies pour analyser une unite de temps.
+MIN_CANDLES = {
+    "D1": 30,
+    "H4": 40,
+    "H2": 40,
+    "H1": 40,
+}
+
+# Parametres de detection.
 ATR_PERIOD = 14
+PIVOT_RADIUS = 2
+PIVOT_LOOKBACK = 80
+LEVEL_LOOKBACK = 100
+TRENDLINE_LOOKBACK = 8
 
-# Distance maximale entre la trendline et le niveau horizontal.
-CONFLUENCE_ATR = 0.60
-
-# Distance maximale du prix actuel à la confluence.
+# Distances exprimees en ATR.
+MAX_CONFLUENCE_DISTANCE_ATR = 0.80
 MAX_ENTRY_DISTANCE_ATR = 1.50
+LEVEL_CLUSTER_DISTANCE_ATR = 0.20
+SL_BUFFER_ATR = 0.15
 
-# Marge supplémentaire au-delà de la zone pour le stop-loss.
-SL_ATR_BUFFER = 0.35
+# On evite les zones trop eloignees du prix actuel.
+MAX_ZONE_DISTANCE_ATR = 1.50
 
-# Distance minimale entre un pivot et un autre pour limiter
-# les faux niveaux horizontaux.
-MIN_LEVEL_SEPARATION_ATR = 0.30
-
-# Si aucun niveau opposé exploitable n'est détecté,
-# un objectif technique de remplacement est calculé.
-FALLBACK_TARGET_R = 3.0
-
-INDEX_NAMES = {
+# Noms complets des indices Deriv.
+SYMBOL_NAMES = {
     "1HZ10V": "Volatility 10 (1s) Index",
     "1HZ15V": "Volatility 15 (1s) Index",
     "1HZ25V": "Volatility 25 (1s) Index",
@@ -67,675 +71,767 @@ INDEX_NAMES = {
 
 
 # ============================================================
-# OUTILS NUMÉRIQUES
+# NORMALISATION DES BOUGIES
 # ============================================================
 
-def _finite_positive(value: Any) -> float | None:
-    """Convertit une valeur en nombre positif valide."""
-
+def _number(value):
+    """Convertit une valeur en nombre, sinon retourne None."""
     try:
         result = float(value)
+        if math.isfinite(result):
+            return result
     except (TypeError, ValueError):
+        pass
+    return None
+
+
+def _get_value(candle, names):
+    """Recupere la premiere cle disponible dans une bougie."""
+    if not isinstance(candle, dict):
         return None
 
-    if not math.isfinite(result) or result <= 0:
-        return None
+    for name in names:
+        if name in candle:
+            value = _number(candle[name])
+            if value is not None:
+                return value
 
-    return result
+    return None
 
 
-def _normalize_candles(
-    candles: Any,
-) -> list[dict[str, float]]:
-    """Normalise les bougies et les trie par ordre chronologique."""
+def _normalise_candles(candles):
+    """
+    Normalise les bougies.
+    Accepte notamment :
+      {"open": ..., "high": ..., "low": ..., "close": ...}
+    ainsi que les variantes en majuscules.
+    """
+    result = []
 
-    if not isinstance(candles, list):
-        return []
-
-    normalized = []
-    seen_epochs = set()
+    if not isinstance(candles, (list, tuple)):
+        return result
 
     for candle in candles:
         if not isinstance(candle, dict):
             continue
 
-        try:
-            epoch = int(candle["epoch"])
-            opening = float(candle["open"])
-            high = float(candle["high"])
-            low = float(candle["low"])
-            close = float(candle["close"])
-        except (KeyError, TypeError, ValueError):
+        o = _get_value(candle, ("open", "OPEN", "o"))
+        h = _get_value(candle, ("high", "HIGH", "h"))
+        l = _get_value(candle, ("low", "LOW", "l"))
+        c = _get_value(candle, ("close", "CLOSE", "c"))
+
+        if None in (o, h, l, c):
             continue
 
-        values = [opening, high, low, close]
-
-        if any(not math.isfinite(value) for value in values):
+        if h < l:
             continue
 
-        if min(values) <= 0:
-            continue
-
-        if high < max(opening, close):
-            continue
-
-        if low > min(opening, close):
-            continue
-
-        if high < low or epoch in seen_epochs:
-            continue
-
-        seen_epochs.add(epoch)
-
-        normalized.append({
-            "epoch": float(epoch),
-            "open": opening,
-            "high": high,
-            "low": low,
-            "close": close,
-        })
-
-    normalized.sort(key=lambda item: item["epoch"])
-
-    return normalized
-
-
-def _calculate_atr(
-    candles: list[dict[str, float]],
-    period: int = ATR_PERIOD,
-) -> float | None:
-    """Calcule l'Average True Range."""
-
-    if len(candles) < period + 1:
-        return None
-
-    true_ranges = []
-
-    for index in range(1, len(candles)):
-        current = candles[index]
-        previous = candles[index - 1]
-
-        true_range = max(
-            current["high"] - current["low"],
-            abs(current["high"] - previous["close"]),
-            abs(current["low"] - previous["close"]),
-        )
-
-        if math.isfinite(true_range) and true_range > 0:
-            true_ranges.append(true_range)
-
-    if len(true_ranges) < period:
-        return None
-
-    # Moyenne des dernières périodes disponibles.
-    atr = sum(true_ranges[-period:]) / period
-
-    if not math.isfinite(atr) or atr <= 0:
-        return None
-
-    return atr
-
-
-# ============================================================
-# PIVOTS ET STRUCTURE DU PRIX
-# ============================================================
-
-def _find_pivots(
-    candles: list[dict[str, float]],
-    radius: int = PIVOT_RADIUS,
-) -> tuple[list[dict[str, float]], list[dict[str, float]]]:
-    """
-    Identifie les sommets et creux locaux.
-
-    Un pivot n'est retenu qu'après l'existence des bougies
-    nécessaires à sa confirmation. On n'utilise donc pas les
-    dernières bougies comme si leurs pivots étaient confirmés.
-    """
-
-    highs = []
-    lows = []
-
-    if len(candles) < 2 * radius + 5:
-        return highs, lows
-
-    for index in range(radius, len(candles) - radius):
-        candle = candles[index]
-
-        left = candles[index - radius:index]
-        right = candles[index + 1:index + radius + 1]
-
-        is_pivot_high = all(
-            candle["high"] > other["high"]
-            for other in left + right
-        )
-
-        is_pivot_low = all(
-            candle["low"] < other["low"]
-            for other in left + right
-        )
-
-        if is_pivot_high:
-            highs.append({
-                "index": float(index),
-                "epoch": candle["epoch"],
-                "price": candle["high"],
-            })
-
-        if is_pivot_low:
-            lows.append({
-                "index": float(index),
-                "epoch": candle["epoch"],
-                "price": candle["low"],
-            })
-
-    return highs, lows
-
-
-def _line_value(
-    first: dict[str, float],
-    second: dict[str, float],
-    target_index: float,
-) -> float | None:
-    """Extrapole une droite passant par deux pivots."""
-
-    x1 = first["index"]
-    x2 = second["index"]
-    y1 = first["price"]
-    y2 = second["price"]
-
-    if x2 <= x1:
-        return None
-
-    slope = (y2 - y1) / (x2 - x1)
-    value = y1 + slope * (target_index - x1)
-
-    if not math.isfinite(value) or value <= 0:
-        return None
-
-    return value
-
-
-def _find_trendline(
-    pivots: list[dict[str, float]],
-    direction: str,
-    atr: float,
-) -> dict[str, Any] | None:
-    """
-    Recherche une trendline cohérente.
-
-    BUY : trendline de support ascendante reliant des creux.
-    SELL : trendline de résistance descendante reliant des sommets.
-    """
-
-    if len(pivots) < 2:
-        return None
-
-    recent = pivots[-8:]
-
-    # On privilégie les deux derniers pivots confirmés.
-    first = recent[-2]
-    second = recent[-1]
-
-    if second["index"] <= first["index"]:
-        return None
-
-    difference = second["price"] - first["price"]
-
-    if direction == "BUY":
-        # Les creux doivent monter suffisamment.
-        if difference < atr * 0.05:
-            return None
-
-    elif direction == "SELL":
-        # Les sommets doivent descendre suffisamment.
-        if difference > -atr * 0.05:
-            return None
-
-    else:
-        return None
-
-    # Évite les droites presque verticales ou excessivement
-    # inclinées, souvent peu pertinentes pour une anticipation.
-    bars_between = second["index"] - first["index"]
-    slope_per_bar = difference / bars_between
-
-    if abs(slope_per_bar) > atr * 0.80:
-        return None
-
-    return {
-        "first": first,
-        "second": second,
-        "slope": slope_per_bar,
-    }
-
-
-# ============================================================
-# SUPPORTS ET RÉSISTANCES HORIZONTAUX
-# ============================================================
-
-def _cluster_levels(
-    pivots: list[dict[str, float]],
-    atr: float,
-    recent_limit: int = 12,
-) -> list[dict[str, Any]]:
-    """
-    Regroupe les pivots proches pour identifier des niveaux
-    horizontaux approximatifs.
-
-    Un niveau touché plusieurs fois est privilégié.
-    """
-
-    if not pivots:
-        return []
-
-    tolerance = atr * 0.35
-    recent_pivots = pivots[-recent_limit:]
-
-    clusters: list[dict[str, Any]] = []
-
-    for pivot in recent_pivots:
-        price = pivot["price"]
-
-        matching = None
-
-        for cluster in clusters:
-            if abs(price - cluster["level"]) <= tolerance:
-                matching = cluster
-                break
-
-        if matching is None:
-            clusters.append({
-                "level": price,
-                "touches": 1,
-                "last_epoch": pivot["epoch"],
-                "last_index": pivot["index"],
-                "prices": [price],
-            })
-        else:
-            matching["prices"].append(price)
-            matching["touches"] += 1
-            matching["level"] = (
-                sum(matching["prices"])
-                / len(matching["prices"])
-            )
-
-            if pivot["epoch"] > matching["last_epoch"]:
-                matching["last_epoch"] = pivot["epoch"]
-                matching["last_index"] = pivot["index"]
-
-    result = []
-
-    for cluster in clusters:
         result.append({
-            "level": float(cluster["level"]),
-            "touches": int(cluster["touches"]),
-            "last_epoch": float(cluster["last_epoch"]),
-            "last_index": float(cluster["last_index"]),
+            "open": o,
+            "high": h,
+            "low": l,
+            "close": c,
         })
 
     return result
 
 
-def _nearest_level(
-    levels: list[dict[str, Any]],
-    reference_price: float,
-    direction: str,
-    atr: float,
-) -> dict[str, Any] | None:
-    """
-    Sélectionne un niveau situé du côté attendu du marché.
+# ============================================================
+# INDICATEURS
+# ============================================================
 
-    BUY : niveau de support proche, sous le prix ou à proximité.
-    SELL : niveau de résistance proche, au-dessus du prix
-    ou à proximité.
-    """
+def _calculate_atr(candles, period=ATR_PERIOD):
+    """Calcule l'ATR a partir des bougies disponibles."""
+    if len(candles) < 2:
+        return 0.0
 
-    if not levels:
+    true_ranges = []
+
+    for i in range(1, len(candles)):
+        current = candles[i]
+        previous = candles[i - 1]
+
+        tr = max(
+            current["high"] - current["low"],
+            abs(current["high"] - previous["close"]),
+            abs(current["low"] - previous["close"]),
+        )
+
+        if math.isfinite(tr):
+            true_ranges.append(max(0.0, tr))
+
+    if not true_ranges:
+        return 0.0
+
+    recent = true_ranges[-period:]
+    atr = sum(recent) / len(recent)
+
+    return atr if atr > 0 else 0.0
+
+
+def _find_pivots(candles, radius=PIVOT_RADIUS):
+    """
+    Detecte les sommets et creux locaux.
+    Les pivots sont utilises pour construire les trendlines.
+    """
+    highs = []
+    lows = []
+
+    if len(candles) < radius * 2 + 5:
+        return highs, lows
+
+    start = max(radius, len(candles) - PIVOT_LOOKBACK)
+    end = len(candles) - radius
+
+    for i in range(start, end):
+        high = candles[i]["high"]
+        low = candles[i]["low"]
+
+        left = candles[i - radius:i]
+        right = candles[i + 1:i + radius + 1]
+
+        if all(high >= item["high"] for item in left + right):
+            highs.append((i, high))
+
+        if all(low <= item["low"] for item in left + right):
+            lows.append((i, low))
+
+    return highs, lows
+
+
+# ============================================================
+# TRENDLINES
+# ============================================================
+
+def _line_value(point_a, point_b, x):
+    """Calcule la valeur d'une droite au point x."""
+    x1, y1 = point_a
+    x2, y2 = point_b
+
+    if x1 == x2:
         return None
 
+    slope = (y2 - y1) / (x2 - x1)
+    return y1 + slope * (x - x1)
+
+
+def _find_trendline(pivots, direction, atr, last_index):
+    """
+    Cherche une trendline simple a partir de pivots recents.
+
+    BUY :
+        trendline haussiere passant par deux creux croissants.
+
+    SELL :
+        trendline baissiere passant par deux sommets decroissants.
+    """
+    if len(pivots) < 2:
+        return None
+
+    recent = pivots[-TRENDLINE_LOOKBACK:]
+
+    # On examine les paires recentes pour eviter de dependre
+    # uniquement des deux derniers pivots.
     candidates = []
 
-    for level in levels:
-        price = float(level["level"])
+    for i in range(len(recent) - 1):
+        for j in range(i + 1, len(recent)):
+            point_a = recent[i]
+            point_b = recent[j]
 
-        if direction == "BUY":
-            if price > reference_price + atr * 0.75:
+            x1, y1 = point_a
+            x2, y2 = point_b
+
+            if x2 <= x1:
                 continue
 
-        elif direction == "SELL":
-            if price < reference_price - atr * 0.75:
+            slope = (y2 - y1) / (x2 - x1)
+
+            if direction == "BUY" and slope <= 0:
                 continue
 
-        distance = abs(price - reference_price)
+            if direction == "SELL" and slope >= 0:
+                continue
 
-        candidates.append((
-            distance,
-            -int(level["touches"]),
-            level,
-        ))
+            projected = _line_value(point_a, point_b, last_index)
+
+            if projected is None:
+                continue
+
+            # Exclut les droites dont la projection est aberrante.
+            if not math.isfinite(projected):
+                continue
+
+            if atr > 0 and abs(projected - y2) > atr * 20:
+                continue
+
+            candidates.append({
+                "point_a": point_a,
+                "point_b": point_b,
+                "price": projected,
+                "slope": slope,
+                "span": x2 - x1,
+            })
 
     if not candidates:
         return None
 
-    candidates.sort(key=lambda item: (item[0], item[1]))
+    # Priorite aux trendlines fondees sur des pivots plus eloignes,
+    # sans penaliser excessivement les lignes recentes.
+    candidates.sort(
+        key=lambda item: (
+            item["span"],
+            item["point_b"][0],
+        ),
+        reverse=True,
+    )
 
-    return candidates[0][2]
+    return candidates[0]
 
 
-def _next_opposing_level(
-    levels: list[dict[str, Any]],
-    entry: float,
-    direction: str,
-) -> float | None:
-    """Cherche le niveau horizontal opposé le plus proche."""
+# ============================================================
+# SUPPORTS ET RESISTANCES
+# ============================================================
 
+def _cluster_levels(values, tolerance):
+    """
+    Regroupe les niveaux de prix proches.
+    Chaque groupe represente une zone horizontale potentielle.
+    """
+    if not values:
+        return []
+
+    values = sorted(values)
+    clusters = []
+
+    for value in values:
+        if not clusters:
+            clusters.append([value])
+            continue
+
+        current_mean = sum(clusters[-1]) / len(clusters[-1])
+
+        if abs(value - current_mean) <= tolerance:
+            clusters[-1].append(value)
+        else:
+            clusters.append([value])
+
+    levels = []
+
+    for cluster in clusters:
+        levels.append({
+            "price": sum(cluster) / len(cluster),
+            "touches": len(cluster),
+            "low": min(cluster),
+            "high": max(cluster),
+        })
+
+    return levels
+
+
+def _find_horizontal_levels(candles, atr):
+    """Construit des zones horizontales a partir des pivots."""
+    highs, lows = _find_pivots(candles)
+
+    tolerance = max(
+        atr * LEVEL_CLUSTER_DISTANCE_ATR,
+        1e-8,
+    )
+
+    resistance_levels = _cluster_levels(
+        [price for _, price in highs],
+        tolerance,
+    )
+
+    support_levels = _cluster_levels(
+        [price for _, price in lows],
+        tolerance,
+    )
+
+    return support_levels, resistance_levels
+
+
+def _nearest_level(levels, reference_price, direction):
+    """
+    BUY : recherche le support le plus proche sous le prix.
+    SELL : recherche la resistance la plus proche au-dessus du prix.
+    """
     if direction == "BUY":
         candidates = [
-            float(level["level"])
-            for level in levels
-            if float(level["level"]) > entry
+            level for level in levels
+            if level["price"] <= reference_price
         ]
-
-        return min(candidates) if candidates else None
-
-    candidates = [
-        float(level["level"])
-        for level in levels
-        if float(level["level"]) < entry
-    ]
-
-    return max(candidates) if candidates else None
-
-
-# ============================================================
-# ANALYSE D'UNE UNITÉ DE TEMPS
-# ============================================================
-
-def _analyze_timeframe(
-    symbol: str,
-    timeframe: str,
-    raw_candles: Any,
-    price_now: float,
-) -> tuple[dict[str, Any] | None, str]:
-    """
-    Recherche une configuration anticipée de confluence.
-
-    BUY :
-    - trendline ascendante sur les creux ;
-    - support horizontal proche de cette trendline ;
-    - prix proche de la zone de confluence.
-
-    SELL :
-    - trendline descendante sur les sommets ;
-    - résistance horizontale proche de cette trendline ;
-    - prix proche de la zone de confluence.
-    """
-
-    candles = _normalize_candles(raw_candles)
-
-    if len(candles) < 40:
-        return None, (
-            f"Historique insuffisant : {len(candles)} bougies."
+        candidates.sort(
+            key=lambda level: reference_price - level["price"]
         )
+    else:
+        candidates = [
+            level for level in levels
+            if level["price"] >= reference_price
+        ]
+        candidates.sort(
+            key=lambda level: level["price"] - reference_price
+        )
+
+    return candidates[0] if candidates else None
+
+
+def _nearest_target(levels, entry, direction):
+    """Recherche le prochain niveau horizontal oppose a l'entree."""
+    if direction == "BUY":
+        candidates = [
+            level for level in levels
+            if level["price"] > entry
+        ]
+        candidates.sort(key=lambda level: level["price"])
+    else:
+        candidates = [
+            level for level in levels
+            if level["price"] < entry
+        ]
+        candidates.sort(
+            key=lambda level: level["price"],
+            reverse=True,
+        )
+
+    return candidates[0] if candidates else None
+
+
+# ============================================================
+# DETECTION D'UNE CONFIGURATION
+# ============================================================
+
+def _build_candidate(symbol, timeframe, candles, price_now):
+    """
+    Detecte une configuration anticipative de confluence
+    trendline + support/resistance.
+    """
+    if len(candles) < MIN_CANDLES.get(timeframe, 30):
+        return None
 
     atr = _calculate_atr(candles)
 
-    if atr is None:
-        return None, "ATR indisponible."
+    if atr <= 0:
+        return None
+
+    last_index = len(candles) - 1
+    last_close = candles[-1]["close"]
+
+    price = _number(price_now)
+
+    if price is None or price <= 0:
+        price = last_close
 
     highs, lows = _find_pivots(candles)
 
-    if len(highs) < 2 or len(lows) < 2:
-        return None, "Pas assez de pivots confirmés."
-
-    # Les valeurs de trendline sont évaluées à la dernière
-    # bougie clôturée, sans utiliser de pivot futur.
-    target_index = float(len(candles) - 1)
-
-    support_levels = _cluster_levels(lows, atr)
-    resistance_levels = _cluster_levels(highs, atr)
-
-    candidates: list[dict[str, Any]] = []
-
-    # --------------------------------------------------------
-    # Configuration haussière : trendline de support + support
-    # --------------------------------------------------------
-
-    bullish_line = _find_trendline(
-        lows,
-        direction="BUY",
-        atr=atr,
+    supports, resistances = _find_horizontal_levels(
+        candles,
+        atr,
     )
 
-    if bullish_line:
-        line_price = _line_value(
-            bullish_line["first"],
-            bullish_line["second"],
-            target_index,
-        )
-
-        if line_price is not None:
-            horizontal = _nearest_level(
-                support_levels,
-                line_price,
-                direction="BUY",
-                atr=atr,
-            )
-
-            if horizontal is not None:
-                level_price = float(horizontal["level"])
-
-                confluence_distance = abs(
-                    line_price - level_price
-                )
-
-                price_distance = abs(
-                    price_now - line_price
-                )
-
-                if (
-                    confluence_distance <= atr * CONFLUENCE_ATR
-                    and price_distance <= atr * MAX_ENTRY_DISTANCE_ATR
-                    and price_now >= line_price - atr * 0.75
-                ):
-                    candidates.append({
-                        "direction": "BUY",
-                        "line_price": line_price,
-                        "level_price": level_price,
-                        "horizontal": horizontal,
-                        "line": bullish_line,
-                        "distance": price_distance,
-                        "confluence_distance": confluence_distance,
-                    })
-
-    # --------------------------------------------------------
-    # Configuration baissière : trendline de résistance
-    # + résistance horizontale
-    # --------------------------------------------------------
-
-    bearish_line = _find_trendline(
-        highs,
-        direction="SELL",
-        atr=atr,
+    directions = (
+        ("BUY", lows, supports, resistances),
+        ("SELL", highs, resistances, supports),
     )
 
-    if bearish_line:
-        line_price = _line_value(
-            bearish_line["first"],
-            bearish_line["second"],
-            target_index,
+    candidates = []
+
+    for direction, pivots, relevant_levels, opposite_levels in directions:
+        trendline = _find_trendline(
+            pivots=pivots,
+            direction=direction,
+            atr=atr,
+            last_index=last_index,
         )
 
-        if line_price is not None:
-            horizontal = _nearest_level(
-                resistance_levels,
-                line_price,
-                direction="SELL",
-                atr=atr,
+        if trendline is None:
+            continue
+
+        line_price = trendline["price"]
+
+        # Selection du support ou de la resistance proche
+        # de la projection de la trendline.
+        level = _nearest_level(
+            relevant_levels,
+            line_price,
+            direction,
+        )
+
+        # Si aucun niveau n'existe du bon cote, on cherche
+        # le niveau le plus proche sans imposer le cote.
+        if level is None and relevant_levels:
+            level = min(
+                relevant_levels,
+                key=lambda item: abs(item["price"] - line_price),
             )
 
-            if horizontal is not None:
-                level_price = float(horizontal["level"])
+        if level is None:
+            continue
 
-                confluence_distance = abs(
-                    line_price - level_price
-                )
+        confluence_distance = abs(
+            line_price - level["price"]
+        )
 
-                price_distance = abs(
-                    price_now - line_price
-                )
+        if confluence_distance > atr * MAX_CONFLUENCE_DISTANCE_ATR:
+            continue
 
-                if (
-                    confluence_distance <= atr * CONFLUENCE_ATR
-                    and price_distance <= atr * MAX_ENTRY_DISTANCE_ATR
-                    and price_now <= line_price + atr * 0.75
-                ):
-                    candidates.append({
-                        "direction": "SELL",
-                        "line_price": line_price,
-                        "level_price": level_price,
-                        "horizontal": horizontal,
-                        "line": bearish_line,
-                        "distance": price_distance,
-                        "confluence_distance": confluence_distance,
-                    })
+        # La zone de confluence se situe entre la trendline
+        # et le niveau horizontal.
+        zone_low = min(line_price, level["low"])
+        zone_high = max(line_price, level["high"])
+        zone_center = (zone_low + zone_high) / 2
+
+        distance_to_zone = abs(price - zone_center)
+
+        # On accepte l'approche de la zone, sans attendre
+        # obligatoirement que le prix la touche.
+        if distance_to_zone > atr * MAX_ENTRY_DISTANCE_ATR:
+            continue
+
+        # BUY doit rester dans une structure haussiere.
+        # SELL doit rester dans une structure baissiere.
+        if direction == "BUY" and price < zone_low - atr * 0.50:
+            continue
+
+        if direction == "SELL" and price > zone_high + atr * 0.50:
+            continue
+
+        # Le prix d'entree est le prix observe au moment
+        # de l'analyse. L'alerte peut donc etre anticipee.
+        entry = price
+
+        if direction == "BUY":
+            stop_loss = min(zone_low, level["low"]) - atr * SL_BUFFER_ATR
+            risk = entry - stop_loss
+        else:
+            stop_loss = max(zone_high, level["high"]) + atr * SL_BUFFER_ATR
+            risk = stop_loss - entry
+
+        if risk <= 0:
+            continue
+
+        target = _nearest_target(
+            opposite_levels,
+            entry,
+            direction,
+        )
+
+        if target is not None:
+            take_profit = target["price"]
+            target_type = "Niveau horizontal oppose"
+        else:
+            # Si aucun niveau oppose n'est disponible,
+            # projection de 3R comme objectif technique.
+            # Cela ne constitue PAS un filtre de RR minimum.
+            if direction == "BUY":
+                take_profit = entry + 3.0 * risk
+            else:
+                take_profit = entry - 3.0 * risk
+
+            target_type = "Projection technique 3R (sans niveau oppose detecte)"
+
+        if direction == "BUY" and take_profit <= entry:
+            continue
+
+        if direction == "SELL" and take_profit >= entry:
+            continue
+
+        reward = abs(take_profit - entry)
+        rr = reward / risk if risk > 0 else 0.0
+
+        # Score indicatif : proximite de la confluence,
+        # nombre de contacts et distance au prix.
+        proximity_score = max(
+            0.0,
+            1.0 - confluence_distance / max(
+                atr * MAX_CONFLUENCE_DISTANCE_ATR,
+                1e-8,
+            ),
+        )
+
+        distance_score = max(
+            0.0,
+            1.0 - distance_to_zone / max(
+                atr * MAX_ENTRY_DISTANCE_ATR,
+                1e-8,
+            ),
+        )
+
+        touch_score = min(level["touches"], 5) / 5.0
+
+        score = round(
+            100 * (
+                0.45 * proximity_score
+                + 0.35 * distance_score
+                + 0.20 * touch_score
+            ),
+            1,
+        )
+
+        candidates.append({
+            "strategy": STRATEGY_NAME,
+            "symbol": symbol,
+            "symbol_name": SYMBOL_NAMES.get(symbol, symbol),
+            "timeframe": timeframe,
+            "direction": direction,
+            "entry": round(entry, 8),
+            "stop_loss": round(stop_loss, 8),
+            "take_profit": round(take_profit, 8),
+            "rr": round(rr, 2),
+            "atr": round(atr, 8),
+            "trendline_price": round(line_price, 8),
+            "horizontal_level": round(level["price"], 8),
+            "zone_low": round(zone_low, 8),
+            "zone_high": round(zone_high, 8),
+            "distance_to_zone_atr": round(
+                distance_to_zone / atr,
+                3,
+            ),
+            "confluence_distance_atr": round(
+                confluence_distance / atr,
+                3,
+            ),
+            "level_touches": int(level["touches"]),
+            "score": score,
+            "target_type": target_type,
+            "status": "ANTICIPATION",
+            "price_at_analysis": round(price, 8),
+        })
 
     if not candidates:
-        return None, (
-            "Aucune confluence exploitable à proximité du prix."
-        )
+        return None
 
-    # Priorité à la confluence la plus proche du prix actuel.
-    # Les configurations proches de la zone sont préférées.
+    # Priorite au meilleur score.
     candidates.sort(
         key=lambda item: (
-            item["distance"] / atr
-            + item["confluence_distance"] / atr
-        )
-    )
-
-    selected = candidates[0]
-
-    direction = selected["direction"]
-    line_price = float(selected["line_price"])
-    level_price = float(selected["level_price"])
-
-    # L'entrée est proposée au prix actuel pour permettre une
-    # anticipation. Ce n'est pas une garantie d'exécution au prix.
-    entry = float(price_now)
-
-    zone_low = min(line_price, level_price)
-    zone_high = max(line_price, level_price)
-
-    # Marge de sécurité autour de la zone.
-    buffer = atr * SL_ATR_BUFFER
-
-    if direction == "BUY":
-        stop_loss = min(zone_low, entry) - buffer
-
-        # Empêche un stop situé au-dessus ou au niveau de l'entrée.
-        if stop_loss >= entry:
-            stop_loss = entry - atr * 0.50
-
-        risk = entry - stop_loss
-
-        opposing_level = _next_opposing_level(
-            resistance_levels,
-            entry,
-            direction="BUY",
-        )
-
-        # On ne place pas un TP structurel trop proche ou derrière
-        # l'entrée. Dans ce cas, on utilise une projection technique.
-        if (
-            opposing_level is not None
-            and opposing_level > entry + risk * 0.25
-        ):
-            take_profit = opposing_level
-            target_type = "Résistance horizontale"
-        else:
-            take_profit = entry + risk * FALLBACK_TARGET_R
-            target_type = "Projection technique 3R"
-
-    else:
-        stop_loss = max(zone_high, entry) + buffer
-
-        if stop_loss <= entry:
-            stop_loss = entry + atr * 0.50
-
-        risk = stop_loss - entry
-
-        opposing_level = _next_opposing_level(
-            support_levels,
-            entry,
-            direction="SELL",
-        )
-
-        if (
-            opposing_level is not None
-            and opposing_level < entry - risk * 0.25
-        ):
-            take_profit = opposing_level
-            target_type = "Support horizontal"
-        else:
-            take_profit = entry - risk * FALLBACK_TARGET_R
-            target_type = "Projection technique 3R"
-
-    if risk <= 0:
-        return None, "Risque calculé invalide."
-
-    if direction == "BUY":
-        if not stop_loss < entry < take_profit:
-            return None, "Niveaux BUY incohérents."
-
-        rr = (take_profit - entry) / risk
-
-    else:
-        if not take_profit < entry < stop_loss:
-            return None, "Niveaux SELL incohérents."
-
-        rr = (entry - take_profit) / risk
-
-    if not math.isfinite(rr) or rr <= 0:
-        return None, "Ratio risque/rendement invalide."
-
-    first_pivot = selected["line"]["first"]
-    second_pivot = selected["line"]["second"]
-
-    # Identifiant stable pour ce couple de pivots et cette zone.
-    # Il aide à éviter de renvoyer le même signal à chaque scan,
-    # sous réserve que la base de données soit persistante.
-    identity = (
-        f"{symbol}|{timeframe}|{direction}|"
-        f"{int(first_pivot['epoch'])}|"
-        f"{int(second_pivot['epoch'])}|"
-        f"{round(level_price, 5)}"
-    )
-
-    signal_id = hashlib.sha256(
-        identity.encode("utf-8")
-    ).hexdigest()[:24]
-
-    signal = {
-        "signal_id": signal_id,
-        "strategy": STRATEGY_NAME,
-        "symbol": symbol,
-        "direction": direction,
-        "timeframe": timeframe,
-        "entry": round(entry, 5),
-        "stop_loss": round(stop_loss, 5),
-        "take_profit": round(take_profit, 5),
-        "rr": round(rr, 4),
-        "current_price": round(price_now, 5),
-        "trendline_level": round(line_price, 5),
-        "horizontal_level": round(level_price, 5),
-        "confluence_level": round(
-            (line_price + level_price) / 2,
-            5,
+            item["score"],
+            item["rr"],
         ),
-        "zone_low": round(zone_low, 5),
-        "zone_high": round(zone_high, 5),
-        "atr": round(atr, 5),
-        "distance_atr": round(
-            abs(price_now - line_price) / atr,
-     
+        reverse=True,
+    )
+
+    return candidates[0]
+
+
+# ============================================================
+# IDENTIFIANT ET FONCTION PUBLIQUE
+# ============================================================
+
+def _make_signal_id(signal):
+    """
+    Identifiant reproductible pour eviter les doublons.
+    Le prix est arrondi pour limiter les changements
+    d'identifiant provoques par de petites variations.
+    """
+    raw = "|".join([
+        str(signal.get("symbol", "")),
+        str(signal.get("timeframe", "")),
+        str(signal.get("direction", "")),
+        str(round(float(signal.get("zone_low", 0)), 3)),
+        str(round(float(signal.get("zone_high", 0)), 3)),
+    ])
+
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+
+
+def find_signals(
+    symbol,
+    d1=None,
+    h4=None,
+    h2=None,
+    h1=None,
+    price_now=None,
+    diagnostics=None,
+):
+    """
+    Fonction appelee par scheduled_analysis.py.
+
+    Examine les unites de temps dans l'ordre D1, H4, H2, H1.
+    Retourne la meilleure configuration de la premiere unite
+    de temps ou une confluence exploitable est detectee.
+
+    Retour :
+        [] si aucune configuration n'est trouvee ;
+        [signal] si une configuration est detectee.
+    """
+    raw_by_timeframe = {
+        "D1": d1,
+        "H4": h4,
+        "H2": h2,
+        "H1": h1,
+    }
+
+    if diagnostics is not None and not isinstance(diagnostics, dict):
+        diagnostics = None
+
+    if diagnostics is not None:
+        diagnostics.setdefault("timeframes_checked", [])
+        diagnostics.setdefault("signals_found", [])
+        diagnostics.setdefault("reasons", [])
+
+    for timeframe in TIMEFRAME_PRIORITY:
+        raw_candles = raw_by_timeframe.get(timeframe)
+        candles = _normalise_candles(raw_candles)
+
+        if diagnostics is not None:
+            diagnostics["timeframes_checked"].append(timeframe)
+
+        if len(candles) < MIN_CANDLES.get(timeframe, 30):
+            if diagnostics is not None:
+                diagnostics["reasons"].append(
+                    f"{timeframe}: pas assez de bougies "
+                    f"({len(candles)} disponibles)."
+                )
+            continue
+
+        signal = _build_candidate(
+            symbol=symbol,
+            timeframe=timeframe,
+            candles=candles,
+            price_now=price_now,
+        )
+
+        if signal is None:
+            if diagnostics is not None:
+                diagnostics["reasons"].append(
+                    f"{timeframe}: aucune confluence exploitable."
+                )
+            continue
+
+        signal["signal_id"] = _make_signal_id(signal)
+
+        if diagnostics is not None:
+            diagnostics["signals_found"].append({
+                "timeframe": timeframe,
+                "direction": signal["direction"],
+                "score": signal["score"],
+            })
+            diagnostics["selected_timeframe"] = timeframe
+
+        # On privilegie la premiere unite de temps valide.
+        return [signal]
+
+    return []
+
+
+# ============================================================
+# MESSAGE TELEGRAM
+# ============================================================
+
+def _format_price(value):
+    """Affiche le prix avec une precision adaptee."""
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+
+    if abs(value) >= 1000:
+        return f"{value:.3f}"
+
+    if abs(value) >= 10:
+        return f"{value:.4f}"
+
+    return f"{value:.5f}"
+
+
+def format_message(signal):
+    """
+    Formate une alerte Telegram en francais.
+    Ne passe aucun ordre : le message est informatif.
+    """
+    symbol = signal.get("symbol", "Indice inconnu")
+    symbol_name = signal.get(
+        "symbol_name",
+        SYMBOL_NAMES.get(symbol, symbol),
+    )
+
+    direction = 
+    str(signal.get("direction", "")).upper()
+    timeframe = signal.get("timeframe", "?")
+    entry = signal.get("entry", 0)
+    stop_loss = signal.get("stop_loss", 0)
+    take_profit = signal.get("take_profit", 0)
+    rr = signal.get("rr", 0)
+    score = signal.get("score", 0)
+
+    if direction == "BUY":
+        direction_text = "ACHAT (BUY)"
+        emoji = "🟢"
+    elif direction == "SELL":
+        direction_text = "VENTE (SELL)"
+        emoji = "🔴"
+    else:
+        direction_text = direction
+        emoji = "📊"
+
+    zone_low = signal.get("zone_low")
+    zone_high = signal.get("zone_high")
+    level = signal.get("horizontal_level")
+    trendline = signal.get("trendline_price")
+    distance = signal.get("distance_to_zone_atr")
+    touches = signal.get("level_touches")
+    target_type = signal.get("target_type", "Objectif technique")
+    signal_id = signal.get("signal_id", "N/A")
+
+    lines = [
+        "━━━━━━━━━━━━━━━━━━",
+        "🚨 TRADER AI PRO",
+        "STRATEGIE : TRENDLINE + CONFLUENCE",
+        "━━━━━━━━━━━━━━━━━━",
+        "",
+        f"{emoji} Direction : {direction_text}",
+        f"📈 Indice : {symbol_name}",
+        f"⏱ Unite de temps : {timeframe}",
+        "",
+        "🎯 PLAN TECHNIQUE",
+        f"Entree indicative : {_format_price(entry)}",
+        f"Stop Loss : {_format_price(stop_loss)}",
+        f"Take Profit : {_format_price(take_profit)}",
+        f"Risque/Rendement estime : 1:{rr}",
+        "",
+        "📐 CONFLUENCE DETECTEE",
+    ]
+
+    if zone_low is not None and zone_high is not None:
+        lines.append(
+            f"Zone de confluence : "
+            f"{_format_price(zone_low)} - {_format_price(zone_high)}"
+        )
+
+    if level is not None:
+        lines.append(
+            f"Niveau horizontal : {_format_price(level)}"
+        )
+
+    if trendline is not None:
+        lines.append(
+            f"Projection trendline : {_format_price(trendline)}"
+        )
+
+    if distance is not None:
+        lines.append(
+            f"Distance a la zone : {distance} ATR"
+        )
+
+    if touches is not None:
+        lines.append(
+            f"Contacts du niveau : {touches}"
+        )
+
+    lines.extend([
+        f"Score technique indicatif : {score}/100",
+        f"Objectif : {target_type}",
+        "",
+        "⚠️ ALERTE ANTICIPEE",
+        "La confluence est detectee, mais le prix peut encore",
+        "evoluer avant d'atteindre ou de quitter la zone.",
+        "Le signal n'est pas une garantie de resultat.",
+        "",
+        "Execution automatique : DESACTIVEE",
+        "Ordre a executer manuellement sur le compte DEMO.",
+        "",
+        f"ID : {signal_id}",
+        "━━━━━━━━━━━━━━━━━━",
+    ])
+
+    return "\n".join(lines)
