@@ -1,108 +1,87 @@
 """
-TRADER AI PRO — DERIV MARKET DATA
-
+TRADER AI PRO
 Module de récupération des données de marché Deriv.
 
-Fonctions prévues :
-- Connexion WebSocket publique.
+Fonctions principales :
 - Récupération des bougies OHLC.
 - Récupération du prix actuel.
-- Gestion des erreurs réseau.
-- Reconnexion automatique.
+- Connexion WebSocket publique.
+- Gestion des erreurs et des délais d'attente.
 
-Aucune exécution d'ordre.
-Aucune connexion à un compte réel.
+IMPORTANT :
+Ce module utilise uniquement les données publiques.
+Aucune authentification de compte.
+Aucun ordre n'est envoyé.
 """
 
 import json
-import time
 import logging
-import threading
+import time
 
 import websocket
 
 
 # ============================================================
-# 1. CONFIGURATION GENERALE
+# CONFIGURATION
 # ============================================================
+
+LOGGER = logging.getLogger("TRADER_AI_PRO.DERIV")
 
 APP_ID = 1089
 
-URLS = [
+WEBSOCKET_URLS = [
     f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}",
     f"wss://ws.binaryws.com/websockets/v3?app_id={APP_ID}",
 ]
 
-REQUEST_TIMEOUT = 20
+DEFAULT_TIMEOUT = 15
+MAX_RETRIES = 2
 
-MAX_RETRIES = 3
-
-RETRY_DELAY = 2
-
-# Taille maximale des données reçues.
-MAX_CANDLES = 1000
-
-
-# ============================================================
-# 2. CONFIGURATION DES JOURNAUX
-# ============================================================
-
-logger = logging.getLogger("TRADER_AI_PRO.DERIV")
-
-if not logger.handlers:
-
-    handler = logging.StreamHandler()
-
-    handler.setFormatter(
-        logging.Formatter(
-            "[DERIV MARKET] %(asctime)s | %(levelname)s | %(message)s"
-        )
-    )
-
-    logger.addHandler(handler)
-
-logger.setLevel(logging.INFO)
+ALLOWED_GRANULARITIES = {
+    3600,    # H1
+    7200,    # H2
+    14400,   # H4
+    86400,   # D1
+}
 
 
 # ============================================================
-# 3. EXCEPTION PERSONNALISEE
-# ============================================================
-
-class DerivMarketError(Exception):
-    """
-    Erreur spécifique au module de données Deriv.
-    """
-    pass
-
-
-# ============================================================
-# 4. VALIDATION DES PARAMETRES
+# VALIDATION DES PARAMÈTRES
 # ============================================================
 
 def _validate_symbol(symbol):
     """
-    Vérifie le symbole demandé.
+    Vérifie que le symbole Deriv est valide.
     """
 
-    if not isinstance(symbol, str) or not symbol.strip():
-        raise ValueError("Symbole Deriv invalide.")
+    if not isinstance(symbol, str):
+        raise ValueError("Le symbole doit être une chaîne.")
 
-    return symbol.strip()
+    symbol = symbol.strip()
+
+    if not symbol:
+        raise ValueError("Le symbole ne peut pas être vide.")
+
+    if len(symbol) > 30:
+        raise ValueError("Symbole trop long.")
+
+    return symbol
 
 
 def _validate_granularity(granularity):
     """
-    Vérifie la durée de la bougie en secondes.
+    Vérifie l'unité de temps demandée.
     """
 
     try:
         granularity = int(granularity)
-
     except (TypeError, ValueError):
         raise ValueError("Granularité invalide.")
 
-    if granularity <= 0:
-        raise ValueError("La granularité doit être positive.")
+    if granularity not in ALLOWED_GRANULARITIES:
+        raise ValueError(
+            f"Granularité non autorisée : {granularity}"
+        )
 
     return granularity
 
@@ -114,89 +93,53 @@ def _validate_count(count):
 
     try:
         count = int(count)
-
     except (TypeError, ValueError):
         raise ValueError("Nombre de bougies invalide.")
 
-    if count < 1 or count > MAX_CANDLES:
+    if count < 1 or count > 1000:
         raise ValueError(
-            f"Le nombre de bougies doit être compris entre 1 et {MAX_CANDLES}."
+            "Le nombre de bougies doit être compris entre 1 et 1000."
         )
 
     return count
 
 
 # ============================================================
-# 5. CREATION D'UNE CONNEXION WEBSOCKET
+# CONNEXION WEBSOCKET
 # ============================================================
 
-def _create_connection(url):
+def _open_connection(url):
     """
-    Ouvre une connexion WebSocket vers Deriv.
+    Ouvre une connexion WebSocket Deriv.
     """
+
+    connection = websocket.create_connection(
+        url,
+        timeout=DEFAULT_TIMEOUT,
+        enable_multithread=False,
+    )
+
+    connection.settimeout(DEFAULT_TIMEOUT)
+
+    return connection
+
+
+def _close_connection(connection):
+    """
+    Ferme proprement une connexion WebSocket.
+    """
+
+    if connection is None:
+        return
 
     try:
-
-        connection = websocket.create_connection(
-            url,
-            timeout=REQUEST_TIMEOUT,
-            enable_multithread=True,
-        )
-
-        connection.settimeout(REQUEST_TIMEOUT)
-
-        return connection
-
-    except Exception as exc:
-
-        raise DerivMarketError(
-            f"Connexion WebSocket impossible : {exc}"
-        ) from exc
+        connection.close()
+    except Exception:
+        pass
 
 
 # ============================================================
-# 6. RECEPTION D'UNE REPONSE WEBSOCKET
-# ============================================================
-
-def _receive_json(connection):
-    """
-    Attend une réponse JSON valide.
-    """
-
-    try:
-
-        raw_message = connection.recv()
-
-        if not raw_message:
-            raise DerivMarketError(
-                "Réponse vide reçue de Deriv."
-            )
-
-        response = json.loads(raw_message)
-
-        if not isinstance(response, dict):
-            raise DerivMarketError(
-                "Format de réponse Deriv invalide."
-            )
-
-        return response
-
-    except json.JSONDecodeError as exc:
-
-        raise DerivMarketError(
-            "Réponse JSON illisible."
-        ) from exc
-
-    except Exception as exc:
-
-        if isinstance(exc, DerivMarketError):
-            raise
-
-        raise DerivMarketError(
-            f"Erreur de réception WebSocket : {exc}"
-        ) from exc
-        # ============================================================
-# 7. ENVOI D'UNE REQUETE DERIV
+# ENVOI ET RÉCEPTION DES REQUÊTES
 # ============================================================
 
 def _send_request(connection, payload):
@@ -204,228 +147,180 @@ def _send_request(connection, payload):
     Envoie une requête JSON à Deriv.
     """
 
-    if not isinstance(payload, dict):
-        raise ValueError("La requête doit être un dictionnaire.")
+    message = json.dumps(payload)
 
-    try:
+    connection.send(message)
 
-        connection.send(
-            json.dumps(payload)
+
+def _receive_response(connection):
+    """
+    Récupère et décode la réponse JSON de Deriv.
+    """
+
+    raw_response = connection.recv()
+
+    if not raw_response:
+        raise ConnectionError(
+            "Réponse vide reçue du serveur Deriv."
         )
 
-    except Exception as exc:
+    try:
+        response = json.loads(raw_response)
+    except json.JSONDecodeError as error:
+        raise ValueError(
+            "Réponse JSON invalide reçue de Deriv."
+        ) from error
 
-        raise DerivMarketError(
-            f"Impossible d'envoyer la requête : {exc}"
-        ) from exc
+    if not isinstance(response, dict):
+        raise ValueError(
+            "Format de réponse Deriv inattendu."
+        )
 
+    if "error" in response:
+        error_data = response["error"]
 
+        error_message = (
+            error_data.get("message", "Erreur inconnue")
+            if isinstance(error_data, dict)
+            else str(error_data)
+        )
+
+        raise RuntimeError(
+            f"Erreur API Deriv : {error_message}"
+        )
+
+    return response
+    # ============================================================
+# NORMALISATION DES BOUGIES
 # ============================================================
-# 8. VERIFICATION DES ERREURS DERIV
-# ============================================================
 
-def _check_deriv_error(response):
+def _normalize_candles(raw_candles):
     """
-    Détecte les erreurs renvoyées par l'API Deriv.
-    """
-
-    error = response.get("error")
-
-    if not error:
-        return
-
-    message = error.get(
-        "message",
-        "Erreur Deriv inconnue.",
-    )
-
-    code = error.get(
-        "code",
-        "UNKNOWN",
-    )
-
-    raise DerivMarketError(
-        f"Erreur Deriv [{code}] : {message}"
-    )
-
-
-# ============================================================
-# 9. EXECUTION D'UNE REQUETE SUR UNE CONNEXION
-# ============================================================
-
-def _execute_request(connection, payload, expected_key=None):
-    """
-    Envoie une requête et attend la réponse correspondante.
-
-    Les réponses intermédiaires non pertinentes sont ignorées.
+    Convertit les bougies Deriv au format interne :
+    epoch, open, high, low, close.
     """
 
-    _send_request(
-        connection,
-        payload,
-    )
+    if not isinstance(raw_candles, list):
+        raise ValueError(
+            "Les données de bougies reçues sont invalides."
+        )
 
-    deadline = time.time() + REQUEST_TIMEOUT
+    normalized = []
+    seen_epochs = set()
 
-    while time.time() < deadline:
+    for candle in raw_candles:
+        if not isinstance(candle, dict):
+            continue
 
-        response = _receive_json(connection)
+        try:
+            epoch = int(candle["epoch"])
+            open_price = float(candle["open"])
+            high_price = float(candle["high"])
+            low_price = float(candle["low"])
+            close_price = float(candle["close"])
 
-        _check_deriv_error(response)
+        except (KeyError, TypeError, ValueError):
+            continue
 
-        if expected_key is None:
-            return response
+        values = [
+            open_price,
+            high_price,
+            low_price,
+            close_price,
+        ]
 
-        if expected_key in response:
-            return response
+        if not all(
+            value == value and abs(value) != float("inf")
+            for value in values
+        ):
+            continue
 
-        # Ignore les réponses qui ne correspondent pas
-        # à la requête attendue.
+        if high_price < low_price:
+            continue
 
-    raise DerivMarketError(
-        "Délai dépassé : aucune réponse exploitable de Deriv."
-    )
+        if epoch in seen_epochs:
+            continue
+
+        seen_epochs.add(epoch)
+
+        normalized.append({
+            "epoch": epoch,
+            "open": open_price,
+            "high": high_price,
+            "low": low_price,
+            "close": close_price,
+        })
+
+    normalized.sort(key=lambda item: item["epoch"])
+
+    return normalized
 
 
 # ============================================================
-# 10. REQUETE AVEC RECONNEXION AUTOMATIQUE
+# EXÉCUTION D'UNE REQUÊTE WEBSOCKET
 # ============================================================
 
-def _request(payload, expected_key=None):
+def _execute_request(payload):
     """
-    Essaie les différents serveurs Deriv.
+    Exécute une requête sur les serveurs WebSocket Deriv.
 
-    Une nouvelle connexion est créée pour chaque tentative.
+    Essaie les différentes URL en cas d'échec.
     """
 
     last_error = None
 
-    for attempt in range(1, MAX_RETRIES + 1):
+    for url in WEBSOCKET_URLS:
+        connection = None
 
-        for url in URLS:
+        try:
+            LOGGER.info(
+                "Connexion au serveur Deriv : %s",
+                url.split("?")[0]
+            )
 
-            connection = None
+            connection = _open_connection(url)
 
-            try:
+            _send_request(connection, payload)
 
-                logger.info(
-                    "Connexion au serveur Deriv : %s",
-                    url.split("?")[0],
-                )
+            response = _receive_response(connection)
 
-                connection = _create_connection(url)
+            return response
 
-                response = _execute_request(
-                    connection,
-                    payload,
-                    expected_key=expected_key,
-                )
+        except Exception as error:
+            last_error = error
 
-                return response
+            LOGGER.warning(
+                "Échec de la requête Deriv : %s",
+                error
+            )
 
-            except Exception as exc:
+        finally:
+            _close_connection(connection)
 
-                last_error = exc
-
-                logger.warning(
-                    "Tentative %s/%s échouée : %s",
-                    attempt,
-                    MAX_RETRIES,
-                    exc,
-                )
-
-            finally:
-
-                if connection is not None:
-
-                    try:
-                        connection.close()
-
-                    except Exception:
-                        pass
-
-        if attempt < MAX_RETRIES:
-            time.sleep(RETRY_DELAY)
-
-    raise DerivMarketError(
-        f"Toutes les connexions Deriv ont échoué : {last_error}"
+    raise ConnectionError(
+        f"Impossible de récupérer les données Deriv : {last_error}"
     )
 
 
 # ============================================================
-# 11. CONVERSION D'UNE BOUGIE DERIV
+# RÉCUPÉRATION DES BOUGIES HISTORIQUES
 # ============================================================
 
-def _normalise_candle(candle):
+def get_candles(symbol, granularity, count=200):
     """
-    Convertit une bougie Deriv en format OHLC standard.
-    """
+    Récupère les bougies historiques d'un indice Deriv.
 
-    if not isinstance(candle, dict):
-        return None
-
-    try:
-
-        timestamp = int(candle["epoch"])
-
-        open_price = float(candle["open"])
-        high_price = float(candle["high"])
-        low_price = float(candle["low"])
-        close_price = float(candle["close"])
-
-    except (KeyError, TypeError, ValueError):
-        return None
-
-    values = [
-        open_price,
-        high_price,
-        low_price,
-        close_price,
-    ]
-
-    if any(value <= 0 for value in values):
-        return None
-
-    if high_price < low_price:
-        return None
-
-    if high_price < max(open_price, close_price):
-        return None
-
-    if low_price > min(open_price, close_price):
-        return None
-
-    return {
-        "epoch": timestamp,
-        "open": open_price,
-        "high": high_price,
-        "low": low_price,
-        "close": close_price,
-    }
-
-
-# ============================================================
-# 12. RECUPERATION DES BOUGIES HISTORIQUES
-# ============================================================
-
-def get_candles(
-    symbol,
-    granularity,
-    count=200,
-):
-    """
-    Récupère les bougies historiques d'un indice.
+    Paramètres :
+        symbol       : symbole Deriv
+        granularity  : 3600, 7200, 14400 ou 86400
+        count        : nombre de bougies souhaitées
 
     Retour :
-    Liste chronologique de dictionnaires OHLC.
+        Liste chronologique de bougies OHLC.
     """
 
     symbol = _validate_symbol(symbol)
-
-    granularity = _validate_granularity(
-        granularity
-    )
-
+    granularity = _validate_granularity(granularity)
     count = _validate_count(count)
 
     payload = {
@@ -437,73 +332,64 @@ def get_candles(
         "style": "candles",
     }
 
-    logger.info(
-        "Récupération %s | granularité=%s | bougies=%s",
+    LOGGER.info(
+        "Récupération des bougies : %s | granularité=%s | quantité=%s",
         symbol,
         granularity,
         count,
     )
 
-    response = _request(
-        payload,
-        expected_key="candles",
-    )
+    last_error = None
 
-    raw_candles = response.get("candles")
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            response = _execute_request(payload)
 
-    if not isinstance(raw_candles, list):
-        raise DerivMarketError(
-            f"Réponse bougies invalide pour {symbol}."
-        )
+            candles_data = response.get("candles")
 
-    candles = []
+            candles = _normalize_candles(candles_data)
 
-    for raw_candle in raw_candles:
+            if not candles:
+                raise ValueError(
+                    f"Aucune bougie valide reçue pour {symbol}."
+                )
 
-        candle = _normalise_candle(
-            raw_candle
-        )
+            LOGGER.info(
+                "%s : %s bougies récupérées.",
+                symbol,
+                len(candles),
+            )
 
-        if candle is not None:
-            candles.append(candle)
+            return candles
 
-    # Suppression des doublons de timestamps.
-    unique_candles = {}
+        except Exception as error:
+            last_error = error
 
-    for candle in candles:
-        unique_candles[candle["epoch"]] = candle
+            LOGGER.warning(
+                "Tentative %s/%s échouée pour %s : %s",
+                attempt,
+                MAX_RETRIES,
+                symbol,
+                error,
+            )
 
-    candles = sorted(
-        unique_candles.values(),
-        key=lambda item: item["epoch"],
-    )
+            if attempt < MAX_RETRIES:
+                time.sleep(1)
 
-    if len(candles) < count:
-
-        logger.warning(
-            "%s | %s bougies valides reçues sur %s demandées.",
-            symbol,
-            len(candles),
-            count,
-        )
-
-    logger.info(
-        "%s | %s bougies valides récupérées.",
-        symbol,
-        len(candles),
-    )
-
-    return candles
+    raise RuntimeError(
+        f"Échec de récupération des bougies pour {symbol} : "
+        f"{last_error}"
+)
     # ============================================================
-# 13. RECUPERATION DU PRIX ACTUEL
+# RÉCUPÉRATION DU PRIX ACTUEL
 # ============================================================
 
 def get_current_price(symbol):
     """
-    Récupère le dernier prix disponible d'un indice Deriv.
+    Récupère le dernier prix connu d'un indice Deriv.
 
-    Utilise la requête ticks_history avec un seul tick
-    pour éviter les problèmes liés aux abonnements.
+    Utilise uniquement les données publiques.
+    Aucun ordre n'est envoyé.
     """
 
     symbol = _validate_symbol(symbol)
@@ -516,267 +402,109 @@ def get_current_price(symbol):
         "style": "ticks",
     }
 
-    logger.info(
-        "Récupération du prix actuel : %s",
-        symbol,
+    last_error = None
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            response = _execute_request(payload)
+
+            history = response.get("history", {})
+
+            prices = history.get("prices", [])
+
+            if not prices:
+                raise ValueError(
+                    f"Aucun prix reçu pour {symbol}."
+                )
+
+            price = float(prices[-1])
+
+            if price <= 0 or not (
+                price == price
+                and abs(price) != float("inf")
+            ):
+                raise ValueError(
+                    f"Prix invalide reçu pour {symbol}."
+                )
+
+            LOGGER.info(
+                "Prix actuel de %s : %s",
+                symbol,
+                price,
+            )
+
+            return price
+
+        except Exception as error:
+            last_error = error
+
+            LOGGER.warning(
+                "Tentative prix %s/%s échouée pour %s : %s",
+                attempt,
+                MAX_RETRIES,
+                symbol,
+                error,
+            )
+
+            if attempt < MAX_RETRIES:
+                time.sleep(1)
+
+    raise RuntimeError(
+        f"Impossible de récupérer le prix de {symbol} : "
+        f"{last_error}"
     )
-
-    response = _request(
-        payload,
-        expected_key="history",
-    )
-
-    history = response.get("history")
-
-    if not isinstance(history, dict):
-        raise DerivMarketError(
-            f"Historique de prix invalide pour {symbol}."
-        )
-
-    prices = history.get("prices")
-
-    if not isinstance(prices, list) or not prices:
-        raise DerivMarketError(
-            f"Aucun prix reçu pour {symbol}."
-        )
-
-    try:
-
-        price = float(prices[-1])
-
-    except (TypeError, ValueError):
-        raise DerivMarketError(
-            f"Prix non numérique reçu pour {symbol}."
-        )
-
-    if price <= 0:
-        raise DerivMarketError(
-            f"Prix invalide reçu pour {symbol}."
-        )
-
-    logger.info(
-        "%s | Prix actuel : %s",
-        symbol,
-        price,
-    )
-
-    return price
 
 
 # ============================================================
-# 14. TEST DE CONNEXION DERIV
+# TEST DE CONNEXION
 # ============================================================
 
 def test_connection():
     """
     Vérifie que le serveur Deriv répond.
+
+    Retourne True si la connexion fonctionne.
     """
 
     payload = {
-        "time": 1,
+        "ping": 1,
     }
 
     try:
+        response = _execute_request(payload)
 
-        response = _request(
-            payload,
-            expected_key="time",
+        if "ping" in response:
+            LOGGER.info("Connexion Deriv opérationnelle.")
+            return True
+
+        LOGGER.warning(
+            "Réponse inattendue lors du test Deriv."
         )
 
-        server_time = response.get("time")
+        return False
 
-        logger.info(
-            "Connexion Deriv réussie. Heure serveur : %s",
-            server_time,
-        )
-
-        return True
-
-    except Exception as exc:
-
-        logger.error(
+    except Exception as error:
+        LOGGER.error(
             "Test de connexion Deriv échoué : %s",
-            exc,
+            error,
         )
 
         return False
 
 
 # ============================================================
-# 15. TEST DE RECUPERATION D'UN INDICE
-# ============================================================
-
-def test_symbol(symbol):
-    """
-    Vérifie la récupération des données d'un indice.
-    """
-
-    try:
-
-        symbol = _validate_symbol(symbol)
-
-        price = get_current_price(symbol)
-
-        candles = get_candles(
-            symbol=symbol,
-            granularity=3600,
-            count=10,
-        )
-
-        result = {
-            "symbol": symbol,
-            "price": price,
-            "candles_received": len(candles),
-            "success": bool(candles),
-        }
-
-        logger.info(
-            "Test indice %s : %s",
-            symbol,
-            result,
-        )
-
-        return result
-
-    except Exception as exc:
-
-        logger.error(
-            "Test de l'indice %s échoué : %s",
-            symbol,
-            exc,
-        )
-
-        return {
-            "symbol": symbol,
-            "price": None,
-            "candles_received": 0,
-            "success": False,
-            "error": str(exc),
-        }
-
-
-# ============================================================
-# 16. TEST DE TOUS LES INDICES
-# ============================================================
-
-def test_all_symbols(symbols):
-    """
-    Teste les symboles fournis sans passer d'ordre.
-    """
-
-    results = []
-
-    for symbol in symbols:
-
-        result = test_symbol(symbol)
-
-        results.append(result)
-
-        time.sleep(0.5)
-
-    successful = sum(
-        1 for result in results
-        if result.get("success")
-    )
-
-    logger.info(
-        "Test terminé : %s/%s indices accessibles.",
-        successful,
-        len(results),
-    )
-
-    return results
-    # ============================================================
-# 17. DIAGNOSTIC DU MODULE
-# ============================================================
-
-def get_module_information():
-    """
-    Retourne les paramètres du module Deriv.
-    """
-
-    return {
-        "module": "TRADER AI PRO DERIV MARKET",
-        "app_id": APP_ID,
-        "servers": URLS,
-        "request_timeout": REQUEST_TIMEOUT,
-        "max_retries": MAX_RETRIES,
-        "max_candles": MAX_CANDLES,
-        "automatic_trading": False,
-        "order_execution": False,
-    }
-
-
-# ============================================================
-# 18. VERIFICATION DES FONCTIONS PRINCIPALES
-# ============================================================
-
-def verify_module():
-    """
-    Vérifie que les fonctions principales sont disponibles.
-    """
-
-    required_functions = [
-        get_candles,
-        get_current_price,
-        test_connection,
-        test_symbol,
-        test_all_symbols,
-    ]
-
-    for function in required_functions:
-
-        if not callable(function):
-
-            raise DerivMarketError(
-                f"Fonction indisponible : {function}"
-            )
-
-    logger.info(
-        "Vérification interne du module réussie."
-    )
-
-    return True
-
-
-# ============================================================
-# 19. TEST AUTONOME
+# FIN DU MODULE
 # ============================================================
 
 if __name__ == "__main__":
-
-    logger.info("=" * 55)
-    logger.info("TRADER AI PRO — TEST DU MODULE DERIV")
-    logger.info("=" * 55)
-
-    verify_module()
-
-    information = get_module_information()
-
-    logger.info(
-        "Informations du module : %s",
-        information,
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(message)s",
     )
+
+    LOGGER.info("Test du module Deriv Market.")
 
     if test_connection():
-
-        logger.info(
-            "Le serveur Deriv est accessible."
-        )
-
-        result = test_symbol("R_50")
-
-        logger.info(
-            "Résultat du test : %s",
-            result,
-        )
-
+        LOGGER.info("Test réussi.")
     else:
-
-        logger.error(
-            "Impossible de communiquer avec Deriv."
-        )
-
-    logger.info(
-        "Test terminé. Aucun ordre n'a été exécuté."
-    )
+        LOGGER.error("Test échoué.")
