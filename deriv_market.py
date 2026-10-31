@@ -30,6 +30,13 @@ MAX_RETRY_DELAY = 10.0
 DEFAULT_CANDLE_COUNT = 200
 MAX_CANDLE_COUNT = 5000
 
+GRANULARITY = {
+    "H1": 3600,
+    "H2": 7200,
+    "H4": 14400,
+    "D1": 86400,
+}
+
 ALLOWED_GRANULARITIES = {
     3600,
     7200,
@@ -108,10 +115,7 @@ def _validate_count(count: int) -> int:
     return count
 
 
-def _to_finite_float(
-    value: Any,
-    field_name: str,
-) -> float:
+def _to_finite_float( value: Any, field_name: str, ) -> float:
     try:
         result = float(value)
     except (TypeError, ValueError) as exc:
@@ -127,9 +131,7 @@ def _to_finite_float(
     return result
 
 
-def _close_connection(
-    connection: Optional[Any],
-) -> None:
+def _close_connection( connection: Optional[Any], ) -> None:
     if connection is None:
         return
 
@@ -170,10 +172,7 @@ def _open_connection(url: str) -> Any:
         ) from exc
 
 
-def _send_request(
-    connection: Any,
-    payload: Dict[str, Any],
-) -> None:
+def _send_request( connection: Any, payload: Dict[str, Any], ) -> None:
     if not isinstance(payload, dict):
         raise ValueError(
             "La requête Deriv doit être un dictionnaire."
@@ -194,9 +193,7 @@ def _send_request(
         ) from exc
 
 
-def _receive_response(
-    connection: Any,
-) -> Dict[str, Any]:
+def _receive_response( connection: Any, ) -> Dict[str, Any]:
     try:
         raw_response = connection.recv()
 
@@ -237,9 +234,7 @@ def _receive_response(
         )
 
     return response
-    def _execute_request(
-    payload: Dict[str, Any],
-) -> Dict[str, Any]:
+def _execute_request( payload: Dict[str, Any], ) -> Dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError(
             "La requête doit être un dictionnaire."
@@ -285,9 +280,7 @@ def _receive_response(
     )
 
 
-def _normalize_candles(
-    raw_candles: Any,
-) -> List[Dict[str, Any]]:
+def _normalize_candles( raw_candles: Any, ) -> List[Dict[str, Any]]:
     if not isinstance(raw_candles, list):
         raise DerivDataError(
             "La réponse ne contient pas une liste de bougies."
@@ -380,9 +373,7 @@ def _normalize_candles(
     return normalized
 
 
-def _extract_history(
-    response: Dict[str, Any],
-) -> Dict[str, Any]:
+def _extract_history( response: Dict[str, Any], ) -> Dict[str, Any]:
     history = response.get("history")
 
     if isinstance(history, dict):
@@ -401,11 +392,7 @@ def _extract_history(
     )
 
 
-def get_candles(
-    symbol: str,
-    granularity: int,
-    count: int = DEFAULT_CANDLE_COUNT,
-) -> List[Dict[str, Any]]:
+def get_candles( symbol: str, granularity: int, count: int = DEFAULT_CANDLE_COUNT, ) -> List[Dict[str, Any]]:
     symbol = _validate_symbol(symbol)
 
     granularity = _validate_granularity(
@@ -499,9 +486,7 @@ def get_candles(
         f"Échec de récupération des bougies "
         f"pour {symbol} : {last_error}"
 )
-    def get_current_price(
-    symbol: str,
-) -> float:
+def get_current_price( symbol: str, ) -> float:
     symbol = _validate_symbol(symbol)
 
     payload = {
@@ -618,10 +603,7 @@ def test_connection() -> bool:
         _close_connection(connection)
 
 
-def validate_candles(
-    candles: List[Dict[str, Any]],
-    expected_count: int = DEFAULT_CANDLE_COUNT,
-) -> bool:
+def validate_candles( candles: List[Dict[str, Any]], expected_count: int = DEFAULT_CANDLE_COUNT, ) -> bool:
     if not isinstance(candles, list):
         return False
 
@@ -690,10 +672,7 @@ def validate_candles(
     return True
 
 
-def get_market_snapshot(
-    symbol: str,
-    candle_count: int = DEFAULT_CANDLE_COUNT,
-) -> Dict[str, Any]:
+def get_market_snapshot( symbol: str, candle_count: int = DEFAULT_CANDLE_COUNT, ) -> Dict[str, Any]:
     symbol = _validate_symbol(symbol)
     candle_count = _validate_count(candle_count)
 
@@ -806,3 +785,30 @@ if __name__ == "__main__":
             "Connexion non disponible. "
             "Aucune analyse ne doit être considérée comme réussie."
             )
+
+
+def get_synthetic_symbols(timeout: int = DEFAULT_TIMEOUT) -> Dict[str, Any]:
+    """Retourne les indices synthétiques actifs via l'API publique Deriv."""
+    response = _execute_request({
+        "active_symbols": "brief",
+        "product_type": "basic",
+    })
+    raw_symbols = response.get("active_symbols", [])
+    if not isinstance(raw_symbols, list):
+        raise DerivDataError("Liste des indices actifs invalide.")
+    symbols = [
+        item for item in raw_symbols
+        if isinstance(item, dict)
+        and item.get("market") == "synthetic_index"
+        and item.get("symbol")
+    ]
+    return {"symbols": symbols, "count": len(symbols)}
+
+
+def get_candles_compat( symbol: str, timeframe: str, count: int = DEFAULT_CANDLE_COUNT, timeout: int = DEFAULT_TIMEOUT, ) -> Dict[str, Any]:
+    """Adaptateur pour l'API HTTP de app.py; la stratégie utilise la forme historique en liste."""
+    timeframe = str(timeframe).upper()
+    if timeframe not in GRANULARITY:
+        raise ValueError(f"Timeframe non autorisé : {timeframe}")
+    rows = get_candles(symbol, GRANULARITY[timeframe], count=count)
+    return {"symbol": symbol, "timeframe": timeframe, "count": len(rows), "candles": rows}
