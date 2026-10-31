@@ -1,66 +1,10 @@
-"""
-TRADER AI PRO
-Strategie : SUPPORTS / RESISTANCES + TRENDLINES
-Analyse multi-timeframe : D1 / H4 / H2 / H1
-
-Objectif :
-- Determiner la direction generale avec D1.
-- Identifier les zones techniques sur H4.
-- Affiner les niveaux avec H2 et H1.
-- Rechercher la confluence entre niveaux horizontaux
-  et trendlines.
-- Detecter les opportunites anticipees.
-- Calculer entree, stop-loss, take-profit et ratio RR.
-- Produire des signaux destines aux alertes Telegram.
-
-Aucune execution automatique d'ordres.
-"""
-
-import hashlib
-import html
-import json
 import logging
 import math
-from typing import Any, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-
-# ============================================================
-# CONFIGURATION GENERALE
-# ============================================================
 
 LOGGER = logging.getLogger("TRADER_AI_PRO.STRATEGY")
 
-MIN_CANDLES = {
-    "D1": 200,
-    "H4": 200,
-    "H2": 200,
-    "H1": 200,
-}
-
-MIN_RR = 1.0
-
-ATR_PERIOD = 14
-
-PIVOT_RADIUS = 2
-
-LEVEL_CLUSTER_ATR = 0.25
-
-ZONE_ATR_BUFFER = 0.10
-
-MIN_TRENDLINE_CONTACTS = 3
-
-MAX_LEVEL_DISTANCE_ATR = 3.0
-
-MIN_BODY_RATIO = 0.35
-
-MIN_DISPLACEMENT_ATR = 0.50
-
-SIGNAL_VERSION = "SR_TRENDLINE_V1"
-
-
-# ============================================================
-# NOMS COMPLETS DES INDICES
-# ============================================================
 
 SYMBOL_NAMES = {
     "1HZ10V": "Volatility 10 (1s) Index",
@@ -79,1954 +23,5211 @@ SYMBOL_NAMES = {
 }
 
 
-# ============================================================
-# OUTILS DE VALIDATION
-# ============================================================
+TIMEFRAME_REQUIREMENTS = {
+    "D1": 200,
+    "H4": 200,
+    "H2": 200,
+    "H1": 200,
+}
 
-def _number(value: Any) -> Optional[float]:
+
+MIN_TRENDLINE_TOUCHES = 3
+ATR_PERIOD = 14
+MIN_RISK_REWARD = 1.0
+ATR_STOP_BUFFER = 0.15
+ZONE_ATR_TOLERANCE = 0.25
+MIN_CANDLE_COUNT = 200
+MAX_PRICE_DISTANCE_ATR = 1.5
+
+
+class StrategyError(Exception):
+    pass
+
+
+def get_symbol_name(symbol: str) -> str:
+    """Renvoie le nom lisible d'un indice Deriv."""
+    symbol = str(symbol).strip()
+    return SYMBOL_NAMES.get(symbol, symbol)
+
+
+def _finite_number(
+    value: Any,
+    field_name: str,
+) -> float:
     """Convertit une valeur en nombre fini."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise StrategyError(
+            f"Valeur numérique invalide pour {field_name}."
+        ) from exc
+
+    if not math.isfinite(number):
+        raise StrategyError(
+            f"Valeur non finie pour {field_name}."
+        )
+
+    return number
+
+
+def _validate_candle(
+    candle: Dict[str, Any],
+) -> Dict[str, float]:
+    """Valide et normalise une bougie OHLC."""
+    if not isinstance(candle, dict):
+        raise StrategyError(
+            "Une bougie doit être un dictionnaire."
+        )
 
     try:
-        result = float(value)
-    except (TypeError, ValueError, OverflowError):
-        return None
+        epoch = int(candle["epoch"])
+        open_price = _finite_number(
+            candle["open"],
+            "open",
+        )
+        high_price = _finite_number(
+            candle["high"],
+            "high",
+        )
+        low_price = _finite_number(
+            candle["low"],
+            "low",
+        )
+        close_price = _finite_number(
+            candle["close"],
+            "close",
+        )
+    except KeyError as exc:
+        raise StrategyError(
+            f"Champ de bougie manquant : {exc}"
+        ) from exc
 
-    if not math.isfinite(result):
-        return None
+    if epoch <= 0:
+        raise StrategyError(
+            "Horodatage de bougie invalide."
+        )
 
-    return result
+    if low_price > high_price:
+        raise StrategyError(
+            "Le minimum dépasse le maximum de la bougie."
+        )
 
+    if not (
+        low_price
+        <= min(open_price, close_price)
+        <= max(open_price, close_price)
+        <= high_price
+    ):
+        raise StrategyError(
+            "Les prix OHLC de la bougie sont incohérents."
+        )
 
-def _positive_number(value: Any) -> Optional[float]:
-    """Retourne un nombre strictement positif."""
-
-    result = _number(value)
-
-    if result is None or result <= 0:
-        return None
-
-    return result
-
-
-def _safe_float(value: Any, default: float = 0.0) -> float:
-    """Convertit une valeur avec une valeur de secours."""
-
-    result = _number(value)
-
-    if result is None:
-        return default
-
-    return result
-
-
-def _normalise_direction(value: Any) -> Optional[str]:
-    """Normalise la direction d'un signal."""
-
-    if not isinstance(value, str):
-        return None
-
-    direction = value.strip().upper()
-
-    if direction in ("BUY", "LONG", "BULLISH"):
-        return "BUY"
-
-    if direction in ("SELL", "SHORT", "BEARISH"):
-        return "SELL"
-
-    return None
+    return {
+        "epoch": epoch,
+        "open": open_price,
+        "high": high_price,
+        "low": low_price,
+        "close": close_price,
+    }
 
 
-# ============================================================
-# NORMALISATION DES BOUGIES
-# ============================================================
-
-def _normalise_candles(
-    candles: Any,
-    timeframe: str = "",
-) -> list:
-    """
-    Valide les bougies OHLC et les trie chronologiquement.
-
-    Chaque bougie doit contenir :
-    epoch, open, high, low, close.
-    """
-
+def validate_candle_series(
+    candles: List[Dict[str, Any]],
+    minimum_count: int = MIN_CANDLE_COUNT,
+) -> List[Dict[str, float]]:
+    """Vérifie une série de bougies ordonnée et exploitable."""
     if not isinstance(candles, list):
-        return []
+        raise StrategyError(
+            "La série de bougies doit être une liste."
+        )
 
-    normalised = []
+    if len(candles) < minimum_count:
+        raise StrategyError(
+            f"Historique insuffisant : {len(candles)} bougies "
+            f"reçues, {minimum_count} nécessaires."
+        )
 
-    required = (
-        "epoch",
-        "open",
-        "high",
-        "low",
-        "close",
+    normalized = [
+        _validate_candle(candle)
+        for candle in candles
+    ]
+
+    normalized.sort(
+        key=lambda candle: candle["epoch"]
     )
 
-    for candle in candles:
-        if not isinstance(candle, dict):
-            continue
+    previous_epoch = 0
 
-        if not all(key in candle for key in required):
-            continue
+    for candle in normalized:
+        if candle["epoch"] <= previous_epoch:
+            raise StrategyError(
+                "Les horodatages des bougies doivent être uniques."
+            )
 
-        epoch = _number(candle.get("epoch"))
-        open_price = _number(candle.get("open"))
-        high_price = _number(candle.get("high"))
-        low_price = _number(candle.get("low"))
-        close_price = _number(candle.get("close"))
+        previous_epoch = int(candle["epoch"])
 
-        values = (
-            epoch,
-            open_price,
-            high_price,
-            low_price,
-            close_price,
-        )
+    return normalized
 
-        if any(value is None for value in values):
-            continue
 
-        if high_price < low_price:
-            continue
+def calculate_true_range(
+    current: Dict[str, float],
+    previous_close: Optional[float],
+) -> float:
+    """Calcule le True Range d'une bougie."""
+    high_price = float(current["high"])
+    low_price = float(current["low"])
 
-        if high_price < max(open_price, close_price):
-            continue
+    if previous_close is None:
+        return high_price - low_price
 
-        if low_price > min(open_price, close_price):
-            continue
+    return max(
+        high_price - low_price,
+        abs(high_price - previous_close),
+        abs(low_price - previous_close),
+    )
 
-        normalised.append({
-            "epoch": int(epoch),
-            "open": open_price,
-            "high": high_price,
-            "low": low_price,
-            "close": close_price,
-        })
 
-    normalised.sort(key=lambda item: item["epoch"])
-
-    # Elimine les doublons de timestamp.
-    unique = []
-    seen_epochs = set()
-
-    for candle in normalised:
-        epoch = candle["epoch"]
-
-        if epoch in seen_epochs:
-            continue
-
-        seen_epochs.add(epoch)
-        unique.append(candle)
-
-    minimum = MIN_CANDLES.get(timeframe, 1)
-
-    if len(unique) < minimum:
-        LOGGER.warning(
-            "Bougies insuffisantes pour %s : %s/%s",
-            timeframe or "timeframe inconnu",
-            len(unique),
-            minimum,
-        )
-        return []
-
-    return unique
-    # ============================================================
-# CALCUL DE L'ATR
-# ============================================================
-
-def _calculate_atr(
-    candles: list,
+def calculate_atr(
+    candles: List[Dict[str, Any]],
     period: int = ATR_PERIOD,
-) -> Optional[float]:
-    """Calcule l'Average True Range."""
+) -> float:
+    """Calcule l'ATR à partir des dernières bougies."""
+    if period < 1:
+        raise StrategyError(
+            "La période ATR doit être positive."
+        )
 
-    if not isinstance(candles, list):
-        return None
-
-    if period < 1 or len(candles) < period + 1:
-        return None
+    normalized = validate_candle_series(
+        candles,
+        minimum_count=period + 1,
+    )
 
     true_ranges = []
 
-    for index in range(1, len(candles)):
-        previous_close = candles[index - 1]["close"]
-        current = candles[index]
+    for index, candle in enumerate(normalized):
+        previous_close = None
 
-        high = current["high"]
-        low = current["low"]
+        if index > 0:
+            previous_close = normalized[index - 1]["close"]
 
-        true_range = max(
-            high - low,
-            abs(high - previous_close),
-            abs(low - previous_close),
+        true_ranges.append(
+            calculate_true_range(
+                candle,
+                previous_close,
+            )
         )
 
-        if math.isfinite(true_range):
-            true_ranges.append(true_range)
-
-    if len(true_ranges) < period:
-        return None
-
     recent_ranges = true_ranges[-period:]
-    atr = sum(recent_ranges) / period
+
+    if not recent_ranges:
+        raise StrategyError(
+            "Impossible de calculer l'ATR."
+        )
+
+    atr = sum(recent_ranges) / len(recent_ranges)
 
     if not math.isfinite(atr) or atr <= 0:
-        return None
+        raise StrategyError(
+            "La valeur ATR calculée est invalide."
+        )
 
     return atr
 
 
-# ============================================================
-# IDENTIFICATION DES PIVOTS
-# ============================================================
+def candle_body_ratio(
+    candle: Dict[str, Any],
+) -> float:
+    """Mesure la proportion du corps dans l'amplitude totale."""
+    normalized = _validate_candle(candle)
 
-def _find_pivots(
-    candles: list,
-    radius: int = PIVOT_RADIUS,
-) -> dict:
-    """
-    Identifie les sommets et creux locaux.
+    total_range = (
+        normalized["high"] - normalized["low"]
+    )
 
-    Un pivot n'est retenu que si son prix est distinct
-    des prix observes autour de lui.
-    """
+    if total_range <= 0:
+        return 0.0
 
-    result = {
-        "highs": [],
-        "lows": [],
-    }
+    body = abs(
+        normalized["close"] - normalized["open"]
+    )
 
-    if not isinstance(candles, list):
-        return result
+    return body / total_range
 
+
+def candle_direction(
+    candle: Dict[str, Any],
+) -> str:
+    """Détermine la direction d'une bougie."""
+    normalized = _validate_candle(candle)
+
+    if normalized["close"] > normalized["open"]:
+        return "BULLISH"
+
+    if normalized["close"] < normalized["open"]:
+        return "BEARISH"
+
+    return "DOJI"
+
+
+def is_bullish_candle(
+    candle: Dict[str, Any],
+) -> bool:
+    return (
+        candle_direction(candle) == "BULLISH"
+    )
+
+
+def is_bearish_candle(
+    candle: Dict[str, Any],
+) -> bool:
+    return (
+        candle_direction(candle) == "BEARISH"
+    )
+
+
+def candle_upper_wick(
+    candle: Dict[str, Any],
+) -> float:
+    normalized = _validate_candle(candle)
+
+    return (
+        normalized["high"]
+        - max(
+            normalized["open"],
+            normalized["close"],
+        )
+    )
+
+
+def candle_lower_wick(
+    candle: Dict[str, Any],
+) -> float:
+    normalized = _validate_candle(candle)
+
+    return (
+        min(
+            normalized["open"],
+            normalized["close"],
+        )
+        - normalized["low"]
+    )
+
+
+def is_doji(
+    candle: Dict[str, Any],
+    maximum_body_ratio: float = 0.10,
+) -> bool:
+    """Détecte un doji selon la proportion de son corps."""
+    if not 0 <= maximum_body_ratio <= 1:
+        raise StrategyError(
+            "Le ratio maximal du doji doit être compris entre 0 et 1."
+        )
+
+    return (
+        candle_body_ratio(candle)
+        <= maximum_body_ratio
+    )
+  def find_pivot_highs(
+    candles: List[Dict[str, Any]],
+    radius: int = 2,
+) -> List[Dict[str, Any]]:
+    """Identifie les sommets locaux servant aux résistances."""
     if radius < 1:
-        return result
+        raise StrategyError(
+            "Le rayon des pivots doit être positif."
+        )
 
-    if len(candles) < radius * 2 + 1:
-        return result
+    normalized = validate_candle_series(
+        candles,
+        minimum_count=(radius * 2) + 1,
+    )
 
-    for index in range(radius, len(candles) - radius):
-        current = candles[index]
+    pivots = []
 
-        left = candles[index - radius:index]
-        right = candles[index + 1:index + radius + 1]
-
-        surrounding = left + right
-
+    for index in range(
+        radius,
+        len(normalized) - radius,
+    ):
+        current = normalized[index]
         current_high = current["high"]
+
+        left_highs = [
+            candle["high"]
+            for candle in normalized[
+                index - radius:index
+            ]
+        ]
+
+        right_highs = [
+            candle["high"]
+            for candle in normalized[
+                index + 1:index + radius + 1
+            ]
+        ]
+
+        if (
+            current_high >= max(left_highs)
+            and current_high >= max(right_highs)
+            and (
+                current_high > max(left_highs)
+                or current_high > max(right_highs)
+            )
+        ):
+            pivots.append(
+                {
+                    "index": index,
+                    "epoch": current["epoch"],
+                    "price": current_high,
+                    "type": "HIGH",
+                }
+            )
+
+    return pivots
+
+
+def find_pivot_lows(
+    candles: List[Dict[str, Any]],
+    radius: int = 2,
+) -> List[Dict[str, Any]]:
+    """Identifie les creux locaux servant aux supports."""
+    if radius < 1:
+        raise StrategyError(
+            "Le rayon des pivots doit être positif."
+        )
+
+    normalized = validate_candle_series(
+        candles,
+        minimum_count=(radius * 2) + 1,
+    )
+
+    pivots = []
+
+    for index in range(
+        radius,
+        len(normalized) - radius,
+    ):
+        current = normalized[index]
         current_low = current["low"]
 
-        is_high = all(
-            current_high >= item["high"]
-            for item in surrounding
-        )
+        left_lows = [
+            candle["low"]
+            for candle in normalized[
+                index - radius:index
+            ]
+        ]
 
-        is_low = all(
-            current_low <= item["low"]
-            for item in surrounding
-        )
+        right_lows = [
+            candle["low"]
+            for candle in normalized[
+                index + 1:index + radius + 1
+            ]
+        ]
 
-        if is_high:
-            result["highs"].append({
-                "index": index,
-                "epoch": current["epoch"],
-                "price": current_high,
-            })
+        if (
+            current_low <= min(left_lows)
+            and current_low <= min(right_lows)
+            and (
+                current_low < min(left_lows)
+                or current_low < min(right_lows)
+            )
+        ):
+            pivots.append(
+                {
+                    "index": index,
+                    "epoch": current["epoch"],
+                    "price": current_low,
+                    "type": "LOW",
+                }
+            )
 
-        if is_low:
-            result["lows"].append({
-                "index": index,
-                "epoch": current["epoch"],
-                "price": current_low,
-            })
-
-    return result
+    return pivots
 
 
-# ============================================================
-# REGROUPEMENT DES NIVEAUX PROCHES
-# ============================================================
-
-def _cluster_values(
-    values: list,
+def cluster_price_levels(
+    pivots: List[Dict[str, Any]],
     tolerance: float,
-) -> list:
-    """
-    Regroupe les prix proches pour identifier
-    des zones de support et de resistance.
-    """
-
-    if not values or tolerance <= 0:
-        return []
-
-    sorted_values = sorted(
-        value
-        for value in values
-        if _number(value) is not None
+    level_type: str,
+) -> List[Dict[str, Any]]:
+    """Regroupe les pivots proches en zones techniques."""
+    tolerance = _finite_number(
+        tolerance,
+        "tolerance",
     )
 
-    if not sorted_values:
-        return []
+    if tolerance < 0:
+        raise StrategyError(
+            "La tolérance ne peut pas être négative."
+        )
+
+    if level_type not in ("SUPPORT", "RESISTANCE"):
+        raise StrategyError(
+            "Type de niveau technique invalide."
+        )
+
+    valid_pivots = []
+
+    for pivot in pivots:
+        if not isinstance(pivot, dict):
+            continue
+
+        try:
+            price = _finite_number(
+                pivot["price"],
+                "pivot.price",
+            )
+
+            index = int(pivot["index"])
+            epoch = int(pivot["epoch"])
+
+        except (KeyError, TypeError, ValueError, StrategyError):
+            continue
+
+        if price <= 0 or index < 0 or epoch <= 0:
+            continue
+
+        valid_pivots.append(
+            {
+                "price": price,
+                "index": index,
+                "epoch": epoch,
+            }
+        )
+
+    valid_pivots.sort(
+        key=lambda pivot: pivot["price"]
+    )
 
     clusters = []
-    current_cluster = [sorted_values[0]]
 
-    for value in sorted_values[1:]:
-        cluster_mean = (
-            sum(current_cluster) / len(current_cluster)
-        )
+    for pivot in valid_pivots:
+        matching_cluster = None
 
-        if abs(value - cluster_mean) <= tolerance:
-            current_cluster.append(value)
+        for cluster in clusters:
+            center = (
+                sum(cluster["prices"])
+                / len(cluster["prices"])
+            )
+
+            if abs(pivot["price"] - center) <= tolerance:
+                matching_cluster = cluster
+                break
+
+        if matching_cluster is None:
+            clusters.append(
+                {
+                    "prices": [pivot["price"]],
+                    "indices": [pivot["index"]],
+                    "epochs": [pivot["epoch"]],
+                }
+            )
         else:
-            clusters.append(current_cluster)
-            current_cluster = [value]
+            matching_cluster["prices"].append(
+                pivot["price"]
+            )
 
-    clusters.append(current_cluster)
+            matching_cluster["indices"].append(
+                pivot["index"]
+            )
 
-    results = []
+            matching_cluster["epochs"].append(
+                pivot["epoch"]
+            )
+
+    levels = []
 
     for cluster in clusters:
-        results.append({
-            "price": sum(cluster) / len(cluster),
-            "touches": len(cluster),
-            "low": min(cluster),
-            "high": max(cluster),
-        })
-
-    return results
-
-
-# ============================================================
-# RECHERCHE DES SUPPORTS ET RESISTANCES
-# ============================================================
-
-def _find_horizontal_levels(
-    candles: list,
-    atr: Optional[float] = None,
-) -> dict:
-    """
-    Detecte les niveaux horizontaux a partir des pivots.
-    """
-
-    empty_result = {
-        "supports": [],
-        "resistances": [],
-    }
-
-    if not candles:
-        return empty_result
-
-    if atr is None:
-        atr = _calculate_atr(candles)
-
-    if atr is None or atr <= 0:
-        return empty_result
-
-    pivots = _find_pivots(candles)
-
-    tolerance = atr * LEVEL_CLUSTER_ATR
-
-    support_clusters = _cluster_values(
-        [item["price"] for item in pivots["lows"]],
-        tolerance,
-    )
-
-    resistance_clusters = _cluster_values(
-        [item["price"] for item in pivots["highs"]],
-        tolerance,
-    )
-
-    for level in support_clusters:
-        level["type"] = "SUPPORT"
-
-    for level in resistance_clusters:
-        level["type"] = "RESISTANCE"
-
-    return {
-        "supports": support_clusters,
-        "resistances": resistance_clusters,
-}
-    # ============================================================
-# DETERMINATION DE LA DIRECTION SUR D1
-# ============================================================
-
-def _d1_zones(candles: list) -> dict:
-    """
-    Analyse D1 pour identifier les zones techniques
-    et determiner le biais directionnel general.
-    """
-
-    result = {
-        "direction": None,
-        "atr": None,
-        "levels": {
-            "supports": [],
-            "resistances": [],
-        },
-        "last_close": None,
-    }
-
-    candles = _normalise_candles(candles, "D1")
-
-    if not candles:
-        return result
-
-    atr = _calculate_atr(candles)
-
-    if atr is None:
-        return result
-
-    levels = _find_horizontal_levels(candles, atr)
-
-    result["atr"] = atr
-    result["levels"] = levels
-    result["last_close"] = candles[-1]["close"]
-
-    # Utilise les dernieres bougies pour estimer
-    # la direction generale, sans garantir le mouvement.
-    recent = candles[-20:]
-
-    first_close = recent[0]["close"]
-    last_close = recent[-1]["close"]
-
-    movement = last_close - first_close
-
-    if movement > atr * 0.5:
-        result["direction"] = "BUY"
-
-    elif movement < -atr * 0.5:
-        result["direction"] = "SELL"
-
-    return result
-
-
-# ============================================================
-# RECHERCHE DES REACTIONS SUR H4
-# ============================================================
-
-def _find_h4_reactions(
-    candles: list,
-    levels: dict,
-    atr: Optional[float] = None,
-) -> list:
-    """
-    Recherche les reactions du prix autour des niveaux
-    horizontaux sur H4.
-    """
-
-    candles = _normalise_candles(candles, "H4")
-
-    if not candles or not isinstance(levels, dict):
-        return []
-
-    if atr is None:
-        atr = _calculate_atr(candles)
-
-    if atr is None or atr <= 0:
-        return []
-
-    reactions = []
-
-    all_levels = (
-        levels.get("supports", [])
-        + levels.get("resistances", [])
-    )
-
-    recent_candles = candles[-60:]
-
-    for level in all_levels:
-        if not isinstance(level, dict):
-            continue
-
-        price = _number(level.get("price"))
-
-        if price is None:
-            continue
-
-        touches = 0
-        last_touch = None
-
-        for index, candle in enumerate(recent_candles):
-            distance = min(
-                abs(candle["high"] - price),
-                abs(candle["low"] - price),
-                abs(candle["close"] - price),
-            )
-
-            if distance <= atr * LEVEL_CLUSTER_ATR:
-                touches += 1
-                last_touch = index
-
-        if touches == 0:
-            continue
-
-        reactions.append({
-            "price": price,
-            "type": level.get("type", "LEVEL"),
-            "touches": touches,
-            "last_touch": last_touch,
-            "strength": touches,
-        })
-
-    reactions.sort(
-        key=lambda item: (
-            item["strength"],
-            item["last_touch"]
-            if item["last_touch"] is not None
-            else -1,
-        ),
-        reverse=True,
-    )
-
-    return reactions
-
-
-# ============================================================
-# AFFINAGE D'UNE ZONE D1 AVEC H4
-# ============================================================
-
-def _refine_d1_zone_with_h4(
-    d1_zone: dict,
-    h4_candles: list,
-    atr: Optional[float] = None,
-) -> Optional[dict]:
-    """
-    Affine une zone technique D1 en utilisant
-    les reactions observees sur H4.
-    """
-
-    if not isinstance(d1_zone, dict):
-        return None
-
-    low = _number(d1_zone.get("low"))
-    high = _number(d1_zone.get("high"))
-
-    if low is None or high is None or high < low:
-        return None
-
-    candles = _normalise_candles(h4_candles, "H4")
-
-    if not candles:
-        return None
-
-    if atr is None:
-        atr = _calculate_atr(candles)
-
-    if atr is None or atr <= 0:
-        return None
-
-    relevant = []
-
-    for candle in candles[-60:]:
-        if candle["high"] < low or candle["low"] > high:
-            continue
-
-        relevant.append(candle)
-
-    if not relevant:
-        return {
-            "low": low,
-            "high": high,
-            "source": "D1",
-        }
-
-    refined_low = max(
-        low,
-        min(item["low"] for item in relevant),
-    )
-
-    refined_high = min(
-        high,
-        max(item["high"] for item in relevant),
-    )
-
-    if refined_high < refined_low:
-        return None
-
-    return {
-        "low": refined_low,
-        "high": refined_high,
-        "source": "D1_H4",
-    }
-    # ============================================================
-# CALCUL DE LA VALEUR D'UNE TRENDLINE
-# ============================================================
-
-def _line_value(
-    point_a: dict,
-    point_b: dict,
-    index: int,
-) -> Optional[float]:
-    """Calcule le prix estime d'une droite entre deux pivots."""
-
-    if not isinstance(point_a, dict):
-        return None
-
-    if not isinstance(point_b, dict):
-        return None
-
-    x1 = _number(point_a.get("index"))
-    y1 = _number(point_a.get("price"))
-    x2 = _number(point_b.get("index"))
-    y2 = _number(point_b.get("price"))
-
-    if any(value is None for value in (x1, y1, x2, y2)):
-        return None
-
-    if x1 == x2:
-        return None
-
-    slope = (y2 - y1) / (x2 - x1)
-
-    value = y1 + slope * (index - x1)
-
-    if not math.isfinite(value):
-        return None
-
-    return value
-
-
-# ============================================================
-# DETECTION DES TRENDLINES
-# ============================================================
-
-def _find_trendline(
-    candles: list,
-    pivot_type: str,
-    atr: Optional[float] = None,
-) -> Optional[dict]:
-    """
-    Recherche une trendline a partir des pivots.
-
-    pivot_type :
-    - lows : trendline potentiellement haussiere.
-    - highs : trendline potentiellement baissiere.
-    """
-
-    candles = _normalise_candles(candles)
-
-    if len(candles) < 20:
-        return None
-
-    if atr is None:
-        atr = _calculate_atr(candles)
-
-    if atr is None or atr <= 0:
-        return None
-
-    pivots = _find_pivots(candles)
-
-    if pivot_type == "lows":
-        points = pivots["lows"]
-        direction = "BUY"
-
-    elif pivot_type == "highs":
-        points = pivots["highs"]
-        direction = "SELL"
-
-    else:
-        return None
-
-    if len(points) < 2:
-        return None
-
-    tolerance = atr * LEVEL_CLUSTER_ATR
-    best_line = None
-
-    # Examine les paires de pivots recents.
-    recent_points = points[-12:]
-
-    for first_index in range(len(recent_points) - 1):
-        for second_index in range(
-            first_index + 1,
-            len(recent_points),
-        ):
-            point_a = recent_points[first_index]
-            point_b = recent_points[second_index]
-
-            if point_b["index"] <= point_a["index"]:
-                continue
-
-            # La ligne doit avoir une pente coherente.
-            if direction == "BUY":
-                if point_b["price"] <= point_a["price"]:
-                    continue
-            else:
-                if point_b["price"] >= point_a["price"]:
-                    continue
-
-            contacts = []
-
-            for point in points:
-                line_price = _line_value(
-                    point_a,
-                    point_b,
-                    point["index"],
-                )
-
-                if line_price is None:
-                    continue
-
-                if abs(point["price"] - line_price) <= tolerance:
-                    contacts.append(point)
-
-            if len(contacts) < 2:
-                continue
-
-            current_index = len(candles) - 1
-
-            current_value = _line_value(
-                point_a,
-                point_b,
-                current_index,
-            )
-
-            if current_value is None:
-                continue
-
-            candidate = {
-                "direction": direction,
-                "point_a": point_a,
-                "point_b": point_b,
-                "value": current_value,
-                "contacts": len(contacts),
-                "slope": (
-                    point_b["price"] - point_a["price"]
-                ) / (
-                    point_b["index"] - point_a["index"]
-                ),
+        prices = cluster["prices"]
+
+        lower = min(prices)
+        upper = max(prices)
+        center = sum(prices) / len(prices)
+
+        levels.append(
+            {
+                "type": level_type,
+                "lower": lower,
+                "upper": upper,
+                "price": center,
+                "touches": len(prices),
+                "indices": sorted(cluster["indices"]),
+                "epochs": sorted(cluster["epochs"]),
+                "strength": len(prices),
             }
+        )
 
-            if (
-                best_line is None
-                or candidate["contacts"] > best_line["contacts"]
-            ):
-                best_line = candidate
+    levels.sort(
+        key=lambda level: level["price"]
+    )
 
-    return best_line
-    # ============================================================
-# SELECTION DE LA TRENDLINE SELON LA DIRECTION
-# ============================================================
+    return levels
 
-def _trendline_for_direction(
-    candles: list,
-    direction: str,
+
+def find_supports(
+    candles: List[Dict[str, Any]],
     atr: Optional[float] = None,
-) -> Optional[dict]:
-    """Selectionne la trendline correspondant au biais."""
-
-    direction = _normalise_direction(direction)
-
-    if direction is None:
-        return None
-
-    pivot_type = "lows" if direction == "BUY" else "highs"
-
-    trendline = _find_trendline(
+    radius: int = 2,
+) -> List[Dict[str, Any]]:
+    """Détecte les zones de support à partir des creux."""
+    normalized = validate_candle_series(
         candles,
-        pivot_type,
-        atr,
+        minimum_count=(radius * 2) + 1,
     )
 
-    if trendline is None:
-        return None
+    if atr is None:
+        atr = calculate_atr(normalized)
 
-    if trendline.get("direction") != direction:
-        return None
+    atr = _finite_number(atr, "ATR")
 
-    # Exige au moins trois contacts distincts.
-    if trendline.get("contacts", 0) < MIN_TRENDLINE_CONTACTS:
-        return None
+    if atr <= 0:
+        raise StrategyError(
+            "L'ATR doit être positif pour détecter les supports."
+        )
 
-    return trendline
+    pivots = find_pivot_lows(
+        normalized,
+        radius=radius,
+    )
+
+    return cluster_price_levels(
+        pivots=pivots,
+        tolerance=atr * ZONE_ATR_TOLERANCE,
+        level_type="SUPPORT",
+    )
 
 
-# ============================================================
-# PROXIMITE ENTRE LE PRIX ET UNE ZONE
-# ============================================================
+def find_resistances(
+    candles: List[Dict[str, Any]],
+    atr: Optional[float] = None,
+    radius: int = 2,
+) -> List[Dict[str, Any]]:
+    """Détecte les zones de résistance à partir des sommets."""
+    normalized = validate_candle_series(
+        candles,
+        minimum_count=(radius * 2) + 1,
+    )
 
-def _price_near_zone(
+    if atr is None:
+        atr = calculate_atr(normalized)
+
+    atr = _finite_number(atr, "ATR")
+
+    if atr <= 0:
+        raise StrategyError(
+            "L'ATR doit être positif pour détecter les résistances."
+        )
+
+    pivots = find_pivot_highs(
+        normalized,
+        radius=radius,
+    )
+
+    return cluster_price_levels(
+        pivots=pivots,
+        tolerance=atr * ZONE_ATR_TOLERANCE,
+        level_type="RESISTANCE",
+    )
+
+
+def level_distance(
     price: float,
-    zone: dict,
-    atr: Optional[float] = None,
-) -> bool:
-    """Verifie si le prix se trouve pres d'une zone."""
+    level: Dict[str, Any],
+) -> float:
+    """Distance entre un prix et une zone de support/résistance."""
+    price = _finite_number(price, "price")
 
-    price = _number(price)
-
-    if price is None or not isinstance(zone, dict):
-        return False
-
-    low = _number(zone.get("low"))
-    high = _number(zone.get("high"))
-
-    if low is None or high is None or high < low:
-        return False
-
-    if low <= price <= high:
-        return True
-
-    if atr is None or atr <= 0:
-        return False
-
-    distance = atr * MAX_LEVEL_DISTANCE_ATR
-
-    return (
-        price >= low - distance
-        and price <= high + distance
+    lower = _finite_number(
+        level["lower"],
+        "level.lower",
     )
 
-
-# ============================================================
-# PROXIMITE ENTRE TRENDLINE ET ZONE
-# ============================================================
-
-def _trendline_near_zone(
-    trendline: Optional[dict],
-    zone: dict,
-    atr: Optional[float] = None,
-) -> bool:
-    """Verifie la convergence d'une trendline et d'une zone."""
-
-    if not isinstance(trendline, dict):
-        return False
-
-    if not isinstance(zone, dict):
-        return False
-
-    value = _number(trendline.get("value"))
-    low = _number(zone.get("low"))
-    high = _number(zone.get("high"))
-
-    if any(item is None for item in (value, low, high)):
-        return False
-
-    if high < low:
-        return False
-
-    if low <= value <= high:
-        return True
-
-    if atr is None or atr <= 0:
-        return False
-
-    return (
-        abs(value - low) <= atr * LEVEL_CLUSTER_ATR
-        or abs(value - high) <= atr * LEVEL_CLUSTER_ATR
+    upper = _finite_number(
+        level["upper"],
+        "level.upper",
     )
 
+    if lower > upper:
+        raise StrategyError(
+            "Les limites de la zone sont inversées."
+        )
 
-# ============================================================
-# VALIDATION DU BIAIS DIRECTIONNEL
-# ============================================================
+    if lower <= price <= upper:
+        return 0.0
 
-def _direction_valid(
-    direction: str,
-    d1_analysis: dict,
-) -> bool:
-    """Verifie que le signal respecte le biais D1."""
+    if price < lower:
+        return lower - price
 
-    direction = _normalise_direction(direction)
-
-    if direction is None or not isinstance(d1_analysis, dict):
-        return False
-
-    d1_direction = _normalise_direction(
-        d1_analysis.get("direction")
-    )
-
-    if d1_direction is None:
-        return False
-
-    return direction == d1_direction 
-# ============================================================
-# CONFLUENCE DES NIVEAUX HORIZONTAUX
-# ============================================================
-
-def _levels_near_zone(
-    levels: dict,
-    zone: dict,
-    atr: Optional[float] = None,
-) -> list:
-    """Recupere les niveaux horizontaux proches d'une zone."""
-
-    if not isinstance(levels, dict):
-        return []
-
-    if not isinstance(zone, dict):
-        return []
-
-    low = _number(zone.get("low"))
-    high = _number(zone.get("high"))
-
-    if low is None or high is None or high < low:
-        return []
-
-    tolerance = 0.0
-
-    if atr is not None and atr > 0:
-        tolerance = atr * LEVEL_CLUSTER_ATR
-
-    nearby = []
-
-    for level_type in ("supports", "resistances"):
-        for level in levels.get(level_type, []):
-            if not isinstance(level, dict):
-                continue
-
-            price = _number(level.get("price"))
-
-            if price is None:
-                continue
-
-            if low - tolerance <= price <= high + tolerance:
-                nearby.append({
-                    "price": price,
-                    "type": level.get("type", level_type),
-                    "touches": int(
-                        _safe_float(level.get("touches"), 0)
-                    ),
-                })
-
-    return nearby
+    return price - upper
 
 
-# ============================================================
-# VERIFICATION DE LA CONFLUENCE HORIZONTALE
-# ============================================================
-
-def _has_horizontal_confluence(
-    levels: dict,
-    zone: dict,
-    atr: Optional[float] = None,
-) -> bool:
-    """Determine si une zone coincide avec un niveau horizontal."""
-
-    nearby = _levels_near_zone(
-        levels,
-        zone,
-        atr,
-    )
-
-    return len(nearby) > 0
-
-
-# ============================================================
-# RECHERCHE DU PROCHAIN OBJECTIF TECHNIQUE
-# ============================================================
-
-def _find_next_target(
-    entry: float,
-    direction: str,
-    levels: dict,
-    zone: dict,
-) -> Optional[float]:
-    """
-    Recherche le prochain niveau technique exploitable
-    dans le sens du trade.
-    """
-
-    entry = _number(entry)
-    direction = _normalise_direction(direction)
-
-    if entry is None or direction is None:
-        return None
-
-    if not isinstance(levels, dict):
-        return None
-
-    if not isinstance(zone, dict):
-        return None
-
-    low = _number(zone.get("low"))
-    high = _number(zone.get("high"))
-
-    if low is None or high is None or high < low:
-        return None
+def find_nearest_level(
+    price: float,
+    levels: List[Dict[str, Any]],
+    level_type: Optional[str] = None,
+    direction: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Renvoie le niveau le plus proche respectant les filtres."""
+    price = _finite_number(price, "price")
 
     candidates = []
 
-    target_key = (
-        "resistances"
-        if direction == "BUY"
-        else "supports"
-    )
-
-    for level in levels.get(target_key, []):
+    for level in levels:
         if not isinstance(level, dict):
             continue
 
-        price = _number(level.get("price"))
-
-        if price is None:
+        if (
+            level_type is not None
+            and level.get("type") != level_type
+        ):
             continue
 
-        if direction == "BUY":
-            if price > entry and price > high:
-                candidates.append(price)
+        level_price = _finite_number(
+            level.get("price"),
+            "level.price",
+        )
 
-        else:
-            if price < entry and price < low:
-                candidates.append(price)
+        if direction == "ABOVE" and level_price <= price:
+            continue
+
+        if direction == "BELOW" and level_price >= price:
+            continue
+
+        if direction not in (
+            None,
+            "ABOVE",
+            "BELOW",
+        ):
+            raise StrategyError(
+                "Direction de recherche de niveau invalide."
+            )
+
+        candidates.append(level)
 
     if not candidates:
         return None
 
-    if direction == "BUY":
-        return min(candidates)
-
-    return max(candidates)
-    # ============================================================
-# CALCUL DU TRADE
-# ============================================================
-
-def _calculate_trade(
-    direction: str,
-    entry: float,
-    zone: dict,
-    atr: float,
-    target_levels: dict,
-) -> Optional[dict]:
-    """Calcule entree, stop-loss, take-profit et ratio risque/rendement."""
-
-    direction = _normalise_direction(direction)
-    entry = _number(entry)
-    atr = _positive_number(atr)
-
-    if direction is None or entry is None or atr is None:
-        return None
-
-    if not isinstance(zone, dict):
-        return None
-
-    low = _number(zone.get("low"))
-    high = _number(zone.get("high"))
-
-    if low is None or high is None or high < low:
-        return None
-
-    buffer = atr * ZONE_ATR_BUFFER
-
-    if direction == "BUY":
-        stop_loss = low - buffer
-
-        if stop_loss >= entry:
-            return None
-
-    else:
-        stop_loss = high + buffer
-
-        if stop_loss <= entry:
-            return None
-
-    take_profit = _find_next_target(
-        entry,
-        direction,
-        target_levels,
-        zone,
+    return min(
+        candidates,
+        key=lambda level: level_distance(
+            price,
+            level,
+        ),
     )
 
-    if take_profit is None:
-        return None
 
-    if direction == "BUY":
-        risk = entry - stop_loss
-        reward = take_profit - entry
+def filter_levels_by_strength(
+    levels: List[Dict[str, Any]],
+    minimum_touches: int = 2,
+) -> List[Dict[str, Any]]:
+    """Écarte les zones trop peu testées."""
+    if minimum_touches < 1:
+        raise StrategyError(
+            "Le nombre minimal de touches doit être positif."
+        )
+
+    return [
+        level
+        for level in levels
+        if int(level.get("touches", 0))
+        >= minimum_touches
+          ]
+  def calculate_linear_regression(
+    points: List[Tuple[float, float]],
+) -> Tuple[float, float]:
+    """Calcule la pente et l'ordonnée à l'origine d'une droite."""
+    if len(points) < 2:
+        raise StrategyError(
+            "Au moins deux points sont nécessaires."
+        )
+
+    x_values = [
+        _finite_number(point[0], "point.x")
+        for point in points
+    ]
+
+    y_values = [
+        _finite_number(point[1], "point.y")
+        for point in points
+    ]
+
+    mean_x = sum(x_values) / len(x_values)
+    mean_y = sum(y_values) / len(y_values)
+
+    denominator = sum(
+        (x - mean_x) ** 2
+        for x in x_values
+    )
+
+    if denominator == 0:
+        raise StrategyError(
+            "Impossible de calculer la pente."
+        )
+
+    numerator = sum(
+        (x - mean_x) * (y - mean_y)
+        for x, y in zip(x_values, y_values)
+    )
+
+    slope = numerator / denominator
+    intercept = mean_y - slope * mean_x
+
+    if not (
+        math.isfinite(slope)
+        and math.isfinite(intercept)
+    ):
+        raise StrategyError(
+            "La droite calculée est invalide."
+        )
+
+    return slope, intercept
+
+
+def line_value_at(
+    slope: float,
+    intercept: float,
+    index: float,
+) -> float:
+    """Calcule la valeur d'une droite à un index donné."""
+    slope = _finite_number(slope, "slope")
+    intercept = _finite_number(
+        intercept,
+        "intercept",
+    )
+    index = _finite_number(index, "index")
+
+    value = slope * index + intercept
+
+    if not math.isfinite(value):
+        raise StrategyError(
+            "Valeur de trendline non finie."
+        )
+
+    return value
+
+
+def count_trendline_touches(
+    candles: List[Dict[str, Any]],
+    pivots: List[Dict[str, Any]],
+    slope: float,
+    intercept: float,
+    tolerance: float,
+) -> List[Dict[str, Any]]:
+    """Compte les contacts entre pivots et une trendline."""
+    normalized = validate_candle_series(
+        candles,
+        minimum_count=3,
+    )
+
+    tolerance = _finite_number(
+        tolerance,
+        "tolerance",
+    )
+
+    if tolerance < 0:
+        raise StrategyError(
+            "La tolérance ne peut pas être négative."
+        )
+
+    touches = []
+
+    for pivot in pivots:
+        try:
+            index = int(pivot["index"])
+            price = _finite_number(
+                pivot["price"],
+                "pivot.price",
+            )
+        except (KeyError, TypeError, ValueError, StrategyError):
+            continue
+
+        if index < 0 or index >= len(normalized):
+            continue
+
+        expected_price = line_value_at(
+            slope,
+            intercept,
+            index,
+        )
+
+        distance = abs(
+            price - expected_price
+        )
+
+        if distance <= tolerance:
+            touches.append(
+                {
+                    "index": index,
+                    "epoch": int(
+                        normalized[index]["epoch"]
+                    ),
+                    "price": price,
+                    "line_price": expected_price,
+                    "distance": distance,
+                }
+            )
+
+    return touches
+
+
+def detect_trendlines(
+    candles: List[Dict[str, Any]],
+    atr: Optional[float] = None,
+    radius: int = 2,
+    minimum_touches: int = MIN_TRENDLINE_TOUCHES,
+) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    Détecte des trendlines haussières et baissières.
+
+    Les lignes ne sont retenues que si elles présentent
+    suffisamment de contacts avec des pivots.
+    """
+    normalized = validate_candle_series(
+        candles,
+        minimum_count=max(
+            MIN_CANDLE_COUNT,
+            (radius * 2) + 1,
+        ),
+    )
+
+    if minimum_touches < 3:
+        raise StrategyError(
+            "Une trendline doit avoir au moins trois touches."
+        )
+
+    if atr is None:
+        atr = calculate_atr(normalized)
+
+    atr = _finite_number(
+        atr,
+        "ATR",
+    )
+
+    if atr <= 0:
+        raise StrategyError(
+            "L'ATR doit être positif."
+        )
+
+    tolerance = atr * ZONE_ATR_TOLERANCE
+
+    low_pivots = find_pivot_lows(
+        normalized,
+        radius=radius,
+    )
+
+    high_pivots = find_pivot_highs(
+        normalized,
+        radius=radius,
+    )
+
+    result = {
+        "uptrend": [],
+        "downtrend": [],
+    }
+
+    def build_candidates(
+        pivots: List[Dict[str, Any]],
+        trend_type: str,
+    ) -> List[Dict[str, Any]]:
+        candidates = []
+
+        if len(pivots) < minimum_touches:
+            return candidates
+
+        pivot_count = len(pivots)
+
+        for start in range(pivot_count - 1):
+            for end in range(
+                start + 1,
+                pivot_count,
+            ):
+                first = pivots[start]
+                last = pivots[end]
+
+                if last["index"] <= first["index"]:
+                    continue
+
+                slope = (
+                    last["price"] - first["price"]
+                ) / (
+                    last["index"] - first["index"]
+                )
+
+                if trend_type == "UPTREND" and slope <= 0:
+                    continue
+
+                if trend_type == "DOWNTREND" and slope >= 0:
+                    continue
+
+                intercept = (
+                    first["price"]
+                    - slope * first["index"]
+                )
+
+                touches = count_trendline_touches(
+                    normalized,
+                    pivots,
+                    slope,
+                    intercept,
+                    tolerance,
+                )
+
+                if len(touches) < minimum_touches:
+                    continue
+
+                indices = [
+                    touch["index"]
+                    for touch in touches
+                ]
+
+                if len(set(indices)) < minimum_touches:
+                    continue
+
+                current_index = len(normalized) - 1
+
+                current_line_price = line_value_at(
+                    slope,
+                    intercept,
+                    current_index,
+                )
+
+                candidate = {
+                    "type": trend_type,
+                    "slope": slope,
+                    "intercept": intercept,
+                    "start_index": min(indices),
+                    "end_index": max(indices),
+                    "touches": len(touches),
+                    "touch_points": touches,
+                    "current_value": current_line_price,
+                    "tolerance": tolerance,
+                }
+
+                candidates.append(candidate)
+
+        candidates.sort(
+            key=lambda candidate: (
+                candidate["touches"],
+                candidate["end_index"],
+                -abs(candidate["slope"]),
+            ),
+            reverse=True,
+        )
+
+        unique = []
+        signatures = set()
+
+        for candidate in candidates:
+            signature = (
+                round(candidate["slope"], 8),
+                round(candidate["intercept"], 6),
+            )
+
+            if signature in signatures:
+                continue
+
+            signatures.add(signature)
+            unique.append(candidate)
+
+            if len(unique) >= 10:
+                break
+
+        return unique
+
+    result["uptrend"] = build_candidates(
+        low_pivots,
+        "UPTREND",
+    )
+
+    result["downtrend"] = build_candidates(
+        high_pivots,
+        "DOWNTREND",
+    )
+
+    LOGGER.debug(
+        "Trendlines détectées : haussières=%s, baissières=%s",
+        len(result["uptrend"]),
+        len(result["downtrend"]),
+    )
+
+    return result
+
+
+def get_nearest_trendline(
+    trendlines: Dict[str, List[Dict[str, Any]]],
+    current_price: float,
+    trend_type: str,
+) -> Optional[Dict[str, Any]]:
+    """Retourne la trendline valide la plus proche du prix."""
+    current_price = _finite_number(
+        current_price,
+        "current_price",
+    )
+
+    if trend_type == "UPTREND":
+        key = "uptrend"
+    elif trend_type == "DOWNTREND":
+        key = "downtrend"
     else:
-        risk = stop_loss - entry
-        reward = entry - take_profit
+        raise StrategyError(
+            "Type de trendline inconnu."
+        )
 
-    if risk <= 0 or reward <= 0:
+    candidates = trendlines.get(key, [])
+
+    if not candidates:
         return None
 
-    rr = reward / risk
+    valid_candidates = [
+        line
+        for line in candidates
+        if int(line.get("touches", 0))
+        >= MIN_TRENDLINE_TOUCHES
+    ]
 
-    if not math.isfinite(rr) or rr < MIN_RR:
+    if not valid_candidates:
         return None
+
+    return min(
+        valid_candidates,
+        key=lambda line: abs(
+            current_price - float(
+                line["current_value"]
+            )
+        ),
+    )
+
+
+def trendline_distance(
+    current_price: float,
+    trendline: Dict[str, Any],
+) -> float:
+    """Mesure la distance absolue entre le prix et une trendline."""
+    current_price = _finite_number(
+        current_price,
+        "current_price",
+    )
+
+    line_price = _finite_number(
+        trendline["current_value"],
+        "trendline.current_value",
+    )
+
+    return abs(
+        current_price - line_price
+    )
+
+
+def is_price_near_trendline(
+    current_price: float,
+    trendline: Dict[str, Any],
+    atr: float,
+    maximum_distance_atr: float = MAX_PRICE_DISTANCE_ATR,
+) -> bool:
+    """Vérifie si le prix approche suffisamment une trendline."""
+    current_price = _finite_number(
+        current_price,
+        "current_price",
+    )
+
+    atr = _finite_number(
+        atr,
+        "ATR",
+    )
+
+    maximum_distance_atr = _finite_number(
+        maximum_distance_atr,
+        "maximum_distance_atr",
+    )
+
+    if atr <= 0 or maximum_distance_atr < 0:
+        return False
+
+    if int(
+        trendline.get("touches", 0)
+    ) < MIN_TRENDLINE_TOUCHES:
+        return False
+
+    distance = trendline_distance(
+        current_price,
+        trendline,
+    )
+
+    return distance <= (
+        atr * maximum_distance_atr
+      )
+  def determine_market_trend(
+    candles: List[Dict[str, Any]],
+    short_period: int = 20,
+    long_period: int = 50,
+) -> Dict[str, Any]:
+    """Détermine une tendance simple à partir des moyennes mobiles."""
+    normalized = validate_candle_series(
+        candles,
+        minimum_count=long_period + 1,
+    )
+
+    if short_period < 2 or long_period <= short_period:
+        raise StrategyError(
+            "Les périodes des moyennes mobiles sont invalides."
+        )
+
+    closes = [
+        candle["close"]
+        for candle in normalized
+    ]
+
+    short_average = sum(
+        closes[-short_period:]
+    ) / short_period
+
+    long_average = sum(
+        closes[-long_period:]
+    ) / long_period
+
+    recent_close = closes[-1]
+
+    if short_average > long_average and recent_close > short_average:
+        direction = "BULLISH"
+
+    elif short_average < long_average and recent_close < short_average:
+        direction = "BEARISH"
+
+    else:
+        direction = "NEUTRAL"
 
     return {
         "direction": direction,
-        "entry": entry,
-        "stop_loss": stop_loss,
-        "take_profit": take_profit,
-        "risk": risk,
-        "reward": reward,
-        "rr": rr,
-        "zone": {
-            "low": low,
-            "high": high,
-        },
+        "short_average": short_average,
+        "long_average": long_average,
+        "last_close": recent_close,
     }
 
 
-# ============================================================
-# RECHERCHE D'UNE BOUGIE DE DEPLACEMENT
-# ============================================================
+def detect_market_structure(
+    candles: List[Dict[str, Any]],
+    radius: int = 2,
+) -> Dict[str, Any]:
+    """Analyse les derniers sommets et creux significatifs."""
+    normalized = validate_candle_series(
+        candles,
+        minimum_count=max(
+            MIN_CANDLE_COUNT,
+            (radius * 2) + 1,
+        ),
+    )
 
-def _has_displacement(
-    candles: list,
-    direction: str,
+    highs = find_pivot_highs(
+        normalized,
+        radius=radius,
+    )
+
+    lows = find_pivot_lows(
+        normalized,
+        radius=radius,
+    )
+
+    last_two_highs = highs[-2:]
+    last_two_lows = lows[-2:]
+
+    higher_high = False
+    lower_high = False
+    higher_low = False
+    lower_low = False
+
+    if len(last_two_highs) == 2:
+        higher_high = (
+            last_two_highs[-1]["price"]
+            > last_two_highs[-2]["price"]
+        )
+
+        lower_high = (
+            last_two_highs[-1]["price"]
+            < last_two_highs[-2]["price"]
+        )
+
+    if len(last_two_lows) == 2:
+        higher_low = (
+            last_two_lows[-1]["price"]
+            > last_two_lows[-2]["price"]
+        )
+
+        lower_low = (
+            last_two_lows[-1]["price"]
+            < last_two_lows[-2]["price"]
+        )
+
+    if higher_high and higher_low:
+        direction = "BULLISH"
+
+    elif lower_high and lower_low:
+        direction = "BEARISH"
+
+    else:
+        direction = "RANGE"
+
+    return {
+        "direction": direction,
+        "higher_high": higher_high,
+        "lower_high": lower_high,
+        "higher_low": higher_low,
+        "lower_low": lower_low,
+        "pivot_highs": highs,
+        "pivot_lows": lows,
+    }
+
+
+def find_nearest_support(
+    current_price: float,
+    supports: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Trouve le support situé au niveau ou sous le prix."""
+    return find_nearest_level(
+        price=current_price,
+        levels=supports,
+        level_type="SUPPORT",
+        direction="BELOW",
+    )
+
+
+def find_nearest_resistance(
+    current_price: float,
+    resistances: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Trouve la résistance située au niveau ou au-dessus du prix."""
+    return find_nearest_level(
+        price=current_price,
+        levels=resistances,
+        level_type="RESISTANCE",
+        direction="ABOVE",
+    )
+
+
+def calculate_confluence_score(
+    current_price: float,
     atr: float,
-) -> bool:
-    """Detecte un mouvement recent suffisamment marque."""
+    level: Dict[str, Any],
+    trendline: Optional[Dict[str, Any]],
+    expected_direction: str,
+) -> Dict[str, Any]:
+    """
+    Évalue la proximité entre une zone technique et une trendline.
 
-    direction = _normalise_direction(direction)
-    atr = _positive_number(atr)
+    Le score exprime une confluence géométrique, pas une probabilité
+    de réussite du trade.
+    """
+    current_price = _finite_number(
+        current_price,
+        "current_price",
+    )
 
-    if direction is None or atr is None:
-        return False
+    atr = _finite_number(
+        atr,
+        "ATR",
+    )
 
-    if not isinstance(candles, list) or not candles:
-        return False
+    if atr <= 0:
+        raise StrategyError(
+            "L'ATR doit être positif."
+        )
 
-    for candle in candles[-3:]:
-        open_price = _number(candle.get("open"))
-        close_price = _number(candle.get("close"))
-        high = _number(candle.get("high"))
-        low = _number(candle.get("low"))
+    if expected_direction not in ("BUY", "SELL"):
+        raise StrategyError(
+            "La direction attendue doit être BUY ou SELL."
+        )
 
-        if any(
-            value is None
-            for value in (
-                open_price,
-                close_price,
-                high,
-                low,
+    level_price = _finite_number(
+        level["price"],
+        "level.price",
+    )
+
+    level_type = level.get("type")
+
+    if expected_direction == "BUY" and level_type != "SUPPORT":
+        return {
+            "score": 0,
+            "confluence": False,
+            "reasons": [
+                "La zone n'est pas un support."
+            ],
+        }
+
+    if expected_direction == "SELL" and level_type != "RESISTANCE":
+        return {
+            "score": 0,
+            "confluence": False,
+            "reasons": [
+                "La zone n'est pas une résistance."
+            ],
+        }
+
+    reasons = []
+    score = 0
+
+    distance_to_level = level_distance(
+        current_price,
+        level,
+    )
+
+    if distance_to_level <= atr * MAX_PRICE_DISTANCE_ATR:
+        score += 1
+        reasons.append(
+            "Prix proche de la zone technique."
+        )
+
+    touches = int(
+        level.get("touches", 0)
+    )
+
+    if touches >= 3:
+        score += 1
+        reasons.append(
+            "Zone testée au moins trois fois."
+        )
+
+    trendline_distance_value = None
+
+    if trendline is not None:
+        trendline_distance_value = trendline_distance(
+            current_price,
+            trendline,
+        )
+
+        if (
+            trendline.get("type")
+            == (
+                "UPTREND"
+                if expected_direction == "BUY"
+                else "DOWNTREND"
             )
+            and touches >= 1
         ):
-            continue
+            if trendline_distance_value <= atr * MAX_PRICE_DISTANCE_ATR:
+                score += 1
+                reasons.append(
+                    "Trendline compatible avec la direction."
+                )
 
-        candle_range = high - low
+            line_price = _finite_number(
+                trendline["current_value"],
+                "trendline.current_value",
+            )
+
+            level_line_gap = abs(
+                line_price - level_price
+            )
+
+            if level_line_gap <= atr * ZONE_ATR_TOLERANCE:
+                score += 1
+                reasons.append(
+                    "Trendline proche de la zone technique."
+                )
+
+    return {
+        "score": score,
+        "confluence": score >= 3,
+        "reasons": reasons,
+        "distance_to_level": distance_to_level,
+        "trendline_distance": trendline_distance_value,
+        "level_price": level_price,
+    }
+
+
+def build_anticipatory_zone(
+    level: Dict[str, Any],
+    trendline: Optional[Dict[str, Any]],
+    atr: float,
+    direction: str,
+) -> Dict[str, Any]:
+    """Construit une zone de surveillance anticipée."""
+    atr = _finite_number(
+        atr,
+        "ATR",
+    )
+
+    if atr <= 0:
+        raise StrategyError(
+            "L'ATR doit être positif."
+        )
+
+    if direction not in ("BUY", "SELL"):
+        raise StrategyError(
+            "Direction invalide pour la zone anticipée."
+        )
+
+    lower = _finite_number(
+        level["lower"],
+        "level.lower",
+    )
+
+    upper = _finite_number(
+        level["upper"],
+        "level.upper",
+    )
+
+    if lower > upper:
+        raise StrategyError(
+            "Les limites de la zone sont inversées."
+        )
+
+    level_price = _finite_number(
+        level["price"],
+        "level.price",
+    )
+
+    zone_lower = lower
+    zone_upper = upper
+
+    if trendline is not None:
+        line_price = _finite_number(
+            trendline["current_value"],
+            "trendline.current_value",
+        )
+
+        line_lower = (
+            line_price - atr * ZONE_ATR_TOLERANCE
+        )
+
+        line_upper = (
+            line_price + atr * ZONE_ATR_TOLERANCE
+        )
+
+        intersection_lower = max(
+            zone_lower,
+            line_lower,
+        )
+
+        intersection_upper = min(
+            zone_upper,
+            line_upper,
+        )
+
+        if intersection_lower <= intersection_upper:
+            zone_lower = intersection_lower
+            zone_upper = intersection_upper
+
+    approach_buffer = atr * ZONE_ATR_TOLERANCE
+
+    if direction == "BUY":
+        entry_min = zone_lower - approach_buffer
+        entry_max = zone_upper + approach_buffer
+    else:
+        entry_min = zone_lower - approach_buffer
+        entry_max = zone_upper + approach_buffer
+
+    return {
+        "direction": direction,
+        "level_type": level.get("type"),
+        "level_price": level_price,
+        "zone_lower": zone_lower,
+        "zone_upper": zone_upper,
+        "entry_zone_lower": entry_min,
+        "entry_zone_upper": entry_max,
+        "atr": atr,
+        "trendline_value": (
+            trendline.get("current_value")
+            if trendline is not None
+            else None
+        ),
+        "anticipatory": True,
+    }
+
+
+def is_price_approaching_zone(
+    current_price: float,
+    zone: Dict[str, Any],
+    atr: float,
+    maximum_distance_atr: float = MAX_PRICE_DISTANCE_ATR,
+) -> bool:
+    """Indique si le prix est dans la zone ou s'en approche."""
+    current_price = _finite_number(
+        current_price,
+        "current_price",
+    )
+
+    atr = _finite_number(
+        atr,
+        "ATR",
+    )
+
+    maximum_distance_atr = _finite_number(
+        maximum_distance_atr,
+        "maximum_distance_atr",
+    )
+
+    if atr <= 0 or maximum_distance_atr < 0:
+        return False
+
+    lower = _finite_number(
+        zone["entry_zone_lower"],
+        "entry_zone_lower",
+    )
+
+    upper = _finite_number(
+        zone["entry_zone_upper"],
+        "entry_zone_upper",
+    )
+
+    if lower > upper:
+        return False
+
+    if lower <= current_price <= upper:
+        return True
+
+    if current_price < lower:
+        return (lower - current_price) <= (
+            atr * maximum_distance_atr
+        )
+
+    return (current_price - upper) <= (
+        atr * maximum_distance_atr
+  )
+  def calculate_stop_loss(
+    direction: str,
+    entry_price: float,
+    zone: Dict[str, Any],
+    atr: float,
+    atr_buffer: float = ATR_STOP_BUFFER,
+) -> float:
+    """Place le Stop Loss au-delà de la zone technique."""
+    entry_price = _finite_number(
+        entry_price,
+        "entry_price",
+    )
+    atr = _finite_number(atr, "ATR")
+    atr_buffer = _finite_number(
+        atr_buffer,
+        "atr_buffer",
+    )
+
+    if entry_price <= 0 or atr <= 0:
+        raise StrategyError(
+            "Le prix d'entrée et l'ATR doivent être positifs."
+        )
+
+    if atr_buffer < 0:
+        raise StrategyError(
+            "La marge ATR ne peut pas être négative."
+        )
+
+    zone_lower = _finite_number(
+        zone["zone_lower"],
+        "zone_lower",
+    )
+    zone_upper = _finite_number(
+        zone["zone_upper"],
+        "zone_upper",
+    )
+
+    if zone_lower > zone_upper:
+        raise StrategyError(
+            "Les limites de la zone sont inversées."
+        )
+
+    buffer = atr * atr_buffer
+
+    if direction == "BUY":
+        stop_loss = zone_lower - buffer
+
+        if stop_loss >= entry_price:
+            raise StrategyError(
+                "Le Stop Loss BUY doit être sous l'entrée."
+            )
+
+    elif direction == "SELL":
+        stop_loss = zone_upper + buffer
+
+        if stop_loss <= entry_price:
+            raise StrategyError(
+                "Le Stop Loss SELL doit être au-dessus de l'entrée."
+            )
+
+    else:
+        raise StrategyError(
+            "Direction invalide pour le Stop Loss."
+        )
+
+    if stop_loss <= 0:
+        raise StrategyError(
+            "Le Stop Loss calculé est invalide."
+        )
+
+    return stop_loss
+
+
+def calculate_take_profit(
+    direction: str,
+    entry_price: float,
+    supports: List[Dict[str, Any]],
+    resistances: List[Dict[str, Any]],
+    minimum_rr: float = MIN_RISK_REWARD,
+    stop_loss: Optional[float] = None,
+) -> float:
+    """Recherche un objectif technique respectant le RR minimal."""
+    entry_price = _finite_number(
+        entry_price,
+        "entry_price",
+    )
+    minimum_rr = _finite_number(
+        minimum_rr,
+        "minimum_rr",
+    )
+
+    if entry_price <= 0:
+        raise StrategyError(
+            "Le prix d'entrée doit être positif."
+        )
+
+    if minimum_rr <= 0:
+        raise StrategyError(
+            "Le ratio risque/rendement doit être positif."
+        )
+
+    if stop_loss is None:
+        raise StrategyError(
+            "Le Stop Loss est obligatoire pour calculer le TP."
+        )
+
+    stop_loss = _finite_number(
+        stop_loss,
+        "stop_loss",
+    )
+
+    if direction == "BUY":
+        if stop_loss >= entry_price:
+            raise StrategyError(
+                "Pour un BUY, le SL doit être sous l'entrée."
+            )
+
+        risk = entry_price - stop_loss
+        candidates = [
+            level
+            for level in resistances
+            if float(level.get("price", 0)) > entry_price
+        ]
+
+        candidates.sort(
+            key=lambda level: float(level["price"])
+        )
+
+        for level in candidates:
+            target = float(level["price"])
+
+            if target <= entry_price:
+                continue
+
+            reward = target - entry_price
+
+            if reward / risk >= minimum_rr:
+                return target
+
+        return entry_price + risk * minimum_rr
+
+    if direction == "SELL":
+        if stop_loss <= entry_price:
+            raise StrategyError(
+                "Pour un SELL, le SL doit être au-dessus de l'entrée."
+            )
+
+        risk = stop_loss - entry_price
+        candidates = [
+            level
+            for level in supports
+            if float(level.get("price", 0)) < entry_price
+        ]
+
+        candidates.sort(
+            key=lambda level: float(level["price"]),
+            reverse=True,
+        )
+
+        for level in candidates:
+            target = float(level["price"])
+
+            if target >= entry_price:
+                continue
+
+            reward = entry_price - target
+
+            if reward / risk >= minimum_rr:
+                return target
+
+        return max(
+            entry_price - risk * minimum_rr,
+            entry_price * 0.000001,
+        )
+
+    raise StrategyError(
+        "Direction invalide pour le Take Profit."
+    )
+
+
+def calculate_risk_reward(
+    direction: str,
+    entry_price: float,
+    stop_loss: float,
+    take_profit: float,
+) -> float:
+    """Calcule le ratio entre le gain potentiel et le risque."""
+    entry_price = _finite_number(
+        entry_price,
+        "entry_price",
+    )
+    stop_loss = _finite_number(
+        stop_loss,
+        "stop_loss",
+    )
+    take_profit = _finite_number(
+        take_profit,
+        "take_profit",
+    )
+
+    if direction == "BUY":
+        risk = entry_price - stop_loss
+        reward = take_profit - entry_price
+
+    elif direction == "SELL":
+        risk = stop_loss - entry_price
+        reward = entry_price - take_profit
+
+    else:
+        raise StrategyError(
+            "Direction invalide pour le calcul du RR."
+        )
+
+    if risk <= 0:
+        raise StrategyError(
+            "Le risque doit être strictement positif."
+        )
+
+    if reward <= 0:
+        raise StrategyError(
+            "Le gain potentiel doit être strictement positif."
+        )
+
+    ratio = reward / risk
+
+    if not math.isfinite(ratio):
+        raise StrategyError(
+            "Le ratio risque/rendement est invalide."
+        )
+
+    return ratio
+
+
+def validate_trade_levels(
+    direction: str,
+    entry_price: float,
+    stop_loss: float,
+    take_profit: float,
+    minimum_rr: float = MIN_RISK_REWARD,
+) -> Dict[str, Any]:
+    """Vérifie la cohérence des niveaux avant de produire un signal."""
+    entry_price = _finite_number(
+        entry_price,
+        "entry_price",
+    )
+    stop_loss = _finite_number(
+        stop_loss
+  )
+    take_profit = _finite_number(
+        take_profit,
+        "take_profit",
+    )
+
+    if direction == "BUY":
+        risk = entry_price - stop_loss
+        reward = take_profit - entry_price
+
+    elif direction == "SELL":
+        risk = stop_loss - entry_price
+        reward = entry_price - take_profit
+
+    else:
+        raise StrategyError(
+            "Direction invalide pour le calcul du RR."
+        )
+
+    if risk <= 0:
+        raise StrategyError(
+            "Le risque doit être strictement positif."
+        )
+
+    if reward <= 0:
+        raise StrategyError(
+            "Le gain potentiel doit être strictement positif."
+        )
+
+    ratio = reward / risk
+
+    if not math.isfinite(ratio):
+        raise StrategyError(
+            "Le ratio risque/rendement est invalide."
+        )
+
+    return ratio
+
+
+def validate_trade_levels(
+    direction: str,
+    entry_price: float,
+    stop_loss: float,
+    take_profit: float,
+    minimum_rr: float = MIN_RISK_REWARD,
+) -> Dict[str, Any]:
+    """Vérifie la cohérence des niveaux avant de produire un signal."""
+    entry_price = _finite_number(
+        entry_price,
+        "entry_price",
+    )
+    stop_loss = _finite_number(
+        stop_loss,
+        "stop_loss",
+    )
+    take_profit = _finite_number(
+        take_profit,
+        "take_profit",
+    )
+    minimum_rr = _finite_number(
+        minimum_rr,
+        "minimum_rr",
+    )
+
+    if min(entry_price, stop_loss, take_profit) <= 0:
+        raise StrategyError(
+            "Les niveaux de prix doivent être positifs."
+        )
+
+    ratio = calculate_risk_reward(
+        direction=direction,
+        entry_price=entry_price,
+        stop_loss=stop_loss,
+        take_profit=take_profit,
+    )
+
+    if ratio < minimum_rr:
+        raise StrategyError(
+            f"RR insuffisant : {ratio:.2f}, "
+            f"minimum requis : {minimum_rr:.2f}."
+        )
+
+    return {
+        "valid": True,
+        "direction": direction,
+        "entry": entry_price,
+        "stop_loss": stop_loss,
+        "take_profit": take_profit,
+        "risk_reward": ratio,
+        "minimum_rr": minimum_rr,
+    }
+
+
+def calculate_entry_price(
+    direction: str,
+    zone: Dict[str, Any],
+    current_price: float,
+) -> float:
+    """Détermine un prix indicatif dans la zone d'entrée."""
+    current_price = _finite_number(
+        current_price,
+        "current_price",
+    )
+
+    if current_price <= 0:
+        raise StrategyError(
+            "Le prix actuel doit être positif."
+        )
+
+    lower = _finite_number(
+        zone["entry_zone_lower"],
+        "entry_zone_lower",
+    )
+    upper = _finite_number(
+        zone["entry_zone_upper"],
+        "entry_zone_upper",
+    )
+
+    if lower > upper:
+        raise StrategyError(
+            "Les limites de la zone d'entrée sont inversées."
+        )
+
+    if direction not in ("BUY", "SELL"):
+        raise StrategyError(
+            "Direction invalide pour l'entrée."
+        )
+
+    if lower <= current_price <= upper:
+        return current_price
+
+    if current_price < lower:
+        return lower
+
+    return upper
+
+
+def check_minimum_rr(
+    direction: str,
+    entry_price: float,
+    stop_loss: float,
+    take_profit: float,
+    minimum_rr: float = MIN_RISK_REWARD,
+) -> bool:
+    """Retourne True uniquement si le RR minimal est respecté."""
+    try:
+        result = validate_trade_levels(
+            direction=direction,
+            entry_price=entry_price,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            minimum_rr=minimum_rr,
+        )
+
+        return bool(result["valid"])
+
+    except (StrategyError, TypeError, ValueError):
+        return False
+      def analyze_d1_direction(
+    d1_candles: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Détermine la direction générale à partir du Daily."""
+    candles = validate_candle_series(
+        d1_candles,
+        minimum_count=TIMEFRAME_REQUIREMENTS["D1"],
+    )
+
+    trend = determine_market_trend(candles)
+    structure = detect_market_structure(candles)
+
+    if (
+        trend["direction"] == "BULLISH"
+        and structure["direction"] == "BULLISH"
+    ):
+        direction = "BULLISH"
+    elif (
+        trend["direction"] == "BEARISH"
+        and structure["direction"] == "BEARISH"
+    ):
+        direction = "BEARISH"
+    else:
+        direction = "NEUTRAL"
+
+    return {
+        "timeframe": "D1",
+        "direction": direction,
+        "trend": trend,
+        "structure": structure,
+        "candles_count": len(candles),
+    }
+
+
+def analyze_h4_structure(
+    h4_candles: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Analyse la structure principale sur H4."""
+    candles = validate_candle_series(
+        h4_candles,
+        minimum_count=TIMEFRAME_REQUIREMENTS["H4"],
+    )
+
+    atr = calculate_atr(candles)
+    trend = determine_market_trend(candles)
+    structure = detect_market_structure(candles)
+
+    supports = find_supports(
+        candles,
+        atr=atr,
+    )
+
+    resistances = find_resistances(
+        candles,
+        atr=atr,
+    )
+
+    trendlines = detect_trendlines(
+        candles,
+        atr=atr,
+    )
+
+    return {
+        "timeframe": "H4",
+        "atr": atr,
+        "trend": trend,
+        "structure": structure,
+        "supports": supports,
+        "resistances": resistances,
+        "trendlines": trendlines,
+        "candles_count": len(candles),
+    }
+
+
+def analyze_h2_confirmation(
+    h2_candles: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Analyse la tendance intermédiaire sur H2."""
+    candles = validate_candle_series(
+        h2_candles,
+        minimum_count=TIMEFRAME_REQUIREMENTS["H2"],
+    )
+
+    trend = determine_market_trend(candles)
+    structure = detect_market_structure(candles)
+    atr = calculate_atr(candles)
+
+    return {
+        "timeframe": "H2",
+        "direction": trend["direction"],
+        "trend": trend,
+        "structure": structure,
+        "atr": atr,
+        "candles_count": len(candles),
+    }
+
+
+def analyze_h1_entry_context(
+    h1_candles: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Prépare les données H1 pour affiner la zone d'entrée."""
+    candles = validate_candle_series(
+        h1_candles,
+        minimum_count=TIMEFRAME_REQUIREMENTS["H1"],
+    )
+
+    atr = calculate_atr(candles)
+    trend = determine_market_trend(candles)
+    structure = detect_market_structure(candles)
+
+    supports = find_supports(
+        candles,
+        atr=atr,
+    )
+
+    resistances = find_resistances(
+        candles,
+        atr=atr,
+    )
+
+    trendlines = detect_trendlines(
+        candles,
+        atr=atr,
+    )
+
+    return {
+        "timeframe": "H1",
+        "atr": atr,
+        "trend": trend,
+        "structure": structure,
+        "supports": supports,
+        "resistances": resistances,
+        "trendlines": trendlines,
+        "candles_count": len(candles),
+    }
+
+
+def check_timeframe_alignment(
+    d1_analysis: Dict[str, Any],
+    h4_analysis: Dict[str, Any],
+    h2_analysis: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Vérifie l'accord entre Daily, H4 et H2."""
+    d1_direction = d1_analysis.get(
+        "direction",
+        "NEUTRAL",
+    )
+
+    h4_direction = h4_analysis.get(
+        "structure",
+        {},
+    ).get(
+        "direction",
+        "RANGE",
+    )
+
+    h2_direction = h2_analysis.get(
+        "direction",
+        "NEUTRAL",
+    )
+
+    if d1_direction == "BULLISH":
+        expected = "BUY"
+        h4_aligned = h4_direction == "BULLISH"
+        h2_aligned = h2_direction == "BULLISH"
+
+    elif d1_direction == "BEARISH":
+        expected = "SELL"
+        h4_aligned = h4_direction == "BEARISH"
+        h2_aligned = h2_direction == "BEARISH"
+
+    else:
+        return {
+            "aligned": False,
+            "direction": None,
+            "score": 0,
+            "reasons": [
+                "La direction D1 n'est pas suffisamment claire."
+            ],
+        }
+
+    score = 1
+    reasons = [
+        f"Direction générale D1 : {d1_direction}.",
+    ]
+
+    if h4_aligned:
+        score += 1
+        reasons.append(
+            "La structure H4 est alignée."
+        )
+    else:
+        reasons.append(
+            "La structure H4 n'est pas alignée."
+        )
+
+    if h2_aligned:
+        score += 1
+        reasons.append(
+            "La tendance H2 est alignée."
+        )
+    else:
+        reasons.append(
+            "La tendance H2 n'est pas alignée."
+        )
+
+    return {
+        "aligned": h4_aligned and h2_aligned,
+        "direction": expected,
+        "score": score,
+        "reasons": reasons,
+    }
+
+
+def detect_bos(
+    candles: List[Dict[str, Any]],
+    radius: int = 2,
+) -> Dict[str, Any]:
+    """Détecte une éventuelle cassure de structure."""
+    normalized = validate_candle_series(
+        candles,
+        minimum_count=max(
+            MIN_CANDLE_COUNT,
+            (radius * 2) + 1,
+        ),
+    )
+
+    highs = find_pivot_highs(
+        normalized,
+        radius=radius,
+    )
+
+    lows = find_pivot_lows(
+        normalized,
+        radius=radius,
+    )
+
+    last_close = normalized[-1]["close"]
+
+    bullish_bos = False
+    bearish_bos = False
+    broken_level = None
+
+    if highs:
+        latest_high = highs[-1]
+
+        if (
+            last_close > latest_high["price"]
+            and normalized[-2]["close"]
+            <= latest_high["price"]
+        ):
+            bullish_bos = True
+            broken_level = latest_high["price"]
+
+    if lows:
+        latest_low = lows[-1]
+
+        if (
+            last_close < latest_low["price"]
+            and normalized[-2]["close"]
+            >= latest_low["price"]
+        ):
+            bearish_bos = True
+            broken_level = latest_low["price"]
+
+    if bullish_bos and not bearish_bos:
+        direction = "BULLISH"
+    elif bearish_bos and not bullish_bos:
+        direction = "BEARISH"
+    else:
+        direction = "NONE"
+
+    return {
+        "detected": direction != "NONE",
+        "direction": direction,
+        "broken_level": broken_level,
+        "last_close": last_close,
+    }
+
+
+def detect_displacement(
+    candles: List[Dict[str, Any]],
+    atr: Optional[float] = None,
+    minimum_body_ratio: float = 0.55,
+    minimum_range_atr: float = 0.80,
+) -> Dict[str, Any]:
+    """Détecte une bougie impulsive relativement à l'ATR."""
+    normalized = validate_candle_series(
+        candles,
+        minimum_count=ATR_PERIOD + 1,
+    )
+
+    if atr is None:
+        atr = calculate_atr(normalized)
+
+    atr = _finite_number(atr, "ATR")
+
+    if atr <= 0:
+        raise StrategyError(
+            "ATR invalide pour détecter le displacement."
+        )
+
+    candle = normalized[-1]
+
+    candle_range = (
+        candle["high"] - candle["low"]
+    )
+
+    body_ratio = candle_body_ratio(candle)
+
+    if candle_range <= 0:
+        return {
+            "detected": False,
+            "direction": "NONE",
+            "range": candle_range,
+            "body_ratio": body_ratio,
+            "range_atr": 0.0,
+        }
+
+    range_atr = candle_range / atr
+
+    detected = (
+        body_ratio >= minimum_body_ratio
+        and range_atr >= minimum_range_atr
+    )
+
+    direction = (
+        candle_direction(candle)
+        if detected
+        else "NONE"
+    )
+
+    if direction == "DOJI":
+        direction = "NONE"
+        detected = False
+
+    return {
+        "detected": detected,
+        "direction": direction,
+        "range": candle_range,
+        "body_ratio": body_ratio,
+        "range_atr": range_atr,
+        "candle": candle,
+}
+def detect_order_blocks(
+    candles: List[Dict[str, Any]],
+    lookback: int = 40,
+    search_back: int = 5,
+    atr: Optional[float] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Recherche les Order Blocks potentiels avant un déplacement.
+
+    Un Order Block reste une zone candidate : sa présence seule
+    ne constitue pas un signal d'entrée.
+    """
+    normalized = validate_candle_series(
+        candles,
+        minimum_count=max(
+            MIN_CANDLE_COUNT,
+            search_back + 2,
+        ),
+    )
+
+    if lookback < 1 or search_back < 1:
+        raise StrategyError(
+            "Les paramètres de recherche des Order Blocks "
+            "doivent être positifs."
+        )
+
+    if atr is None:
+        atr = calculate_atr(normalized)
+
+    atr = _finite_number(
+        atr,
+        "ATR",
+    )
+
+    if atr <= 0:
+        raise StrategyError(
+            "L'ATR doit être positif."
+        )
+
+    start_index = max(
+        1,
+        len(normalized) - lookback,
+    )
+
+    order_blocks = []
+
+    for displacement_index in range(
+        start_index,
+        len(normalized),
+    ):
+        displacement_candle = normalized[
+            displacement_index
+        ]
+
+        candle_range = (
+            displacement_candle["high"]
+            - displacement_candle["low"]
+        )
 
         if candle_range <= 0:
             continue
 
-        body = abs(close_price - open_price)
-        body_ratio = body / candle_range
+        body_ratio = candle_body_ratio(
+            displacement_candle
+        )
 
-        if body_ratio < MIN_BODY_RATIO:
+        if (
+            body_ratio < 0.55
+            or candle_range < atr * 0.80
+        ):
             continue
 
-        if body < atr * MIN_DISPLACEMENT_ATR:
+        displacement_direction = candle_direction(
+            displacement_candle
+        )
+
+        if displacement_direction == "DOJI":
             continue
 
-        if direction == "BUY" and close_price > open_price:
-            return True
+        search_start = max(
+            0,
+            displacement_index - search_back,
+        )
 
-        if direction == "SELL" and close_price < open_price:
-            return True
+        candidate_index = None
 
-    return False
-    # ============================================================
-# VERIFICATION DE LA CONFLUENCE MULTI-TIMEFRAME
-# ============================================================
+        for index in range(
+            displacement_index - 1,
+            search_start - 1,
+            -1,
+        ):
+            previous_candle = normalized[index]
+            previous_direction = candle_direction(
+                previous_candle
+            )
 
-def _timeframe_direction(
-    candles: list,
-    timeframe: str,
-) -> Optional[str]:
-    """Determine la direction generale d'une unite de temps."""
+            if (
+                displacement_direction == "BULLISH"
+                and previous_direction == "BEARISH"
+            ):
+                candidate_index = index
+                break
 
-    normalized = _normalise_candles(candles, timeframe)
+            if (
+                displacement_direction == "BEARISH"
+                and previous_direction == "BULLISH"
+            ):
+                candidate_index = index
+                break
 
-    if len(normalized) < MIN_CANDLES.get(timeframe, 200):
+        if candidate_index is None:
+            continue
+
+        block = normalized[candidate_index]
+
+        if displacement_direction == "BULLISH":
+            block_type = "BULLISH"
+        else:
+            block_type = "BEARISH"
+
+        order_blocks.append(
+            {
+                "type": block_type,
+                "index": candidate_index,
+                "epoch": block["epoch"],
+                "open": block["open"],
+                "high": block["high"],
+                "low": block["low"],
+                "close": block["close"],
+                "zone_lower": block["low"],
+                "zone_upper": block["high"],
+                "displacement_index": displacement_index,
+                "displacement_epoch": (
+                    displacement_candle["epoch"]
+                ),
+                "displacement_range_atr": (
+                    candle_range / atr
+                ),
+                "body_ratio": body_ratio,
+                "entry_reference": block["open"],
+                "status": "CANDIDATE",
+            }
+        )
+
+    unique_blocks = []
+    seen = set()
+
+    for block in sorted(
+        order_blocks,
+        key=lambda item: item["displacement_index"],
+    ):
+        key = (
+            block["type"],
+            block["index"],
+        )
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        unique_blocks.append(block)
+
+    return unique_blocks
+
+
+def is_price_inside_order_block(
+    current_price: float,
+    order_block: Dict[str, Any],
+) -> bool:
+    """Vérifie si le prix se trouve dans un Order Block."""
+    current_price = _finite_number(
+        current_price,
+        "current_price",
+    )
+
+    lower = _finite_number(
+        order_block["zone_lower"],
+        "zone_lower",
+    )
+
+    upper = _finite_number(
+        order_block["zone_upper"],
+        "zone_upper",
+    )
+
+    if lower > upper:
+        raise StrategyError(
+            "Les limites de l'Order Block sont inversées."
+        )
+
+    return lower <= current_price <= upper
+
+
+def is_price_near_order_block(
+    current_price: float,
+    order_block: Dict[str, Any],
+    atr: float,
+    maximum_distance_atr: float = MAX_PRICE_DISTANCE_ATR,
+) -> bool:
+    """Vérifie si le prix approche d'un Order Block."""
+    current_price = _finite_number(
+        current_price,
+        "current_price",
+    )
+
+    atr = _finite_number(
+        atr,
+        "ATR",
+    )
+
+    maximum_distance_atr = _finite_number(
+        maximum_distance_atr,
+        "maximum_distance_atr",
+    )
+
+    if atr <= 0 or maximum_distance_atr < 0:
+        return False
+
+    lower = _finite_number(
+        order_block["zone_lower"],
+        "zone_lower",
+    )
+
+    upper = _finite_number(
+        order_block["zone_upper"],
+        "zone_upper",
+    )
+
+    if lower > upper:
+        return False
+
+    if lower <= current_price <= upper:
+        return True
+
+    if current_price < lower:
+        distance = lower - current_price
+    else:
+        distance = current_price - upper
+
+    return distance <= (
+        atr * maximum_distance_atr
+    )
+
+
+def filter_order_blocks_by_direction(
+    order_blocks: List[Dict[str, Any]],
+    direction: str,
+) -> List[Dict[str, Any]]:
+    """Conserve les Order Blocks compatibles avec la direction."""
+    if direction == "BUY":
+        expected_type = "BULLISH"
+    elif direction == "SELL":
+        expected_type = "BEARISH"
+    else:
+        raise StrategyError(
+            "Direction invalide pour filtrer les Order Blocks."
+        )
+
+    return [
+        block
+        for block in order_blocks
+        if block.get("type") == expected_type
+    ]
+
+
+def select_nearest_order_block(
+    current_price: float,
+    order_blocks: List[Dict[str, Any]],
+    direction: str,
+    atr: float,
+    maximum_distance_atr: float = MAX_PRICE_DISTANCE_ATR,
+) -> Optional[Dict[str, Any]]:
+    """Sélectionne l'Order Block compatible le plus proche."""
+    current_price = _finite_number(
+        current_price,
+        "current_price",
+    )
+
+    atr = _finite_number(
+        atr,
+        "ATR",
+    )
+
+    if current_price <= 0 or atr <= 0:
         return None
 
-    atr = _calculate_atr(normalized)
+    candidates = filter_order_blocks_by_direction(
+        order_blocks,
+        direction,
+    )
 
-    if atr is None or atr <= 0:
+    nearby = [
+        block
+        for block in candidates
+        if is_price_near_order_block(
+            current_price=current_price,
+            order_block=block,
+            atr=atr,
+            maximum_distance_atr=maximum_distance_atr,
+        )
+    ]
+
+    if not nearby:
         return None
 
-    recent = normalized[-20:]
-    first_close = _number(recent[0].get("close"))
-    last_close = _number(recent[-1].get("close"))
+    def distance_to_block(
+        block: Dict[str, Any],
+    ) -> float:
+        return level_distance(
+            current_price,
+            {
+                "lower": block["zone_lower"],
+                "upper": block["zone_upper"],
+            },
+        )
 
-    if first_close is None or last_close is None:
-        return None
+    nearby.sort(
+        key=distance_to_block
+    )
 
-    movement = last_close - first_close
+    return nearby[0]
 
-    if movement >= atr * 0.5:
-        return "BUY"
 
-    if movement <= -atr * 0.5:
-        return "SELL"
+def detect_order_block_retest(
+    candles: List[Dict[str, Any]],
+    order_block: Dict[str, Any],
+    direction: str,
+) -> Dict[str, Any]:
+    """Analyse si les dernières bougies revisitent un Order Block."""
+    normalized = validate_candle_series(
+        candles,
+        minimum_count=3,
+    )
+
+    if direction not in ("BUY", "SELL"):
+        raise StrategyError(
+            "Direction invalide pour le retest."
+        )
+
+    lower = _finite_number(
+        order_block["zone_lower"],
+        "zone_lower",
+    )
+
+    upper = _finite_number(
+        order_block["zone_upper"],
+        "zone_upper",
+    )
+
+    last_candle = normalized[-1]
+
+    overlaps = (
+        last_candle["low"] <= upper
+        and last_candle["high"] >= lower
+    )
+
+    if direction == "BUY":
+        reaction = (
+            overlaps
+            and last_candle["close"] > last_candle["open"]
+        )
+    else:
+        reaction = (
+            overlaps
+            and last_candle["close"] < last_candle["open"]
+        )
+
+    return {
+        "retested": overlaps,
+        "reaction_detected": reaction,
+        "direction": direction,
+        "last_close": last_candle["close"],
+        "zone_lower": lower,
+        "zone_upper": upper,
+    }
+
+
+def summarize_order_block(
+    order_block: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Prépare les informations essentielles d'un Order Block."""
+    return {
+        "type": order_block.get("type"),
+        "zone_lower": order_block.get("zone_lower"),
+        "zone_upper": order_block.get("zone_upper"),
+        "entry_reference": order_block.get("entry_reference"),
+        "displacement_range_atr": (
+            order_block.get("displacement_range_atr")
+        ),
+        "status": order_block.get(
+            "status",
+            "CANDIDATE",
+        ),
+}
+def detect_liquidity_sweep(
+    candles: List[Dict[str, Any]],
+    radius: int = 2,
+    lookback: int = 20,
+) -> Dict[str, Any]:
+    """Détecte un balayage potentiel des sommets ou des creux."""
+    normalized = validate_candle_series(
+        candles,
+        minimum_count=max(
+            MIN_CANDLE_COUNT,
+            lookback + 1,
+            (radius * 2) + 1,
+        ),
+    )
+
+    if radius < 1 or lookback < 2:
+        raise StrategyError(
+            "Paramètres invalides pour le balayage de liquidité."
+        )
+
+    current = normalized[-1]
+
+    historical = normalized[
+        -(lookback + 1):-1
+    ]
+
+    if not historical:
+        return {
+            "detected": False,
+            "direction": "NONE",
+            "level": None,
+        }
+
+    previous_high = max(
+        candle["high"]
+        for candle in historical
+    )
+
+    previous_low = min(
+        candle["low"]
+        for candle in historical
+    )
+
+    swept_high = (
+        current["high"] > previous_high
+        and current["close"] < previous_high
+    )
+
+    swept_low = (
+        current["low"] < previous_low
+        and current["close"] > previous_low
+    )
+
+    if swept_low and not swept_high:
+        direction = "BUY"
+        level = previous_low
+
+    elif swept_high and not swept_low:
+        direction = "SELL"
+        level = previous_high
+
+    else:
+        direction = "NONE"
+        level = None
+
+    return {
+        "detected": direction != "NONE",
+        "direction": direction,
+        "level": level,
+        "swept_high": swept_high,
+        "swept_low": swept_low,
+        "current_high": current["high"],
+        "current_low": current["low"],
+        "current_close": current["close"],
+    }
+
+
+def detect_rejection_candle(
+    candle: Dict[str, Any],
+    direction: str,
+    minimum_wick_ratio: float = 0.40,
+) -> Dict[str, Any]:
+    """Recherche une bougie de rejet compatible avec la direction."""
+    normalized = _validate_candle(candle)
+
+    if direction not in ("BUY", "SELL"):
+        raise StrategyError(
+            "Direction invalide pour la bougie de rejet."
+        )
+
+    if not 0 <= minimum_wick_ratio <= 1:
+        raise StrategyError(
+            "Le ratio de mèche doit être compris entre 0 et 1."
+        )
+
+    candle_range = (
+        normalized["high"] - normalized["low"]
+    )
+
+    if candle_range <= 0:
+        return {
+            "detected": False,
+            "direction": direction,
+            "wick_ratio": 0.0,
+        }
+
+    if direction == "BUY":
+        wick = candle_lower_wick(normalized)
+
+        compatible_close = (
+            normalized["close"] >= normalized["open"]
+        )
+
+    else:
+        wick = candle_upper_wick(normalized)
+
+        compatible_close = (
+            normalized["close"] <= normalized["open"]
+        )
+
+    wick_ratio = wick / candle_range
+
+    detected = (
+        wick_ratio >= minimum_wick_ratio
+        and compatible_close
+    )
+
+    return {
+        "detected": detected,
+        "direction": direction,
+        "wick_ratio": wick_ratio,
+        "candle_range": candle_range,
+        "wick_size": wick,
+        "candle": normalized,
+    }
+
+
+def detect_engulfing(
+    candles: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Détecte un éventuel avalement haussier ou baissier."""
+    normalized = validate_candle_series(
+        candles,
+        minimum_count=2,
+    )
+
+    previous = normalized[-2]
+    current = normalized[-1]
+
+    previous_bullish = (
+        previous["close"] > previous["open"]
+    )
+
+    previous_bearish = (
+        previous["close"] < previous["open"]
+    )
+
+    current_bullish = (
+        current["close"] > current["open"]
+    )
+
+    current_bearish = (
+        current["close"] < current["open"]
+    )
+
+    bullish_engulfing = (
+        previous_bearish
+        and current_bullish
+        and current["open"] <= previous["close"]
+        and current["close"] >= previous["open"]
+    )
+
+    bearish_engulfing = (
+        previous_bullish
+        and current_bearish
+        and current["open"] >= previous["close"]
+        and current["close"] <= previous["open"]
+    )
+
+    if bullish_engulfing and not bearish_engulfing:
+        direction = "BUY"
+    elif bearish_engulfing and not bullish_engulfing:
+        direction = "SELL"
+    else:
+        direction = "NONE"
+
+    return {
+        "detected": direction != "NONE",
+        "direction": direction,
+        "bullish_engulfing": bullish_engulfing,
+        "bearish_engulfing": bearish_engulfing,
+    }
+
+
+def evaluate_candle_confirmation(
+    candles: List[Dict[str, Any]],
+    direction: str,
+) -> Dict[str, Any]:
+    """Combine les principaux indices de confirmation en bougies."""
+    normalized = validate_candle_series(
+        candles,
+        minimum_count=3,
+    )
+
+    if direction not in ("BUY", "SELL"):
+        raise StrategyError(
+            "Direction invalide pour la confirmation."
+        )
+
+    last_candle = normalized[-1]
+
+    rejection = detect_rejection_candle(
+        last_candle,
+        direction,
+    )
+
+    engulfing = detect_engulfing(
+        normalized[-2:],
+    )
+
+    sweep = detect_liquidity_sweep(
+        normalized,
+    )
+
+    sweep_aligned = (
+        sweep["detected"]
+        and sweep["direction"] == direction
+    )
+
+    engulfing_aligned = (
+        engulfing["detected"]
+        and engulfing["direction"] == direction
+    )
+
+    score = sum(
+        (
+            rejection["detected"],
+            engulfing_aligned,
+            sweep_aligned,
+        )
+    )
+
+    return {
+        "direction": direction,
+        "score": score,
+        "rejection": rejection,
+        "engulfing": engulfing,
+        "liquidity_sweep": sweep,
+        "confirmed": score >= 1,
+    }
+
+
+def find_recent_doji(
+    candles: List[Dict[str, Any]],
+    lookback: int = 10,
+    maximum_body_ratio: float = 0.10,
+) -> Optional[Dict[str, Any]]:
+    """Recherche le doji récent le plus proche de la fin de série."""
+    normalized = validate_candle_series(
+        candles,
+        minimum_count=max(lookback, 2),
+    )
+
+    if lookback < 1:
+        raise StrategyError(
+            "La période de recherche doit être positive."
+        )
+
+    recent = normalized[-lookback:]
+
+    for index in range(
+        len(recent) - 1,
+        -1,
+        -1,
+    ):
+        candle = recent[index]
+
+        if is_doji(
+            candle,
+            maximum_body_ratio=maximum_body_ratio,
+        ):
+            return {
+                "index": len(normalized) - lookback + index,
+                "epoch": candle["epoch"],
+                "open": candle["open"],
+                "high": candle["high"],
+                "low": candle["low"],
+                "close": candle["close"],
+                "upper_wick": candle_upper_wick(candle),
+                "lower_wick": candle_lower_wick(candle),
+                "body_ratio": candle_body_ratio(candle),
+            }
 
     return None
 
 
-def _multi_timeframe_agreement(
-    market_data: dict,
+def calculate_doji_wick_entry(
+    doji: Dict[str, Any],
     direction: str,
-) -> bool:
-    """Verifie que les grandes unites ne contredisent pas le signal."""
-
-    direction = _normalise_direction(direction)
-
-    if direction is None or not isinstance(market_data, dict):
-        return False
-
-    d1_direction = _timeframe_direction(
-        market_data.get("D1", []),
-        "D1",
-    )
-
-    h4_direction = _timeframe_direction(
-        market_data.get("H4", []),
-        "H4",
-    )
-
-    # Le Daily doit obligatoirement soutenir la direction.
-    if d1_direction != direction:
-        return False
-
-    # H4 ne doit pas contredire la direction.
-    if h4_direction is not None and h4_direction != direction:
-        return False
-
-    return True
-
-
-# ============================================================
-# VALIDATION DU PRIX D'ENTREE
-# ============================================================
-
-def _validate_entry_price(
-    current_price: float,
-    zone: dict,
-    atr: float,
-) -> bool:
-    """Verifie que le prix reste suffisamment proche de la zone."""
-
-    current_price = _positive_number(current_price)
-    atr = _positive_number(atr)
-
-    if current_price is None or atr is None:
-        return False
-
-    if not isinstance(zone, dict):
-        return False
-
-    low = _number(zone.get("low"))
-    high = _number(zone.get("high"))
-
-    if low is None or high is None or high < low:
-        return False
-
-    # Accepte un prix dans la zone ou proche de celle-ci.
-    tolerance = atr * MAX_LEVEL_DISTANCE_ATR
-
-    return low - tolerance <= current_price <= high + tolerance
-    # ============================================================
-# ANALYSE D'UN SYMBOLE
-# ============================================================
-
-def _analyze_symbol(
-    symbol: str,
-    market_data: dict,
-) -> Optional[dict]:
-    """Recherche un signal base sur supports, resistances et trendline."""
-
-    if not isinstance(symbol, str) or not symbol.strip():
-        return None
-
-    if not isinstance(market_data, dict):
-        return None
-
-    # Recuperation des donnees multi-timeframe.
-    d1_candles = _normalise_candles(
-        market_data.get("D1", []),
-        "D1",
-    )
-    h4_candles = _normalise_candles(
-        market_data.get("H4", []),
-        "H4",
-    )
-    h2_candles = _normalise_candles(
-        market_data.get("H2", []),
-        "H2",
-    )
-    h1_candles = _normalise_candles(
-        market_data.get("H1", []),
-        "H1",
-    )
-
-    # Toutes les unites de temps sont obligatoires.
-    if any(
-        len(candles) < MIN_CANDLES[timeframe]
-        for timeframe, candles in (
-            ("D1", d1_candles),
-            ("H4", h4_candles),
-            ("H2", h2_candles),
-            ("H1", h1_candles),
-        )
-    ):
-        LOGGER.info(
-            "%s : donnees insuffisantes pour l'analyse.",
-            symbol,
-        )
-        return None
-
-    current_price = _positive_number(
-        market_data.get("current_price")
-    )
-
-    if current_price is None:
-        current_price = _positive_number(
-            h1_candles[-1].get("close")
+) -> float:
+    """Propose un niveau d'entrée de référence sur la mèche du doji."""
+    if direction not in ("BUY", "SELL"):
+        raise StrategyError(
+            "Direction invalide pour l'entrée sur doji."
         )
 
-    if current_price is None:
-        return None
+    normalized = _validate_candle(doji)
 
-    # Le Daily determine le biais directionnel.
-    d1_analysis = _d1_zones(d1_candles)
+    if not is_doji(normalized):
+        raise StrategyError(
+            "La bougie fournie ne satisfait pas le critère doji."
+        )
 
-    if not isinstance(d1_analysis, dict):
-        return None
+    if direction == "BUY":
+        entry = normalized["low"]
+    else:
+        entry = normalized["high"]
 
-    direction = _normalise_direction(
-        d1_analysis.get("direction")
+    if entry <= 0:
+        raise StrategyError(
+            "Le niveau d'entrée du doji est invalide."
+        )
+
+    return entry
+def analyze_timeframe_consistency(
+    d1_analysis: Dict[str, Any],
+    h4_analysis: Dict[str, Any],
+    h2_analysis: Dict[str, Any],
+    h1_analysis: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Vérifie la cohérence entre D1, H4, H2 et H1.
+    D1 définit le contexte principal.
+    H4 définit la structure.
+    H2 vérifie l'alignement.
+    H1 affine la zone d'entrée.
+    """
+    d1_direction = d1_analysis.get("direction", "NEUTRAL")
+    h4_direction = h4_analysis.get("structure", {}).get(
+        "direction", "RANGE"
     )
+    h2_direction = h2_analysis.get("direction", "NEUTRAL")
+    h1_direction = h1_analysis.get("direction", "NEUTRAL")
 
-    if direction is None:
-        return None
-
-    # Le prix doit rester dans une zone technique exploitable.
-    d1_atr = _positive_number(d1_analysis.get("atr"))
-
-    if d1_atr is None:
-        return None
-
-    d1_levels = d1_analysis.get("levels", {})
-
-    if not isinstance(d1_levels, dict):
-        return None
-
-    # Verification du contexte H4.
-    if not _multi_timeframe_agreement(
-        {
-            "D1": d1_candles,
-            "H4": h4_candles,
-        },
-        direction,
-    ):
-        return None
-
-    # Calcul des niveaux techniques sur H4.
-    h4_atr = _calculate_atr(h4_candles)
-
-    if h4_atr is None or h4_atr <= 0:
-        return None
-
-    h4_levels = _find_horizontal_levels(
-        h4_candles,
-        h4_atr,
-    )
-
-    if not isinstance(h4_levels, dict):
-        return None
-
-    # Les prochaines parties completeront la selection
-    # de la zone, la trendline et la validation du signal.
-    return {
-        "symbol": symbol,
-        "direction": direction,
-        "current_price": current_price,
-        "d1_analysis": d1_analysis,
-        "d1_levels": d1_levels,
-        "h4_levels": h4_levels,
-        "h4_atr": h4_atr,
-        "d1_candles": d1_candles,
-        "h4_candles": h4_candles,
-        "h2_candles": h2_candles,
-        "h1_candles": h1_candles,
+    directions = {
+        "D1": d1_direction,
+        "H4": h4_direction,
+        "H2": h2_direction,
+        "H1": h1_direction,
     }
-    # ============================================================
-# SELECTION DE LA ZONE TECHNIQUE
-# ============================================================
 
-def _select_candidate_zone(
-    direction: str,
-    current_price: float,
-    levels: dict,
-    atr: float,
-) -> Optional[dict]:
-    """Selectionne le niveau horizontal le plus proche du prix."""
+    bullish_votes = sum(
+        1 for value in directions.values()
+        if value in ("BULLISH", "BUY")
+    )
+    bearish_votes = sum(
+        1 for value in directions.values()
+        if value in ("BEARISH", "SELL")
+    )
 
-    direction = _normalise_direction(direction)
-    current_price = _positive_number(current_price)
-    atr = _positive_number(atr)
-
-    if (
-        direction is None
-        or current_price is None
-        or atr is None
-        or not isinstance(levels, dict)
-    ):
-        return None
-
-    if direction == "BUY":
-        candidates = levels.get("supports", [])
-        expected_type = "support"
+    if bullish_votes >= 3 and d1_direction in ("BULLISH", "BUY"):
+        overall_direction = "BUY"
+    elif bearish_votes >= 3 and d1_direction in ("BEARISH", "SELL"):
+        overall_direction = "SELL"
     else:
-        candidates = levels.get("resistances", [])
-        expected_type = "resistance"
-
-    if not isinstance(candidates, list):
-        return None
-
-    valid_zones = []
-
-    for level in candidates:
-        if not isinstance(level, dict):
-            continue
-
-        price = _positive_number(level.get("price"))
-
-        if price is None:
-            continue
-
-        distance = abs(current_price - price)
-
-        if distance > atr * MAX_LEVEL_DISTANCE_ATR:
-            continue
-
-        valid_zones.append({
-            "type": expected_type,
-            "low": _number(level.get("low"))
-            if _number(level.get("low")) is not None
-            else price,
-            "high": _number(level.get("high"))
-            if _number(level.get("high")) is not None
-            else price,
-            "price": price,
-            "touches": int(
-                _safe_float(level.get("touches"), 0)
-            ),
-            "distance": distance,
-        })
-
-    if not valid_zones:
-        return None
-
-    # Priorite au niveau le plus proche du prix actuel.
-    valid_zones.sort(
-        key=lambda item: (
-            item["distance"],
-            -item["touches"],
-        )
-    )
-
-    return valid_zones[0]
-
-
-# ============================================================
-# VERIFICATION DE LA QUALITE DE LA ZONE
-# ============================================================
-
-def _validate_candidate_zone(
-    zone: dict,
-    current_price: float,
-    direction: str,
-) -> bool:
-    """Rejette les zones incoherentes avec le sens du trade."""
-
-    if not isinstance(zone, dict):
-        return False
-
-    direction = _normalise_direction(direction)
-    current_price = _positive_number(current_price)
-    low = _number(zone.get("low"))
-    high = _number(zone.get("high"))
-    level_price = _number(zone.get("price"))
-
-    if (
-        direction is None
-        or current_price is None
-        or low is None
-        or high is None
-        or level_price is None
-    ):
-        return False
-
-    if high < low:
-        return False
-
-    if not low <= level_price <= high:
-        return False
-
-    if direction == "BUY":
-        # Un support doit etre situe sous le prix ou
-        # pouvoir etre teste depuis sa zone superieure.
-        if level_price > current_price:
-            return False
-    else:
-        # Une resistance doit etre situee au-dessus du prix
-        # ou pouvoir etre testee depuis sa zone inferieure.
-        if level_price < current_price:
-            return False
-
-    return True
-    # ============================================================
-# RECHERCHE DE LA CONFLUENCE SUPPORT / RESISTANCE + TRENDLINE
-# ============================================================
-
-def _build_confluence_zone(
-    analysis: dict,
-) -> Optional[dict]:
-    """Combine une zone horizontale et une trendline exploitable."""
-
-    if not isinstance(analysis, dict):
-        return None
-
-    direction = _normalise_direction(
-        analysis.get("direction")
-    )
-    current_price = _positive_number(
-        analysis.get("current_price")
-    )
-    h4_atr = _positive_number(
-        analysis.get("h4_atr")
-    )
-    h4_levels = analysis.get("h4_levels")
-    h4_candles = analysis.get("h4_candles")
-
-    if (
-        direction is None
-        or current_price is None
-        or h4_atr is None
-        or not isinstance(h4_levels, dict)
-        or not isinstance(h4_candles, list)
-    ):
-        return None
-
-    # Selection du support pour un achat ou de la resistance
-    # pour une vente.
-    zone = _select_candidate_zone(
-        direction,
-        current_price,
-        h4_levels,
-        h4_atr,
-    )
-
-    if zone is None:
-        return None
-
-    if not _validate_candidate_zone(
-        zone,
-        current_price,
-        direction,
-    ):
-        return None
-
-    # La trendline doit avoir au moins trois contacts.
-    trendline = _trendline_for_direction(
-        h4_candles,
-        direction,
-        h4_atr,
-    )
-
-    if not isinstance(trendline, dict):
-        LOGGER.debug(
-            "%s : trendline insuffisante pour %s.",
-            analysis.get("symbol", "UNKNOWN"),
-            direction,
-        )
-        return None
-
-    if not _trendline_near_zone(
-        trendline,
-        zone,
-        h4_atr,
-    ):
-        return None
-
-    # La zone doit egalement etre proche du prix actuel.
-    if not _price_near_zone(
-        current_price,
-        zone,
-        h4_atr,
-    ):
-        return None
-
-    zone["trendline_value"] = _number(
-        trendline.get("value")
-    )
-    zone["trendline_contacts"] = int(
-        _safe_float(trendline.get("contacts"), 0)
-    )
-    zone["confluence"] = True
-
-    return zone
-
-
-# ============================================================
-# VALIDATION DE LA REACTION DU PRIX
-# ============================================================
-
-def _validate_price_reaction(
-    candles: list,
-    direction: str,
-    zone: dict,
-) -> bool:
-    """Verifie si les bougies recentes montrent une reaction exploitable."""
-
-    direction = _normalise_direction(direction)
-
-    if (
-        direction is None
-        or not isinstance(candles, list)
-        or not candles
-        or not isinstance(zone, dict)
-    ):
-        return False
-
-    low = _number(zone.get("low"))
-    high = _number(zone.get("high"))
-
-    if low is None or high is None or high < low:
-        return False
-
-    # Examiner les trois dernieres bougies disponibles.
-    for candle in candles[-3:]:
-        candle_low = _number(candle.get("low"))
-        candle_high = _number(candle.get("high"))
-        open_price = _number(candle.get("open"))
-        close_price = _number(candle.get("close"))
-
-        if any(
-            value is None
-            for value in (
-                candle_low,
-                candle_high,
-                open_price,
-                close_price,
-            )
-        ):
-            continue
-
-        # La bougie doit avoir touche ou traverse la zone.
-        touched_zone = (
-            candle_low <= high
-            and candle_high >= low
-        )
-
-        if not touched_zone:
-            continue
-
-        # Une reaction haussiere pour BUY.
-        if direction == "BUY" and close_price > open_price:
-            return True
-
-        # Une reaction baissiere pour SELL.
-        if direction == "SELL" and close_price < open_price:
-            return True
-
-    return False
-    # ============================================================
-# GENERATION DU SIGNAL
-# ============================================================
-
-def _generate_signal(
-    symbol: str,
-    analysis: dict,
-) -> Optional[dict]:
-    """Construit un signal a partir des confluences detectees."""
-
-    if not isinstance(analysis, dict):
-        return None
-
-    direction = _normalise_direction(
-        analysis.get("direction")
-    )
-
-    current_price = _positive_number(
-        analysis.get("current_price")
-    )
-
-    h4_atr = _positive_number(
-        analysis.get("h4_atr")
-    )
-
-    h4_levels = analysis.get("h4_levels")
-    h4_candles = analysis.get("h4_candles")
-
-    if (
-        direction is None
-        or current_price is None
-        or h4_atr is None
-        or not isinstance(h4_levels, dict)
-        or not isinstance(h4_candles, list)
-    ):
-        return None
-
-    # Rechercher la confluence entre niveau horizontal
-    # et trendline.
-    zone = _build_confluence_zone(analysis)
-
-    if zone is None:
-        return None
-
-    # Le prix doit rester proche de la zone d'entree.
-    if not _validate_entry_price(
-        current_price,
-        zone,
-        h4_atr,
-    ):
-        return None
-
-    # La reaction recente est une confluence supplementaire.
-    # Elle n'est pas obligatoire pour conserver une entree
-    # anticipative.
-    reaction_confirmed = _validate_price_reaction(
-        h4_candles,
-        direction,
-        zone,
-    )
-
-    # Chercher un niveau horizontal exploitable pour le TP.
-    trade = _calculate_trade(
-        direction,
-        current_price,
-        zone,
-        h4_atr,
-        h4_levels,
-    )
-
-    if trade is None:
-        return None
-
-    # Controle supplementaire du biais Daily.
-    d1_analysis = analysis.get("d1_analysis", {})
-
-    if not _direction_valid(direction, d1_analysis):
-        return None
-
-    # Identifiant stable pour faciliter la detection
-    # des doublons dans le programme appelant.
-    identity = "|".join([
-        SIGNAL_VERSION,
-        symbol,
-        direction,
-        f"{trade['entry']:.8f}",
-        f"{trade['stop_loss']:.8f}",
-        f"{trade['take_profit']:.8f}",
-    ])
-
-    signal_id = hashlib.sha256(
-        identity.encode("utf-8")
-    ).hexdigest()[:20]
+        overall_direction = "NEUTRAL"
 
     return {
-        "signal_id": signal_id,
-        "strategy": SIGNAL_VERSION,
-        "symbol": symbol,
-        "symbol_name": SYMBOL_NAMES.get(
-            symbol,
-            symbol,
-        ),
-        "direction": direction,
-        "entry": trade["entry"],
-        "stop_loss": trade["stop_loss"],
-        "take_profit": trade["take_profit"],
-        "risk_reward": trade["rr"],
-        "rr": trade["rr"],
-        "zone": trade["zone"],
-        "trendline_contacts": zone.get(
-            "trendline_contacts",
-            0,
-        ),
-        "reaction_confirmed": reaction_confirmed,
-        "current_price": current_price,
-        "timeframes": ["D1", "H4", "H2", "H1"],
-        "automatic_execution": False,
-        "dry_run": True,
-            }
-    # ============================================================
-# FONCTION PUBLIQUE : RECHERCHE DES SIGNAUX
-# ============================================================
+        "direction": overall_direction,
+        "timeframes": directions,
+        "bullish_votes": bullish_votes,
+        "bearish_votes": bearish_votes,
+        "aligned": overall_direction != "NEUTRAL",
+    }
 
-def find_signals(
-    symbol: str,
-    market_data: dict,
-) -> list:
+
+def get_directional_levels(
+    direction: str,
+    supports: List[Dict[str, Any]],
+    resistances: List[Dict[str, Any]],
+    current_price: float,
+) -> Dict[str, Optional[Dict[str, Any]]]:
     """
-    Analyse un symbole et retourne les signaux exploitables.
-
-    Cette fonction est appelee par scheduled_analysis.py.
-    Elle ne passe aucun ordre sur le compte Deriv.
+    Sélectionne les niveaux techniques situés du bon côté du prix.
+    BUY : support sous le prix et résistance au-dessus.
+    SELL : résistance au-dessus du prix et support en dessous.
     """
+    if not _finite_number(current_price):
+        return {
+            "entry_level": None,
+            "target_level": None,
+            "opposite_level": None,
+        }
 
-    if not isinstance(symbol, str) or not symbol.strip():
-        LOGGER.warning("Symbole invalide : %r", symbol)
-        return []
+    valid_supports = [
+        level for level in supports
+        if isinstance(level, dict)
+        and _finite_number(level.get("price"))
+    ]
 
-    if not isinstance(market_data, dict):
-        LOGGER.warning(
-            "%s : donnees de marche invalides.",
-            symbol,
+    valid_resistances = [
+        level for level in resistances
+        if isinstance(level, dict)
+        and _finite_number(level.get("price"))
+    ]
+
+    supports_below = [
+        level for level in valid_supports
+        if float(level["price"]) <= current_price
+    ]
+
+    resistances_above = [
+        level for level in valid_resistances
+        if float(level["price"]) >= current_price
+    ]
+
+    nearest_support = (
+        min(
+            supports_below,
+            key=lambda item: current_price - float(item["price"]),
         )
-        return []
+        if supports_below else None
+    )
+
+    nearest_resistance = (
+        min(
+            resistances_above,
+            key=lambda item: float(item["price"]) - current_price,
+        )
+        if resistances_above else None
+    )
+
+    if direction == "BUY":
+        return {
+            "entry_level": nearest_support,
+            "target_level": nearest_resistance,
+            "opposite_level": nearest_resistance,
+        }
+
+    if direction == "SELL":
+        return {
+            "entry_level": nearest_resistance,
+            "target_level": nearest_support,
+            "opposite_level": nearest_support,
+        }
+
+    return {
+        "entry_level": None,
+        "target_level": None,
+        "opposite_level": None,
+    }
+
+
+def calculate_zone_width(
+    atr: float,
+    tolerance: float = ZONE_ATR_TOLERANCE,
+) -> float:
+    """Calcule une largeur de zone adaptée à la volatilité."""
+    if not _finite_number(atr) or atr <= 0:
+        return 0.0
+
+    if not _finite_number(tolerance) or tolerance <= 0:
+        return 0.0
+
+    return float(atr) * float(tolerance)
+
+
+def price_is_inside_range(
+    price: float,
+    lower_bound: float,
+    upper_bound: float,
+) -> bool:
+    """Indique si le prix appartient à une zone définie."""
+    if not all(
+        _finite_number(value)
+        for value in (price, lower_bound, upper_bound)
+    ):
+        return False
+
+    lower = min(float(lower_bound), float(upper_bound))
+    upper = max(float(lower_bound), float(upper_bound))
+
+    return lower <= float(price) <= upper
+
+
+def distance_to_range(
+    price: float,
+    lower_bound: float,
+    upper_bound: float,
+) -> float:
+    """Retourne la distance du prix à une zone."""
+    if not all(
+        _finite_number(value)
+        for value in (price, lower_bound, upper_bound)
+    ):
+        return float("inf")
+
+    lower = min(float(lower_bound), float(upper_bound))
+    upper = max(float(lower_bound), float(upper_bound))
+    current = float(price)
+
+    if lower <= current <= upper:
+        return 0.0
+
+    if current < lower:
+        return lower - current
+
+    return current - upper
+
+
+def validate_market_snapshot(
+    snapshot: Dict[str, Any],
+) -> Tuple[bool, List[str]]:
+    """
+    Vérifie qu'un instantané de marché contient les données
+    nécessaires avant toute analyse.
+    """
+    errors = []
+
+    if not isinstance(snapshot, dict):
+        return False, ["L'instantané de marché doit être un dictionnaire."]
+
+    if not _finite_number(snapshot.get("current_price")):
+        errors.append("Prix actuel absent ou invalide.")
+
+    timeframe_data = snapshot.get("timeframes")
+
+    if not isinstance(timeframe_data, dict):
+        errors.append("Données des unités de temps absentes.")
+        return False, errors
+
+    for timeframe, required_count in TIMEFRAME_REQUIREMENTS.items():
+        candles = timeframe_data.get(timeframe)
+
+        if not isinstance(candles, list):
+            errors.append(
+                f"{timeframe} : données de bougies absentes."
+            )
+            continue
+
+        if len(candles) < required_count:
+            errors.append(
+                f"{timeframe} : {len(candles)} bougies reçues, "
+                f"{required_count} nécessaires."
+            )
+            continue
+
+        try:
+            validate_candle_series(
+                candles,
+                minimum_count=required_count,
+            )
+        except (ValueError, TypeError, KeyError) as exc:
+            errors.append(f"{timeframe} : données invalides ({exc}).")
+
+    return len(errors) == 0, errors
+
+
+def normalize_signal_direction(direction: Any) -> str:
+    """Normalise les différentes formes de direction."""
+    if not isinstance(direction, str):
+        return "NEUTRAL"
+
+    value = direction.strip().upper()
+
+    if value in ("BUY", "BULLISH", "LONG", "HAUSSIER"):
+        return "BUY"
+
+    if value in ("SELL", "BEARISH", "SHORT", "BAISSIER"):
+        return "SELL"
+
+    return "NEUTRAL"
+
+
+def safe_float(
+    value: Any,
+    default: Optional[float] = None,
+) -> Optional[float]:
+    """Convertit une valeur en nombre sans propager d'exception."""
+    try:
+        result = float(value)
+
+        if math.isfinite(result):
+            return result
+
+    except (TypeError, ValueError, OverflowError):
+        pass
+
+    return default
+
+
+def build_analysis_error(
+    symbol: str,
+    reason: str,
+    details: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Construit une réponse standard lorsqu'une analyse échoue."""
+    return {
+        "symbol": symbol,
+        "symbol_name": get_symbol_name(symbol),
+        "status": "ERROR",
+        "signal": None,
+        "direction": "NEUTRAL",
+        "reason": str(reason),
+        "details": details or [],
+    }
+
+
+def build_no_signal_result(
+    symbol: str,
+    reason: str,
+    current_price: Optional[float] = None,
+    details: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Construit un résultat valide lorsqu'aucune entrée n'est retenue."""
+    return {
+        "symbol": symbol,
+        "symbol_name": get_symbol_name(symbol),
+        "status": "NO_SIGNAL",
+        "signal": None,
+        "direction": "NEUTRAL",
+        "current_price": safe_float(current_price),
+        "reason": str(reason),
+        "details": details or {},
+            }
+def analyze_symbol(
+    symbol: str,
+    snapshot: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Analyse complète d'un indice.
+
+    Principes :
+    - D1 : contexte directionnel.
+    - H4 : structure, supports, résistances et trendlines.
+    - H2 : filtre de confirmation.
+    - H1 : précision de l'entrée.
+    - Entrée anticipée sur une confluence technique.
+    - Aucun ordre n'est exécuté par cette fonction.
+    """
+    symbol = str(symbol).strip()
+
+    valid, errors = validate_market_snapshot(snapshot)
+
+    if not valid:
+        return build_analysis_error(
+            symbol,
+            "Instantané de marché incomplet ou invalide.",
+            errors,
+        )
+
+    current_price = safe_float(snapshot.get("current_price"))
+
+    if current_price is None or current_price <= 0:
+        return build_analysis_error(
+            symbol,
+            "Le prix actuel est invalide.",
+        )
+
+    timeframe_data = snapshot["timeframes"]
 
     try:
-        analysis = _analyze_symbol(
-            symbol.strip(),
-            market_data,
-        )
+        d1_candles = timeframe_data["D1"]
+        h4_candles = timeframe_data["H4"]
+        h2_candles = timeframe_data["H2"]
+        h1_candles = timeframe_data["H1"]
 
-        if analysis is None:
-            LOGGER.info(
-                "%s : aucune configuration exploitable.",
-                symbol,
-            )
-            return []
+        d1_analysis = analyze_d1_direction(d1_candles)
+        h4_analysis = analyze_h4_structure(h4_candles)
+        h2_analysis = analyze_h2_confirmation(h2_candles)
+        h1_analysis = analyze_h1_entry_context(h1_candles)
 
-        signal = _generate_signal(
-            symbol.strip(),
-            analysis,
-        )
-
-        if signal is None:
-            LOGGER.info(
-                "%s : aucune confluence valide.",
-                symbol,
-            )
-            return []
-
-        LOGGER.info(
-            "%s : signal %s detecte ; RR=%.2f.",
+    except (ValueError, TypeError, KeyError, IndexError) as exc:
+        logger.exception(
+            "Erreur pendant l'analyse de %s : %s",
             symbol,
-            signal["direction"],
-            signal["rr"],
+            exc,
         )
-
-        return [signal]
-
-    except Exception:
-        LOGGER.exception(
-            "%s : erreur pendant l'analyse strategique.",
+        return build_analysis_error(
             symbol,
+            "Erreur pendant l'analyse technique.",
+            [str(exc)],
         )
+
+    consistency = analyze_timeframe_consistency(
+        d1_analysis,
+        h4_analysis,
+        h2_analysis,
+        h1_analysis,
+    )
+
+    direction = consistency["direction"]
+
+    if direction == "NEUTRAL":
+        return build_no_signal_result(
+            symbol,
+            "Les unités D1, H4, H2 et H1 ne présentent pas "
+            "un alignement directionnel suffisant.",
+            current_price,
+            {
+                "timeframe_consistency": consistency,
+                "d1": d1_analysis,
+                "h4": h4_analysis,
+                "h2": h2_analysis,
+                "h1": h1_analysis,
+            },
+        )
+
+    try:
+        h4_supports = h4_analysis.get("supports", [])
+        h4_resistances = h4_analysis.get("resistances", [])
+        h4_trendlines = h4_analysis.get("trendlines", {})
+        h4_atr = safe_float(h4_analysis.get("atr"), 0.0) or 0.0
+
+        if h4_atr <= 0:
+            return build_no_signal_result(
+                symbol,
+                "ATR H4 absent ou invalide.",
+                current_price,
+            )
+
+        h4_structure = h4_analysis.get("structure", {})
+        structure_direction = normalize_signal_direction(
+            h4_structure.get("direction", "NEUTRAL")
+        )
+
+        if structure_direction != direction:
+            return build_no_signal_result(
+                symbol,
+                "La structure H4 ne confirme pas la direction principale.",
+                current_price,
+                {
+                    "direction": direction,
+                    "h4_structure": h4_structure,
+                },
+            )
+
+        supports = find_supports(h4_candles)
+        resistances = find_resistances(h4_candles)
+
+        if not supports or not resistances:
+            return build_no_signal_result(
+                symbol,
+                "Niveaux H4 insuffisants pour établir une confluence.",
+                current_price,
+            )
+
+        levels = get_directional_levels(
+            direction,
+            supports,
+            resistances,
+            current_price,
+        )
+
+        trendline = get_nearest_trendline(
+            current_price,
+            h4_trendlines,
+        )
+
+        order_blocks = detect_order_blocks(
+            h4_candles,
+            lookback=40,
+            search_back=5,
+            atr=h4_atr,
+        )
+
+        directional_blocks = filter_order_blocks_by_direction(
+            order_blocks,
+            direction,
+        )
+
+    except (ValueError, TypeError, KeyError, IndexError) as exc:
+        logger.exception(
+            "Erreur de calcul technique pour %s : %s",
+            symbol,
+            exc,
+        )
+        return build_analysis_error(
+            symbol,
+            "Impossible de calculer les niveaux techniques.",
+            [str(exc)],
+        )
+
+    if not directional_blocks:
+        return build_no_signal_result(
+            symbol,
+            "Aucun Order Block exploitable dans la direction retenue.",
+            current_price,
+            {
+                "direction": direction,
+                "supports": supports,
+                "resistances": resistances,
+            },
+        )
+
+    selected_block = select_nearest_order_block(
+        directional_blocks,
+        current_price,
+    )
+
+    if not selected_block:
+        return build_no_signal_result(
+            symbol,
+            "Aucun Order Block n'a pu être sélectionné.",
+            current_price,
+        )
+
+    block_summary = summarize_order_block(selected_block)
+
+    try:
+        confluence = calculate_confluence_score(
+            current_price=current_price,
+            level=levels.get("entry_level"),
+            trendline=trendline,
+            order_block=selected_block,
+            atr=h4_atr,
+            direction=direction,
+        )
+    except TypeError:
+        # Une signature différente ne doit pas créer de faux signal.
+        return build_analysis_error(
+            symbol,
+            "La signature de calculate_confluence_score "
+            "ne correspond pas à l'appel principal.",
+        )
+
+    if not isinstance(confluence, dict):
+        return build_analysis_error(
+            symbol,
+            "Le calcul de confluence a renvoyé un résultat invalide.",
+        )
+
+    return {
+        "symbol": symbol,
+        "symbol_name": get_symbol_name(symbol),
+        "status": "ANALYZED",
+        "signal": None,
+        "direction": direction,
+        "current_price": current_price,
+        "timeframe_consistency": consistency,
+        "d1": d1_analysis,
+        "h4": h4_analysis,
+        "h2": h2_analysis,
+        "h1": h1_analysis,
+        "levels": levels,
+        "trendline": trendline,
+        "order_block": block_summary,
+        "confluence": confluence,
+        "atr_h4": h4_atr,
+        "supports": supports,
+        "resistances": resistances,
+        "reason": (
+            "Analyse technique terminée. "
+            "La validation finale de l'entrée reste à effectuer."
+        ),
+    }
+
+
+def analyze_market(
+    market_data: Dict[str, Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    Analyse les instantanés de plusieurs indices.
+
+    market_data doit être de la forme :
+    {
+        "1HZ50V": {
+            "current_price": 123.45,
+            "timeframes": {
+                "D1": [...],
+                "H4": [...],
+                "H2": [...],
+                "H1": [...]
+            }
+        }
+    }
+    """
+    if not isinstance(market_data, dict):
+        logger.error("Les données de marché doivent être un dictionnaire.")
         return []
 
+    results = []
 
-# ============================================================
-# FONCTION PUBLIQUE : FORMATAGE TELEGRAM
-# ============================================================
+    for symbol, snapshot in market_data.items():
+        try:
+            result = analyze_symbol(symbol, snapshot)
+            results.append(result)
 
-def format_message(signal: dict) -> str:
-    """Prepare un message lisible pour Telegram."""
+            logger.info(
+                "%s | Statut=%s | Direction=%s",
+                symbol,
+                result.get("status"),
+                result.get("direction"),
+            )
 
-    if not isinstance(signal, dict):
-        return "TRADER AI PRO : signal invalide."
+        except Exception as exc:
+            logger.exception(
+                "Erreur inattendue sur %s : %s",
+                symbol,
+                exc,
+            )
+            results.append(
+                build_analysis_error(
+                    str(symbol),
+                    "Erreur inattendue pendant l'analyse.",
+                    [str(exc)],
+                )
+            )
 
-    symbol = str(signal.get("symbol", "UNKNOWN"))
-    symbol_name = str(
-        signal.get("symbol_name", symbol)
+    return results
+def extract_numeric_value(
+    data: Any,
+    keys: Tuple[str, ...],
+) -> Optional[float]:
+    """Extrait le premier nombre valide parmi plusieurs clés."""
+    if not isinstance(data, dict):
+        return None
+
+    for key in keys:
+        value = safe_float(data.get(key))
+
+        if value is not None:
+            return value
+
+    return None
+
+
+def extract_level_price(
+    level: Any,
+) -> Optional[float]:
+    """Extrait le prix d'un support ou d'une résistance."""
+    return extract_numeric_value(
+        level,
+        ("price", "level", "value", "midpoint", "middle"),
     )
-    direction = str(
-        signal.get("direction", "UNKNOWN")
-    ).upper()
 
-    entry = _number(signal.get("entry"))
-    stop_loss = _number(signal.get("stop_loss"))
-    take_profit = _number(signal.get("take_profit"))
-    rr = _number(signal.get("rr"))
 
-    if any(
-        value is None
-        for value in (
-            entry,
-            stop_loss,
-            take_profit,
-            rr,
+def extract_zone_bounds(
+    zone: Any,
+) -> Optional[Tuple[float, float]]:
+    """Extrait les limites d'une zone technique."""
+    if not isinstance(zone, dict):
+        return None
+
+    lower = extract_numeric_value(
+        zone,
+        ("lower", "low", "zone_low", "bottom", "low_price"),
+    )
+
+    upper = extract_numeric_value(
+        zone,
+        ("upper", "high", "zone_high", "top", "high_price"),
+    )
+
+    if lower is None or upper is None:
+        return None
+
+    return min(lower, upper), max(lower, upper)
+
+
+def is_valid_order_block(
+    order_block: Any,
+    direction: str,
+) -> bool:
+    """Vérifie les informations essentielles d'un Order Block."""
+    if not isinstance(order_block, dict):
+        return False
+
+    block_direction = normalize_signal_direction(
+        order_block.get(
+            "direction",
+            order_block.get("type", ""),
         )
+    )
+
+    if block_direction != normalize_signal_direction(direction):
+        return False
+
+    bounds = extract_zone_bounds(order_block)
+
+    if bounds is None:
+        return False
+
+    lower, upper = bounds
+
+    return (
+        lower > 0
+        and upper > 0
+        and upper >= lower
+    )
+
+
+def is_valid_trendline(
+    trendline: Any,
+    minimum_touches: int = MIN_TRENDLINE_TOUCHES,
+) -> bool:
+    """Vérifie qu'une trendline dispose d'assez de contacts."""
+    if not isinstance(trendline, dict):
+        return False
+
+    touches = safe_float(
+        trendline.get(
+            "touches",
+            trendline.get("touch_count", 0),
+        ),
+        0.0,
+    )
+
+    slope = safe_float(
+        trendline.get(
+            "slope",
+            trendline.get("m"),
+        )
+    )
+
+    intercept = safe_float(
+        trendline.get(
+            "intercept",
+            trendline.get("b"),
+        )
+    )
+
+    if touches is None or touches < minimum_touches:
+        return False
+
+    return slope is not None and intercept is not None
+
+
+def calculate_signal_quality(
+    confluence: Dict[str, Any],
+    direction: str,
+    order_block: Dict[str, Any],
+    trendline: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """
+    Évalue la qualité d'une configuration sans garantir son résultat.
+    Une configuration ne devient pas automatiquement un ordre.
+    """
+    normalized_direction = normalize_signal_direction(direction)
+
+    score = safe_float(
+        confluence.get(
+            "score",
+            confluence.get("confluence_score", 0),
+        ),
+        0.0,
+    ) or 0.0
+
+    checks = {
+        "direction_valid": normalized_direction in ("BUY", "SELL"),
+        "order_block_valid": is_valid_order_block(
+            order_block,
+            normalized_direction,
+        ),
+        "trendline_valid": is_valid_trendline(trendline),
+        "confluence_sufficient": score >= 3,
+    }
+
+    passed = sum(1 for value in checks.values() if value)
+
+    return {
+        "score": score,
+        "checks": checks,
+        "checks_passed": passed,
+        "checks_total": len(checks),
+        "eligible": all(checks.values()),
+    }
+
+
+def validate_signal_prices(
+    direction: str,
+    entry: float,
+    stop_loss: float,
+    take_profit: float,
+) -> Tuple[bool, str]:
+    """Vérifie que les prix sont cohérents avec le sens du signal."""
+    direction = normalize_signal_direction(direction)
+
+    if not all(
+        _finite_number(value) and float(value) > 0
+        for value in (entry, stop_loss, take_profit)
     ):
-        return (
-            "TRADER AI PRO\n"
-            "Signal incomplet : donnees numeriques invalides."
+        return False, "Un prix est invalide ou inférieur ou égal à zéro."
+
+    entry = float(entry)
+    stop_loss = float(stop_loss)
+    take_profit = float(take_profit)
+
+    if direction == "BUY":
+        if not stop_loss < entry < take_profit:
+            return False, (
+                "Pour un BUY, le SL doit être inférieur à l'entrée "
+                "et le TP supérieur à l'entrée."
+            )
+
+    elif direction == "SELL":
+        if not take_profit < entry < stop_loss:
+            return False, (
+                "Pour un SELL, le TP doit être inférieur à l'entrée "
+                "et le SL supérieur à l'entrée."
+            )
+
+    else:
+        return False, "La direction doit être BUY ou SELL."
+
+    return True, "Prix cohérents."
+
+
+def build_signal_payload(
+    symbol: str,
+    direction: str,
+    entry: float,
+    stop_loss: float,
+    take_profit: float,
+    current_price: float,
+    quality: Dict[str, Any],
+    timeframe_consistency: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Construit un objet de signal pour les alertes.
+    Cette fonction ne passe aucun ordre.
+    """
+    valid, reason = validate_signal_prices(
+        direction,
+        entry,
+        stop_loss,
+        take_profit,
+    )
+
+    if not valid:
+        return build_no_signal_result(
+            symbol,
+            reason,
+            current_price,
+        )
+
+    risk = abs(float(entry) - float(stop_loss))
+    reward = abs(float(take_profit) - float(entry))
+
+    if risk <= 0:
+        return build_no_signal_result(
+            symbol,
+            "Risque nul : signal rejeté.",
+            current_price,
+        )
+
+    risk_reward = reward / risk
+
+    if risk_reward < MIN_RISK_REWARD:
+        return build_no_signal_result(
+            symbol,
+            (
+                f"Ratio risque/rendement insuffisant : "
+                f"{risk_reward:.2f}."
+            ),
+            current_price,
+        )
+
+    return {
+        "symbol": symbol,
+        "symbol_name": get_symbol_name(symbol),
+        "status": "SIGNAL_CANDIDATE",
+        "signal": normalize_signal_direction(direction),
+        "direction": normalize_signal_direction(direction),
+        "entry": float(entry),
+        "stop_loss": float(stop_loss),
+        "take_profit": float(take_profit),
+        "current_price": float(current_price),
+        "risk_reward": round(risk_reward, 2),
+        "quality": quality,
+        "timeframe_consistency": timeframe_consistency,
+        "automatic_execution": False,
+        "reason": (
+            "Configuration candidate validée techniquement. "
+            "Exécution automatique désactivée."
+        ),
+          }
+def evaluate_entry_candidate(
+    symbol: str,
+    direction: str,
+    current_price: float,
+    candles: List[Dict[str, Any]],
+    supports: List[Dict[str, Any]],
+    resistances: List[Dict[str, Any]],
+    trendlines: Dict[str, Any],
+    order_blocks: List[Dict[str, Any]],
+    atr: float,
+    timeframe_consistency: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Évalue une entrée anticipée à partir d'une confluence technique.
+
+    Cette fonction :
+    - privilégie les supports et résistances proches ;
+    - recherche une trendline confirmée par au moins trois contacts ;
+    - vérifie la proximité d'un Order Block ;
+    - calcule une entrée, un SL et un TP ;
+    - rejette les configurations incomplètes.
+
+    Elle ne passe aucun ordre.
+    """
+    direction = normalize_signal_direction(direction)
+
+    if direction not in ("BUY", "SELL"):
+        return build_no_signal_result(
+            symbol,
+            "Direction non exploitable.",
+            current_price,
+        )
+
+    if not _finite_number(current_price) or current_price <= 0:
+        return build_no_signal_result(
+            symbol,
+            "Prix actuel invalide.",
+        )
+
+    if not _finite_number(atr) or atr <= 0:
+        return build_no_signal_result(
+            symbol,
+            "ATR invalide.",
+            current_price,
+        )
+
+    try:
+        validate_candle_series(
+            candles,
+            minimum_count=MIN_CANDLE_COUNT,
+        )
+    except (ValueError, TypeError, KeyError) as exc:
+        return build_no_signal_result(
+            symbol,
+            "Historique insuffisant ou invalide.",
+            current_price,
+            {"error": str(exc)},
+        )
+
+    if not isinstance(timeframe_consistency, dict):
+        return build_no_signal_result(
+            symbol,
+            "Vérification multi-timeframe absente.",
+            current_price,
+        )
+
+    if not timeframe_consistency.get("aligned", False):
+        return build_no_signal_result(
+            symbol,
+            "Les unités de temps ne sont pas alignées.",
+            current_price,
+        )
+
+    selected_level = find_nearest_level(
+        current_price,
+        supports if direction == "BUY" else resistances,
+    )
+
+    if not isinstance(selected_level, dict):
+        return build_no_signal_result(
+            symbol,
+            "Aucun niveau technique pertinent trouvé.",
+            current_price,
+        )
+
+    level_price = extract_level_price(selected_level)
+
+    if level_price is None or level_price <= 0:
+        return build_no_signal_result(
+            symbol,
+            "Le niveau technique sélectionné est invalide.",
+            current_price,
+        )
+
+    maximum_distance = float(atr) * MAX_PRICE_DISTANCE_ATR
+
+    if abs(float(current_price) - level_price) > maximum_distance:
+        return build_no_signal_result(
+            symbol,
+            "Le prix est encore trop éloigné du niveau technique.",
+            current_price,
+            {
+                "level_price": level_price,
+                "distance": abs(float(current_price) - level_price),
+                "maximum_distance": maximum_distance,
+            },
+        )
+
+    if not isinstance(trendlines, dict):
+        trendlines = {}
+
+    trendline_key = "uptrend" if direction == "BUY" else "downtrend"
+    trendline = trendlines.get(trendline_key)
+
+    if not is_valid_trendline(trendline):
+        return build_no_signal_result(
+            symbol,
+            "Aucune trendline valide avec trois contacts minimum.",
+            current_price,
+            {"selected_level": selected_level},
+        )
+
+    if not isinstance(order_blocks, list):
+        order_blocks = []
+
+    directional_blocks = filter_order_blocks_by_direction(
+        order_blocks,
+        direction,
+    )
+
+    if not directional_blocks:
+        return build_no_signal_result(
+            symbol,
+            "Aucun Order Block correspondant à la direction.",
+            current_price,
+        )
+
+    order_block = select_nearest_order_block(
+        directional_blocks,
+        current_price,
+    )
+
+    if not is_valid_order_block(order_block, direction):
+        return build_no_signal_result(
+            symbol,
+            "Order Block sélectionné invalide.",
+            current_price,
+        )
+
+    block_bounds = extract_zone_bounds(order_block)
+
+    if block_bounds is None:
+        return build_no_signal_result(
+            symbol,
+            "Limites de l'Order Block indisponibles.",
+            current_price,
+        )
+
+    block_low, block_high = block_bounds
+    zone_tolerance = calculate_zone_width(float(atr))
+
+    if distance_to_range(
+        float(current_price),
+        block_low,
+        block_high,
+    ) > zone_tolerance:
+        return build_no_signal_result(
+            symbol,
+            "Le prix n'approche pas suffisamment l'Order Block.",
+            current_price,
+            {
+                "order_block_low": block_low,
+                "order_block_high": block_high,
+                "zone_tolerance": zone_tolerance,
+            },
+        )
+
+    try:
+        confluence = calculate_confluence_score(
+            current_price=current_price,
+            level=selected_level,
+            trendline=trendline,
+            order_block=order_block,
+            atr=float(atr),
+            direction=direction,
+        )
+    except (TypeError, ValueError, KeyError) as exc:
+        return build_no_signal_result(
+            symbol,
+            "Impossible de calculer la confluence.",
+            current_price,
+            {"error": str(exc)},
+        )
+
+    if not isinstance(confluence, dict):
+        return build_no_signal_result(
+            symbol,
+            "Résultat de confluence invalide.",
+            current_price,
+        )
+
+    quality = calculate_signal_quality(
+        confluence=confluence,
+        direction=direction,
+        order_block=order_block,
+        trendline=trendline,
+    )
+
+    if not quality.get("eligible", False):
+        return build_no_signal_result(
+            symbol,
+            "La qualité de la configuration est insuffisante.",
+            current_price,
+            {
+                "quality": quality,
+                "confluence": confluence,
+            },
+        )
+
+    entry = calculate_entry_price(
+        direction=direction,
+        current_price=float(current_price),
+        zone={
+            "lower": block_low,
+            "upper": block_high,
+        },
+    )
+
+    if not _finite_number(entry) or entry <= 0:
+        return build_no_signal_result(
+            symbol,
+            "Prix d'entrée invalide.",
+            current_price,
+        )
+
+    stop_loss = calculate_stop_loss(
+        direction=direction,
+        entry=float(entry),
+        zone={
+            "lower": block_low,
+            "upper": block_high,
+        },
+        atr=float(atr),
+    )
+
+    if not _finite_number(stop_loss) or stop_loss <= 0:
+        return build_no_signal_result(
+            symbol,
+            "Stop-loss invalide.",
+            current_price,
+        )
+
+    target_levels = (
+        resistances if direction == "BUY" else supports
+    )
+
+    valid_targets = []
+
+    for target in target_levels:
+        target_price = extract_level_price(target)
+
+        if target_price is None:
+            continue
+
+        if direction == "BUY" and target_price > float(entry):
+            valid_targets.append(target_price)
+
+        elif direction == "SELL" and target_price < float(entry):
+            valid_targets.append(target_price)
+
+    if not valid_targets:
+        return build_no_signal_result(
+            symbol,
+            "Aucun objectif technique disponible du bon côté du marché.",
+            current_price,
+        )
+
+    if direction == "BUY":
+        take_profit = min(valid_targets)
+    else:
+        take_profit = max(valid_targets)
+
+    valid_prices, price_reason = validate_signal_prices(
+        direction,
+        float(entry),
+        float(stop_loss),
+        float(take_profit),
+    )
+
+    if not valid_prices:
+        return build_no_signal_result(
+            symbol,
+            price_reason,
+            current_price,
+        )
+
+    risk_reward = calculate_risk_reward(
+        float(entry),
+        float(stop_loss),
+        float(take_profit),
+    )
+
+    if not _finite_number(risk_reward):
+        return build_no_signal_result(
+            symbol,
+            "Ratio risque/rendement impossible à calculer.",
+            current_price,
+        )
+
+    if float(risk_reward) < MIN_RISK_REWARD:
+        return build_no_signal_result(
+            symbol,
+            "Ratio risque/rendement inférieur au minimum autorisé.",
+            current_price,
+            {"risk_reward": float(risk_reward)},
+        )
+
+    signal = build_signal_payload(
+        symbol=symbol,
+        direction=direction,
+        entry=float(entry),
+        stop_loss=float(stop_loss),
+        take_profit=float(take_profit),
+        current_price=float(current_price),
+        quality=quality,
+        timeframe_consistency=timeframe_consistency,
+    )
+
+    if signal.get("status") != "SIGNAL_CANDIDATE":
+        return signal
+
+    signal.update({
+        "status": "SIGNAL_CANDIDATE",
+        "selected_level": selected_level,
+        "trendline": trendline,
+        "order_block": summarize_order_block(order_block),
+        "confluence": confluence,
+        "atr": float(atr),
+        "automatic_execution": False,
+    })
+
+    return signal
+def finalize_symbol_analysis(
+    symbol: str,
+    snapshot: Dict[str, Any],
+    analysis: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Effectue la validation finale d'une analyse technique.
+
+    Contrôles :
+    - cohérence des unités D1, H4, H2 et H1 ;
+    - proximité d'un support ou d'une résistance ;
+    - trendline avec au moins trois contacts ;
+    - présence d'un Order Block exploitable ;
+    - validation de l'entrée, du SL, du TP et du ratio RR.
+
+    Aucun ordre n'est exécuté.
+    """
+    if not isinstance(analysis, dict):
+        return build_analysis_error(
+            symbol,
+            "Résultat d'analyse invalide.",
+        )
+
+    if analysis.get("status") != "ANALYZED":
+        return analysis
+
+    snapshot_valid, errors = validate_market_snapshot(snapshot)
+
+    if not snapshot_valid:
+        return build_analysis_error(
+            symbol,
+            "Instantané de marché invalide lors de la validation finale.",
+            errors,
+        )
+
+    current_price = safe_float(
+        snapshot.get("current_price")
+    )
+
+    direction = normalize_signal_direction(
+        analysis.get("direction")
+    )
+
+    if current_price is None or current_price <= 0:
+        return build_analysis_error(
+            symbol,
+            "Prix actuel indisponible lors de la validation finale.",
         )
 
     if direction not in ("BUY", "SELL"):
-        return (
-            "TRADER AI PRO\n"
-            "Signal incomplet : direction invalide."
+        return build_no_signal_result(
+            symbol,
+            "Aucune direction exploitable.",
+            current_price,
         )
 
-    if rr < MIN_RR:
-        return (
-            "TRADER AI PRO\n"
-            "Signal rejete : ratio risque/rendement insuffisant."
+    timeframe_consistency = analysis.get(
+        "timeframe_consistency",
+        {},
+    )
+
+    if not isinstance(timeframe_consistency, dict):
+        return build_no_signal_result(
+            symbol,
+            "Vérification multi-timeframe invalide.",
+            current_price,
         )
-        # Construction du message Telegram.
-    separator = "━━━━━━━━━━━━━━━━━━━━"
 
-    lines = [
-        "🎯 TRADER AI PRO",
-        separator,
-        f"📊 Indice : {symbol_name}",
-        f"🔎 Symbole : {symbol}",
-        f"📈 Direction : {direction}",
-        separator,
-        f"💰 Entrée indicative : {entry:.5f}",
-        f"🛑 Stop-loss : {stop_loss:.5f}",
-        f"🎯 Take-profit : {take_profit:.5f}",
-        f"⚖️ Ratio risque/rendement : 1:{rr:.2f}",
-        separator,
-        (
-            "📍 Contacts trendline : "
-            f"{signal.get('trendline_contacts', 0)}"
-        ),
-        (
-            "🔔 Réaction récente : "
-            + (
-                "détectée"
-                if signal.get("reaction_confirmed")
-                else "non confirmée"
-            )
-        ),
-        "",
-        "⏳ Signal à vérifier manuellement sur Deriv.",
-        "🧪 Mode : analyse / DRY_RUN",
-        "🚫 Exécution automatique : désactivée",
-        "",
-        "⚠️ Signal indicatif, sans garantie de résultat.",
-    ]
+    if not timeframe_consistency.get("aligned", False):
+        return build_no_signal_result(
+            symbol,
+            "Les unités de temps ne sont pas suffisamment alignées.",
+            current_price,
+        )
 
-    return "\n".join(lines)
+    h4_analysis = analysis.get("h4", {})
+
+    if not isinstance(h4_analysis, dict):
+        return build_no_signal_result(
+            symbol,
+            "Analyse H4 indisponible.",
+            current_price,
+        )
+
+    h4_candles = snapshot["timeframes"]["H4"]
+
+    atr = safe_float(
+        h4_analysis.get("atr")
+    )
+
+    if atr is None or atr <= 0:
+        atr = calculate_atr(
+            h4_candles,
+            period=ATR_PERIOD,
+        )
+
+    if atr is None or atr <= 0:
+        return build_no_signal_result(
+            symbol,
+            "ATR H4 impossible à calculer.",
+            current_price,
+        )
+
+    supports = h4_analysis.get("supports", [])
+    resistances = h4_analysis.get("resistances", [])
+    trendlines = h4_analysis.get("trendlines", {})
+
+    if not isinstance(supports, list):
+        supports = []
+
+    if not isinstance(resistances, list):
+        resistances = []
+
+    if not isinstance(trendlines, dict):
+        trendlines = {}
+
+    try:
+        order_blocks = detect_order_blocks(
+            h4_candles,
+            lookback=40,
+            search_back=5,
+            atr=atr,
+        )
+
+        result = evaluate_entry_candidate(
+            symbol=symbol,
+            direction=direction,
+            current_price=current_price,
+            candles=h4_candles,
+            supports=supports,
+            resistances=resistances,
+            trendlines=trendlines,
+            order_blocks=order_blocks,
+            atr=atr,
+            timeframe_consistency=timeframe_consistency,
+        )
+
+    except (ValueError, TypeError, KeyError, IndexError) as exc:
+        logger.exception(
+            "Validation finale impossible pour %s : %s",
+            symbol,
+            exc,
+        )
+
+        return build_analysis_error(
+            symbol,
+            "Erreur pendant la validation finale du signal.",
+            [str(exc)],
+        )
+
+    if not isinstance(result, dict):
+        return build_analysis_error(
+            symbol,
+            "La validation finale a renvoyé un résultat invalide.",
+        )
+
+    result["d1_direction"] = analysis.get(
+        "d1", {}
+    ).get("direction", "NEUTRAL")
+
+    result["h4_structure"] = h4_analysis.get(
+        "structure", {}
+    )
+
+    result["h2_confirmation"] = analysis.get(
+        "h2", {}
+    )
+
+    result["h1_entry_context"] = analysis.get(
+        "h1", {}
+    )
+
+    result["automatic_execution"] = False
+
+    return result
 
 
-# ============================================================
-# FONCTIONS UTILITAIRES PUBLIQUES
-# ============================================================
+def analyze_symbol_completely(
+    symbol: str,
+    snapshot: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Point d'entrée complet pour analyser un indice et rechercher
+    un signal potentiel.
 
-def get_symbol_name(symbol: str) -> str:
-    """Retourne le nom complet d'un indice connu."""
+    Cette fonction peut être appelée par scheduled_analysis.py.
+    """
+    try:
+        preliminary = analyze_symbol(
+            symbol=symbol,
+            snapshot=snapshot,
+        )
 
-    if not isinstance(symbol, str):
-        return "Indice inconnu"
+        if preliminary.get("status") != "ANALYZED":
+            return preliminary
 
-    return SYMBOL_NAMES.get(
-        symbol.strip(),
-        symbol.strip(),
+        return finalize_symbol_analysis(
+            symbol=symbol,
+            snapshot=snapshot,
+            analysis=preliminary,
+        )
+
+    except Exception as exc:
+        logger.exception(
+            "Erreur complète d'analyse sur %s : %s",
+            symbol,
+            exc,
+        )
+
+        return build_analysis_error(
+            symbol,
+            "Une erreur inattendue a interrompu l'analyse.",
+            [str(exc)],
+        )
+
+
+def analyze_multiple_symbols(
+    market_data: Dict[str, Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    Analyse plusieurs indices et renvoie un résultat par indice.
+    Les erreurs sur un indice n'interrompent pas les autres analyses.
+    """
+    if not isinstance(market_data, dict):
+        logger.error(
+            "Impossible d'analyser les marchés : données invalides."
+        )
+        return []
+
+    results = []
+
+    for symbol, snapshot in market_data.items():
+        result = analyze_symbol_completely(
+            symbol=str(symbol),
+            snapshot=snapshot,
+        )
+
+        results.append(result)
+
+        logger.info(
+            "%s | %s | Direction : %s",
+            result.get("symbol_name", symbol),
+            result.get("status", "UNKNOWN"),
+            result.get("direction", "NEUTRAL"),
+        )
+
+    return results
+
+
+def get_valid_signal_candidates(
+    analysis_results: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    Filtre les résultats pour ne conserver que les candidats
+    disposant d'une entrée, d'un SL et d'un TP valides.
+
+    Un candidat reste une alerte à examiner manuellement.
+    """
+    if not isinstance(analysis_results, list):
+        return []
+
+    candidates = []
+
+    for result in analysis_results:
+        if not isinstance(result, dict):
+            continue
+
+        if result.get("status") != "SIGNAL_CANDIDATE":
+            continue
+
+        if result.get("automatic_execution") is not False:
+            continue
+
+        direction = normalize_signal_direction(
+            result.get("direction")
+        )
+
+        entry = safe_float(result.get("entry"))
+        stop_loss = safe_float(result.get("stop_loss"))
+        take_profit = safe_float(result.get("take_profit"))
+
+        if direction not in ("BUY", "SELL"):
+            continue
+
+        if entry is None or stop_loss is None or take_profit is None:
+            continue
+
+        prices_valid, _ = validate_signal_prices(
+            direction,
+            entry,
+            stop_loss,
+            take_profit,
+        )
+
+        if not prices_valid:
+            continue
+
+        risk_reward = calculate_risk_reward(
+            entry,
+            stop_loss,
+            take_profit,
+        )
+
+        if risk_reward is None:
+            continue
+
+        if risk_reward < MIN_RISK_REWARD:
+            continue
+
+        candidates.append(result)
+
+    return candidates
+def format_price(value: Any, decimals: int = 5) -> str:
+    """Formate un prix pour les journaux et les alertes."""
+    number = safe_float(value)
+
+    if number is None:
+        return "N/D"
+
+    if not isinstance(decimals, int) or decimals < 0:
+        decimals = 5
+
+    return f"{number:.{decimals}f}"
+
+
+def format_risk_reward(value: Any) -> str:
+    """Formate le ratio risque/rendement."""
+    number = safe_float(value)
+
+    if number is None or number < 0:
+        return "N/D"
+
+    return f"1:{number:.2f}"
+
+
+def get_signal_summary(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Extrait les informations essentielles d'un résultat."""
+    if not isinstance(result, dict):
+        return {
+            "status": "ERROR",
+            "signal": None,
+            "reason": "Résultat invalide.",
+        }
+
+    return {
+        "symbol": result.get("symbol", "UNKNOWN"),
+        "symbol_name": result.get("symbol_name", "Unknown index"),
+        "status": result.get("status", "UNKNOWN"),
+        "direction": result.get("direction", "NEUTRAL"),
+        "current_price": safe_float(result.get("current_price")),
+        "entry": safe_float(result.get("entry")),
+        "stop_loss": safe_float(result.get("stop_loss")),
+        "take_profit": safe_float(result.get("take_profit")),
+        "risk_reward": safe_float(result.get("risk_reward")),
+        "reason": result.get("reason", ""),
+        "automatic_execution": False,
+    }
+
+
+def format_signal_message(result: Dict[str, Any]) -> str:
+    """
+    Prépare le texte d'une alerte de signal potentiel.
+    Cette fonction ne communique pas avec Telegram et n'exécute
+    aucun ordre.
+    """
+    summary = get_signal_summary(result)
+
+    if summary.get("status") != "SIGNAL_CANDIDATE":
+        return (
+            f"ANALYSE — {summary.get('symbol_name', 'Indice inconnu')}\n"
+            f"Statut : {summary.get('status', 'UNKNOWN')}\n"
+            f"Motif : {summary.get('reason', 'Aucun détail disponible')}"
+        )
+
+    direction = summary.get("direction", "NEUTRAL")
+    direction_label = "ACHAT (BUY)" if direction == "BUY" else "VENTE (SELL)"
+
+    entry = summary.get("entry")
+    stop_loss = summary.get("stop_loss")
+    take_profit = summary.get("take_profit")
+    current_price = summary.get("current_price")
+    risk_reward = summary.get("risk_reward")
+
+    return (
+        "TRADER AI PRO — SIGNAL POTENTIEL\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"Indice : {summary.get('symbol_name')}\n"
+        f"Symbole : {summary.get('symbol')}\n"
+        f"Direction : {direction_label}\n"
+        f"Prix observé : {format_price(current_price)}\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"Entrée indicative : {format_price(entry)}\n"
+        f"Stop-loss (SL) : {format_price(stop_loss)}\n"
+        f"Take-profit (TP) : {format_price(take_profit)}\n"
+        f"Ratio risque/rendement : {format_risk_reward(risk_reward)}\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "Analyse : D1 / H4 / H2 / H1\n"
+        "Exécution automatique : DÉSACTIVÉE\n"
+        "Mode : ALERTE UNIQUEMENT\n"
+        "Vérifier le graphique avant toute décision."
     )
 
 
-def get_strategy_info() -> dict:
-    """Expose les principaux parametres de la strategie."""
+def log_analysis_result(result: Dict[str, Any]) -> None:
+    """Écrit un résumé exploitable dans les journaux."""
+    if not isinstance(result, dict):
+        logger.error("Impossible de journaliser un résultat invalide.")
+        return
 
+    symbol_name = result.get("symbol_name", "Indice inconnu")
+    symbol = result.get("symbol", "UNKNOWN")
+    status = result.get("status", "UNKNOWN")
+    direction = result.get("direction", "NEUTRAL")
+
+    if status == "SIGNAL_CANDIDATE":
+        logger.info(
+            "%s (%s) | CANDIDAT %s | Entrée=%s | SL=%s | TP=%s | RR=%s",
+            symbol_name,
+            symbol,
+            direction,
+            format_price(result.get("entry")),
+            format_price(result.get("stop_loss")),
+            format_price(result.get("take_profit")),
+            format_risk_reward(result.get("risk_reward")),
+        )
+    else:
+        logger.info(
+            "%s (%s) | Statut=%s | Direction=%s | Motif=%s",
+            symbol_name,
+            symbol,
+            status,
+            direction,
+            result.get("reason", "Non précisé"),
+        )
+
+
+def log_multiple_analysis_results(
+    results: List[Dict[str, Any]],
+) -> Dict[str, int]:
+    """Journalise un ensemble de résultats et compte les statuts."""
+    counts = {
+        "total": 0,
+        "signal_candidates": 0,
+        "no_signal": 0,
+        "errors": 0,
+        "other": 0,
+    }
+
+    if not isinstance(results, list):
+        logger.error("La liste des résultats est invalide.")
+        return counts
+
+    for result in results:
+        if not isinstance(result, dict):
+            counts["errors"] += 1
+            continue
+
+        counts["total"] += 1
+        status = result.get("status", "UNKNOWN")
+
+        if status == "SIGNAL_CANDIDATE":
+            counts["signal_candidates"] += 1
+        elif status == "NO_SIGNAL":
+            counts["no_signal"] += 1
+        elif status == "ERROR":
+            counts["errors"] += 1
+        else:
+            counts["other"] += 1
+
+        log_analysis_result(result)
+
+    logger.info(
+        "BILAN | Total=%d | Candidats=%d | Sans signal=%d | Erreurs=%d",
+        counts["total"],
+        counts["signal_candidates"],
+        counts["no_signal"],
+        counts["errors"],
+    )
+
+    return counts
+def get_strategy_config() -> Dict[str, Any]:
+    """Retourne la configuration active de la stratégie."""
     return {
         "name": "TRADER AI PRO",
-        "version": SIGNAL_VERSION,
-        "strategy": "Supports / Resistances + Trendlines",
-        "timeframes": ["D1", "H4", "H2", "H1"],
-        "minimum_candles": dict(MIN_CANDLES),
-        "minimum_risk_reward": MIN_RR,
-        "minimum_trendline_contacts": MIN_TRENDLINE_CONTACTS,
+        "version": "2.0",
+        "strategy": "Support/Resistance + Trendlines + Order Blocks",
+        "timeframes": {
+            "D1": {
+                "required_candles": TIMEFRAME_REQUIREMENTS["D1"],
+                "role": "Direction principale",
+            },
+            "H4": {
+                "required_candles": TIMEFRAME_REQUIREMENTS["H4"],
+                "role": "Structure et zones techniques",
+            },
+            "H2": {
+                "required_candles": TIMEFRAME_REQUIREMENTS["H2"],
+                "role": "Filtre de confirmation",
+            },
+            "H1": {
+                "required_candles": TIMEFRAME_REQUIREMENTS["H1"],
+                "role": "Précision de l'entrée",
+            },
+        },
+        "minimum_trendline_touches": MIN_TRENDLINE_TOUCHES,
+        "minimum_risk_reward": MIN_RISK_REWARD,
+        "atr_period": ATR_PERIOD,
+        "atr_stop_buffer": ATR_STOP_BUFFER,
+        "zone_atr_tolerance": ZONE_ATR_TOLERANCE,
+        "max_price_distance_atr": MAX_PRICE_DISTANCE_ATR,
+        "minimum_candles": MIN_CANDLE_COUNT,
         "automatic_execution": False,
-        "dry_run": True,
     }
+
+
+def validate_strategy_configuration() -> Dict[str, Any]:
+    """
+    Vérifie les paramètres de configuration sans contacter Deriv
+    et sans produire de signal de trading.
+    """
+    errors = []
+    config = get_strategy_config()
+
+    if not isinstance(MIN_TRENDLINE_TOUCHES, int):
+        errors.append(
+            "MIN_TRENDLINE_TOUCHES doit être un entier."
+        )
+    elif MIN_TRENDLINE_TOUCHES < 3:
+        errors.append(
+            "Une trendline doit exiger au moins trois contacts."
+        )
+
+    if not _finite_number(MIN_RISK_REWARD):
+        errors.append(
+            "MIN_RISK_REWARD doit être un nombre valide."
+        )
+    elif MIN_RISK_REWARD < 1.0:
+        errors.append(
+            "Le ratio risque/rendement minimum ne peut pas être inférieur à 1."
+        )
+
+    if not isinstance(TIMEFRAME_REQUIREMENTS, dict):
+        errors.append(
+            "TIMEFRAME_REQUIREMENTS doit être un dictionnaire."
+        )
+    else:
+        required_timeframes = ("D1", "H4", "H2", "H1")
+
+        for timeframe in required_timeframes:
+            count = TIMEFRAME_REQUIREMENTS.get(timeframe)
+
+            if not isinstance(count, int) or count < 200:
+                errors.append(
+                    f"{timeframe} doit exiger au moins 200 bougies."
+                )
+
+    if not _finite_number(ATR_PERIOD):
+        errors.append("ATR_PERIOD est invalide.")
+    elif ATR_PERIOD <= 0:
+        errors.append("ATR_PERIOD doit être positif.")
+
+    if not _finite_number(ATR_STOP_BUFFER):
+        errors.append("ATR_STOP_BUFFER est invalide.")
+    elif ATR_STOP_BUFFER < 0:
+        errors.append("ATR_STOP_BUFFER ne peut pas être négatif.")
+
+    if not _finite_number(ZONE_ATR_TOLERANCE):
+        errors.append("ZONE_ATR_TOLERANCE est invalide.")
+    elif ZONE_ATR_TOLERANCE <= 0:
+        errors.append("ZONE_ATR_TOLERANCE doit être positif.")
+
+    if config.get("automatic_execution") is not False:
+        errors.append(
+            "L'exécution automatique doit rester désactivée."
+        )
+
+    return {
+        "valid": len(errors) == 0,
+        "errors": errors,
+        "configuration": config,
+    }
+
+
+def validate_supported_symbols(
+    symbols: List[str],
+) -> Dict[str, Any]:
+    """Vérifie les symboles à analyser."""
+    if not isinstance(symbols, list):
+        return {
+            "valid": False,
+            "valid_symbols": [],
+            "invalid_symbols": [],
+            "error": "La liste des symboles est invalide.",
+        }
+
+    valid_symbols = []
+    invalid_symbols = []
+
+    for symbol in symbols:
+        if not isinstance(symbol, str):
+            invalid_symbols.append(str(symbol))
+            continue
+
+        normalized = symbol.strip()
+
+        if normalized in SYMBOL_NAMES:
+            valid_symbols.append(normalized)
+        else:
+            invalid_symbols.append(normalized)
+
+    return {
+        "valid": len(invalid_symbols) == 0,
+        "valid_symbols": valid_symbols,
+        "invalid_symbols": invalid_symbols,
+        "total": len(symbols),
+    }
+
+
+def run_strategy_diagnostics() -> Dict[str, Any]:
+    """
+    Lance uniquement les diagnostics locaux.
+    Aucun accès réseau, aucune alerte Telegram et aucun ordre.
+    """
+    logger.info(
+        "Démarrage des diagnostics de Trader AI Pro."
+    )
+
+    configuration_check = validate_strategy_configuration()
+
+    symbols_check = validate_supported_symbols(
+        list(SYMBOL_NAMES.keys())
+    )
+
+    passed = (
+        configuration_check["valid"]
+        and symbols_check["valid"]
+    )
+
+    report = {
+        "status": "PASS" if passed else "FAIL",
+        "configuration": configuration_check,
+        "symbols": symbols_check,
+        "automatic_execution": False,
+    }
+
+    if passed:
+        logger.info(
+            "Diagnostics locaux réussis."
+        )
+    else:
+        logger.error(
+            "Diagnostics locaux échoués : configuration à corriger."
+        )
+
+        for error in configuration_check.get("errors", []):
+            logger.error("Configuration : %s", error)
+
+    return report
+def run_strategy_self_tests() -> Dict[str, Any]:
+    """
+    Exécute des tests locaux de fonctions élémentaires.
+    Ces tests ne contactent aucun service externe et ne génèrent
+    aucun signal de trading.
+    """
+    tests = []
+
+    def record_test(
+        name: str,
+        passed: bool,
+        details: str = "",
+    ) -> None:
+        tests.append({
+            "name": name,
+            "passed": bool(passed),
+            "details": details,
+        })
+
+    # Test 1 : reconnaissance des symboles.
+    try:
+        record_test(
+            "symbol_name",
+            get_symbol_name("1HZ50V") != "1HZ50V",
+            "Vérification du nom complet d'un indice.",
+        )
+    except Exception as exc:
+        record_test("symbol_name", False, str(exc))
+
+    # Test 2 : validation des prix d'un BUY.
+    try:
+        valid, _ = validate_signal_prices(
+            "BUY",
+            entry=100.0,
+            stop_loss=95.0,
+            take_profit=110.0,
+        )
+        record_test(
+            "valid_buy_prices",
+            valid,
+            "SL < entrée < TP.",
+        )
+    except Exception as exc:
+        record_test("valid_buy_prices", False, str(exc))
+
+    # Test 3 : validation des prix d'un SELL.
+    try:
+        valid, _ = validate_signal_prices(
+            "SELL",
+            entry=100.0,
+            stop_loss=105.0,
+            take_profit=90.0,
+        )
+        record_test(
+            "valid_sell_prices",
+            valid,
+            "TP < entrée < SL.",
+        )
+    except Exception as exc:
+        record_test("valid_sell_prices", False, str(exc))
+
+    # Test 4 : rejet d'un BUY dont les prix sont incohérents.
+    try:
+        valid, _ = validate_signal_prices(
+            "BUY",
+            entry=100.0,
+            stop_loss=105.0,
+            take_profit=110.0,
+        )
+        record_test(
+            "reject_invalid_buy",
+            not valid,
+            "Le stop-loss ne doit pas dépasser l'entrée.",
+        )
+    except Exception as exc:
+        record_test("reject_invalid_buy", False, str(exc))
+
+    # Test 5 : calcul de la distance à une zone.
+    try:
+        distance = distance_to_range(
+            price=105.0,
+            lower_bound=100.0,
+            upper_bound=110.0,
+        )
+        record_test(
+            "price_inside_range",
+            distance == 0.0,
+            f"Distance calculée : {distance}.",
+        )
+    except Exception as exc:
+        record_test("price_inside_range", False, str(exc))
+
+    # Test 6 : calcul de la distance à l'extérieur d'une zone.
+    try:
+        distance = distance_to_range(
+            price=115.0,
+            lower_bound=100.0,
+            upper_bound=110.0,
+        )
+        record_test(
+            "price_outside_range",
+            math.isclose(distance, 5.0),
+            f"Distance calculée : {distance}.",
+        )
+    except Exception as exc:
+        record_test("price_outside_range", False, str(exc))
+
+    # Test 7 : conversion numérique.
+    try:
+        result = safe_float("123.45")
+        record_test(
+            "safe_float",
+            result == 123.45,
+            f"Valeur obtenue : {result}.",
+        )
+    except Exception as exc:
+        record_test("safe_float", False, str(exc))
+
+    # Test 8 : rejet des valeurs non finies.
+    try:
+        result = safe_float(float("nan"))
+        record_test(
+            "reject_nan",
+            result is None,
+            f"Valeur obtenue : {result}.",
+        )
+    except Exception as exc:
+        record_test("reject_nan", False, str(exc))
+
+    # Test 9 : configuration de la stratégie.
+    try:
+        config = validate_strategy_configuration()
+        record_test(
+            "strategy_configuration",
+            config.get("valid") is True,
+            str(config.get("errors", [])),
+        )
+    except Exception as exc:
+        record_test("strategy_configuration", False, str(exc))
+
+    # Bilan des tests.
+    passed_count = sum(
+        1 for test in tests if test["passed"]
+    )
+
+    failed_count = len(tests) - passed_count
+
+    report = {
+        "status": "PASS" if failed_count == 0 else "FAIL",
+        "total_tests": len(tests),
+        "passed": passed_count,
+        "failed": failed_count,
+        "tests": tests,
+        "automatic_execution": False,
+    }
+
+    for test in tests:
+        if test["passed"]:
+            logger.info(
+                "[TEST OK] %s",
+                test["name"],
+            )
+        else:
+            logger.error(
+                "[TEST ÉCHEC] %s : %s",
+                test["name"],
+                test["details"],
+            )
+
+    logger.info(
+        "Bilan des tests : %d réussis, %d échoués, sur %d.",
+        passed_count,
+        failed_count,
+        len(tests),
+    )
+
+    return report
+def get_strategy_health_report() -> Dict[str, Any]:
+    """
+    Produit un rapport local sur l'état de la stratégie.
+    Ne contacte aucun service externe.
+    """
+    logger.info("Contrôle de santé de Trader AI Pro.")
+
+    configuration = validate_strategy_configuration()
+    self_tests = run_strategy_self_tests()
+
+    required_functions = [
+        "analyze_symbol",
+        "analyze_symbol_completely",
+        "analyze_multiple_symbols",
+        "evaluate_entry_candidate",
+        "calculate_stop_loss",
+        "calculate_take_profit",
+        "calculate_risk_reward",
+        "detect_trendlines",
+        "detect_order_blocks",
+        "calculate_confluence_score",
+        "format_signal_message",
+    ]
+
+    missing_functions = [
+        name
+        for name in required_functions
+        if name not in globals()
+        or not callable(globals().get(name))
+    ]
+
+    passed = (
+        configuration.get("valid", False)
+        and self_tests.get("status") == "PASS"
+        and not missing_functions
+    )
+
+    report = {
+        "status": "PASS" if passed else "FAIL",
+        "configuration_valid": configuration.get("valid", False),
+        "self_tests": self_tests,
+        "missing_functions": missing_functions,
+        "automatic_execution": False,
+    }
+
+    if passed:
+        logger.info(
+            "Contrôle local terminé : configuration et tests validés."
+        )
+    else:
+        logger.error(
+            "Contrôle local échoué. Vérifier les erreurs avant utilisation."
+        )
+
+        if missing_functions:
+            logger.error(
+                "Fonctions manquantes : %s",
+                ", ".join(missing_functions),
+            )
+
+    return report
+
+
+def print_strategy_health_report() -> Dict[str, Any]:
+    """Affiche un résumé lisible du contrôle local."""
+    report = get_strategy_health_report()
+
+    print("=" * 54)
+    print("TRADER AI PRO — DIAGNOSTIC DE LA STRATÉGIE")
+    print("=" * 54)
+    print(f"Statut général : {report['status']}")
+    print(
+        "Configuration valide : "
+        f"{report['configuration_valid']}"
+    )
+
+    test_report = report["self_tests"]
+
+    print(
+        "Tests locaux : "
+        f"{test_report['passed']}/{test_report['total_tests']} réussis"
+    )
+
+    if report["missing_functions"]:
+        print("Fonctions manquantes :")
+        for function_name in report["missing_functions"]:
+            print(f"- {function_name}")
+
+    print("Exécution automatique des ordres : DÉSACTIVÉE")
+    print("=" * 54)
+
+    return report
+def get_strategy_metadata() -> Dict[str, Any]:
+    """Retourne les informations générales sur la stratégie."""
+    return {
+        "name": "Trader AI Pro",
+        "version": "2.0",
+        "description": (
+            "Analyse multi-timeframe avec supports, résistances, "
+            "trendlines et Order Blocks."
+        ),
+        "timeframes": ["D1", "H4", "H2", "H1"],
+        "minimum_candles_per_timeframe": 200,
+        "minimum_trendline_touches": MIN_TRENDLINE_TOUCHES,
+        "minimum_risk_reward": MIN_RISK_REWARD,
+        "automatic_execution": False,
+        "signal_mode": "ALERT_ONLY",
+    }
+
+
+def prepare_strategy_run() -> Dict[str, Any]:
+    """
+    Prépare les informations nécessaires avant une analyse.
+    Cette fonction ne récupère pas les données de marché.
+    """
+    config_check = validate_strategy_configuration()
+    symbols_check = validate_supported_symbols(
+        list(SYMBOL_NAMES.keys())
+    )
+
+    errors = []
+
+    if not config_check.get("valid", False):
+        errors.extend(config_check.get("errors", []))
+
+    if not symbols_check.get("valid", False):
+        errors.append(
+            "La liste des symboles contient des valeurs invalides."
+        )
+
+    return {
+        "ready": len(errors) == 0,
+        "metadata": get_strategy_metadata(),
+        "configuration": config_check,
+        "symbols": symbols_check,
+        "errors": errors,
+        "automatic_execution": False,
+    }
+
+
+def get_strategy_status() -> Dict[str, Any]:
+    """Retourne un statut synthétique de la stratégie."""
+    preparation = prepare_strategy_run()
+
+    return {
+        "status": "READY_FOR_COMPATIBILITY_CHECK"
+        if preparation["ready"]
+        else "CONFIGURATION_ERROR",
+        "ready": preparation["ready"],
+        "timeframes": ["D1", "H4", "H2", "H1"],
+        "candles_required": 200,
+        "automatic_execution": False,
+        "errors": preparation["errors"],
+      }
