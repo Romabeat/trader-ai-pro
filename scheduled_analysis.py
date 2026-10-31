@@ -505,12 +505,14 @@ def fetch_market_data(symbol: str) -> Optional[dict]:
         )
         return None
 
-    market_data["current_price"] = current_price
+         market_data["current_price"] = current_price
+  log(
+    f"{symbol} : PRIX ACTUEL = {current_price}"
+)
 
-    log(
-        f"{symbol} : donnees multi-timeframe complete."
-    )
-
+log(
+    f"{symbol} : donnees multi-timeframe complete."
+)
     return market_data
 
 
