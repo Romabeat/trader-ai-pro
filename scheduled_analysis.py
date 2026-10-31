@@ -496,24 +496,29 @@ def fetch_market_data(symbol: str) -> Optional[dict]:
         time.sleep(REQUEST_DELAY)
 
     # Recuperation du prix actuel.
-    current_price = fetch_current_price(symbol)
 
-    if current_price is None:
-        log(
-            f"{symbol} : prix actuel indisponible.",
-            "warning",
-        )
-        return None
+current_price = fetch_current_price(symbol)
 
-         market_data["current_price"] = current_price
-  log(
+if current_price is None:
+    log(
+        f"{symbol} : prix actuel indisponible.",
+        "warning",
+    )
+    return None
+
+market_data["current_price"] = current_price
+
+log(
     f"{symbol} : PRIX ACTUEL = {current_price}"
 )
 
 log(
     f"{symbol} : donnees multi-timeframe complete."
 )
-    return market_data
+
+return market_data
+
+
 
 
 # ============================================================
