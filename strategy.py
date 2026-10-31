@@ -18,10 +18,10 @@ STRATEGY_NAME = "TRENDLINE_SUPPORT_RESISTANCE"
 TIMEFRAME_PRIORITY = ("D1", "H4", "H2", "H1")
 
 MIN_CANDLES = {
-    "D1": 30,
-    "H4": 40,
-    "H2": 40,
-    "H1": 40,
+    "D1": 200,
+    "H4": 200,
+    "H2": 200,
+    "H1": 200,
 }
 
 ATR_PERIOD = 14
