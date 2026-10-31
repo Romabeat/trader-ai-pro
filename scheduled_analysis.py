@@ -1,19 +1,4 @@
-"""
-TRADER AI PRO
-Analyse automatique des indices Deriv.
-
-Fonctions :
-- Recuperation des prix actuels.
-- Recuperation des bougies D1, H4, H2 et H1.
-- Analyse des 13 indices.
-- Envoi des alertes sur Telegram.
-- Controle des donnees de marche.
-- Execution automatique des ordres interdite.
-
-IMPORTANT :
-Ce programme genere des alertes.
-Les transactions restent manuelles.
-"""
+""" TRADER AI PRO Analyse automatique des indices Deriv. Fonctions : - Recuperation des prix actuels. - Recuperation des bougies D1, H4, H2 et H1. - Analyse des 13 indices. - Envoi des alertes sur Telegram. - Controle des donnees de marche. - Execution automatique des ordres interdite. IMPORTANT : Ce programme genere des alertes. Les transactions restent manuelles. """
 
 import logging
 import os
@@ -277,7 +262,7 @@ except Exception as exc:
 
 try:
     from strategy import (
-        find_signals,
+        analyze_symbol_completely,
         format_message,
     )
 
@@ -297,10 +282,7 @@ except Exception as exc:
 # RECUPERATION DES BOUGIES D'UN TIMEFRAME
 # ============================================================
 
-def fetch_timeframe_candles(
-    symbol: str,
-    timeframe: str,
-) -> list:
+def fetch_timeframe_candles( symbol: str, timeframe: str, ) -> list:
     """Recupere les bougies d'un timeframe."""
 
     if timeframe not in TIMEFRAMES:
@@ -346,24 +328,6 @@ def fetch_timeframe_candles(
     )
 
     return candles
-
-
-def fetch_candles(symbol: str, timeframe: str) -> Optional[list]:
-    """Interface de compatibilité: renvoie une liste de bougies ou None."""
-    if timeframe not in TIMEFRAMES:
-        return None
-    try:
-        data = get_candles(symbol, TIMEFRAMES[timeframe], count=MIN_CANDLES)
-    except Exception as exc:
-        log(f"{symbol} : erreur API bougies {timeframe} : {exc}", "error")
-        return None
-    if isinstance(data, dict):
-        if data.get("error"):
-            return None
-        data = data.get("candles")
-    if not isinstance(data, list):
-        return None
-    return data
 
 
 # ============================================================
@@ -616,10 +580,22 @@ def process_symbol(symbol: str) -> int:
         f"{market_data['current_price']}"
     )
 
+    # Diagnostic detaille : on appelle directement le point d'entree
+    # officiel de la strategie afin de conserver le motif exact du rejet.
+    # Aucun reglage ni critere de la strategie n'est modifie ici.
+    snapshot = {
+        "symbol": symbol,
+        "current_price": market_data.get("current_price"),
+        "timeframes": {
+            timeframe: market_data.get(timeframe)
+            for timeframe in ("D1", "H4", "H2", "H1")
+        },
+    }
+
     try:
-        signals = find_signals(
-            symbol,
-            market_data,
+        analysis_result = analyze_symbol_completely(
+            symbol=symbol,
+            snapshot=snapshot,
         )
 
     except Exception as exc:
@@ -629,12 +605,36 @@ def process_symbol(symbol: str) -> int:
         )
         return 0
 
-    if signals is None:
-        log(f"{symbol} : aucun signal retourne.")
+    if not isinstance(analysis_result, dict):
+        log(
+            f"{symbol} : resultat de diagnostic invalide.",
+            "error",
+        )
         return 0
 
-    if isinstance(signals, dict):
-        signals = [signals]
+    analysis_status = analysis_result.get("status", "UNKNOWN")
+    analysis_reason = analysis_result.get("reason", "Motif non fourni.")
+
+    if analysis_status != "SIGNAL_CANDIDATE":
+        log(
+            f"{symbol} : diagnostic = {analysis_status} | "
+            f"motif = {analysis_reason}"
+        )
+        details = analysis_result.get("details")
+        if isinstance(details, dict) and details:
+            log(f"{symbol} : details = {details}")
+        elif isinstance(details, list) and details:
+            log(f"{symbol} : details = {'; '.join(str(x) for x in details)}")
+        return 0
+
+    log(
+        f"{symbol} : candidat detecte | direction = "
+        f"{analysis_result.get('direction', 'N/A')} | "
+        f"RR = {analysis_result.get('risk_reward', 'N/A')}"
+    )
+    signals = [dict(analysis_result)]
+    signals[0]["rr"] = signals[0].get("risk_reward")
+    signals[0]["automatic_execution"] = False
 
     if not isinstance(signals, (list, tuple)):
         log(
@@ -756,11 +756,7 @@ def run_preflight_checks() -> bool:
 # RESUME DE L'ANALYSE
 # ============================================================
 
-def print_analysis_summary(
-    analyzed: int,
-    skipped: int,
-    signal_count: int,
-) -> None:
+def print_analysis_summary( analyzed: int, skipped: int, signal_count: int, ) -> None:
     """Affiche le bilan de l'execution."""
 
     log("=" * 65)
@@ -808,8 +804,7 @@ def run_analysis() -> int:
 
         try:
             count = process_symbol(symbol)
-
-            if count >= 0:
+             if count >= 0:
                 analyzed += 1
                 signal_count += count
             else:
@@ -873,4 +868,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    main()     
