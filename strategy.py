@@ -745,14 +745,8 @@ def format_message(signal):
         SYMBOL_NAMES.get(symbol, symbol),
     )
 
-    direction = 
-    str(signal.get("direction", "")).upper()
+    direction = str(signal.get("direction", "")).upper()
     timeframe = signal.get("timeframe", "?")
-    entry = signal.get("entry", 0)
-    stop_loss = signal.get("stop_loss", 0)
-    take_profit = signal.get("take_profit", 0)
-    rr = signal.get("rr", 0)
-    score = signal.get("score", 0)
 
     if direction == "BUY":
         direction_text = "ACHAT (BUY)"
@@ -763,6 +757,12 @@ def format_message(signal):
     else:
         direction_text = direction
         emoji = "📊"
+
+    entry = signal.get("entry", 0)
+    stop_loss = signal.get("stop_loss", 0)
+    take_profit = signal.get("take_profit", 0)
+    rr = signal.get("rr", 0)
+    score = signal.get("score", 0)
 
     zone_low = signal.get("zone_low")
     zone_high = signal.get("zone_high")
@@ -799,24 +799,16 @@ def format_message(signal):
         )
 
     if level is not None:
-        lines.append(
-            f"Niveau horizontal : {_format_price(level)}"
-        )
+        lines.append(f"Niveau horizontal : {_format_price(level)}")
 
     if trendline is not None:
-        lines.append(
-            f"Projection trendline : {_format_price(trendline)}"
-        )
+        lines.append(f"Projection trendline : {_format_price(trendline)}")
 
     if distance is not None:
-        lines.append(
-            f"Distance a la zone : {distance} ATR"
-        )
+        lines.append(f"Distance a la zone : {distance} ATR")
 
     if touches is not None:
-        lines.append(
-            f"Contacts du niveau : {touches}"
-        )
+        lines.append(f"Contacts du niveau : {touches}")
 
     lines.extend([
         f"Score technique indicatif : {score}/100",
