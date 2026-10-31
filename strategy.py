@@ -18,7 +18,7 @@ import math
 
 
 # ============================================================
-# CONFIGURATION
+# 1. CONFIGURATION
 # ============================================================
 
 STRATEGY_NAME = "TRENDLINE_SUPPORT_RESISTANCE"
@@ -61,7 +61,7 @@ MAX_TRENDLINE_BREAK_ATR = 0.35
 
 
 # ============================================================
-# NOMS COMPLETS DES INDICES
+# 2. NOMS COMPLETS DES INDICES
 # ============================================================
 
 SYMBOL_NAMES = {
@@ -82,11 +82,10 @@ SYMBOL_NAMES = {
 
 
 # ============================================================
-# OUTILS NUMERIQUES
+# 3. OUTILS NUMERIQUES
 # ============================================================
 
 def _number(value):
-
     try:
         result = float(value)
 
@@ -117,7 +116,7 @@ def _get_value(candle, names):
 
 
 # ============================================================
-# NORMALISATION DES BOUGIES
+# 4. NORMALISATION DES BOUGIES
 # ============================================================
 
 def _normalise_candles(candles):
@@ -183,7 +182,7 @@ def _normalise_candles(candles):
 
 
 # ============================================================
-# CALCUL DE L'ATR
+# 5. CALCUL DE L'ATR
 # ============================================================
 
 def _calculate_atr(
@@ -230,7 +229,7 @@ def _calculate_atr(
 
 
 # ============================================================
-# DETECTION DES PIVOTS
+# 6. DETECTION DES PIVOTS
 # ============================================================
 
 def _find_pivots(
@@ -290,17 +289,24 @@ def _find_pivots(
             ))
 
     return highs, lows
-    # ============================================================
-# REGROUPEMENT DES NIVEAUX HORIZONTAUX
+
+
+# ============================================================
+# 7. REGROUPEMENT DES NIVEAUX HORIZONTAUX
 # ============================================================
 
 def _cluster_values(values, tolerance):
 
-    valid_values = sorted(
-        value
-        for value in values
-        if _number(value) is not None
-    )
+    valid_values = []
+
+    for value in values:
+
+        number = _number(value)
+
+        if number is not None:
+            valid_values.append(number)
+
+    valid_values.sort()
 
     clusters = []
 
@@ -334,10 +340,13 @@ def _cluster_values(values, tolerance):
 
 
 # ============================================================
-# DETECTION DES SUPPORTS ET RESISTANCES
+# 8. DETECTION DES SUPPORTS ET RESISTANCES
 # ============================================================
 
 def _find_horizontal_levels(candles, atr):
+
+    if not candles or atr <= 0:
+        return [], []
 
     highs, lows = _find_pivots(candles)
 
@@ -357,10 +366,8 @@ def _find_horizontal_levels(candles, atr):
     )
 
     return supports, resistances
-
-
-# ============================================================
-# ZONES DE REFERENCE D1
+    # ============================================================
+# 9. ZONES DE REFERENCE D1
 # ============================================================
 
 def _d1_zones(candles, atr):
@@ -390,7 +397,7 @@ def _d1_zones(candles, atr):
 
 
 # ============================================================
-# VERIFICATION DE L'APPARTENANCE A UNE ZONE
+# 10. VERIFICATION DE L'APPARTENANCE A UNE ZONE
 # ============================================================
 
 def _zone_contains(zone, price):
@@ -404,7 +411,7 @@ def _zone_contains(zone, price):
 
 
 # ============================================================
-# DETECTION DES REACTIONS INDEPENDANTES EN H4
+# 11. DETECTION DES REACTIONS INDEPENDANTES EN H4
 # ============================================================
 
 def _find_h4_reactions(
@@ -427,9 +434,6 @@ def _find_h4_reactions(
     recent = h4_candles[-LEVEL_LOOKBACK:]
 
     for index, candle in enumerate(recent):
-
-        # Une réaction est représentée par le prix
-        # extrême réellement rejeté par la bougie.
 
         lower_rejection = (
             d1_low <= candle["low"] <= d1_high
@@ -457,9 +461,8 @@ def _find_h4_reactions(
                 "type": "UPPER",
             })
 
-    # Regroupement des réactions proches dans le temps.
-    # Plusieurs bougies consécutives d'une même réaction
-    # ne doivent pas être comptées comme plusieurs touches.
+    # Les réactions proches dans le temps sont
+    # regroupées pour éviter les fausses touches multiples.
 
     independent = []
 
@@ -477,16 +480,20 @@ def _find_h4_reactions(
 
         if separation <= REACTION_SEPARATION_CANDLES:
 
-            old_distance = abs(
-                previous["price"] - d1_zone["mid"]
-            )
+            if reaction["type"] == previous["type"]:
 
-            new_distance = abs(
-                reaction["price"] - d1_zone["mid"]
-            )
+                if reaction["type"] == "LOWER":
 
-            if new_distance < old_distance:
-                independent[-1] = reaction
+                    if reaction["price"] < previous["price"]:
+                        independent[-1] = reaction
+
+                else:
+
+                    if reaction["price"] > previous["price"]:
+                        independent[-1] = reaction
+
+            else:
+                independent.append(reaction)
 
         else:
             independent.append(reaction)
@@ -495,7 +502,7 @@ def _find_h4_reactions(
 
 
 # ============================================================
-# AFFINAGE D1 PAR LES REACTIONS H4
+# 12. AFFINAGE D1 PAR LES REACTIONS H4
 # ============================================================
 
 def _refine_d1_zone_with_h4(
@@ -525,6 +532,7 @@ def _refine_d1_zone_with_h4(
         1e-10,
     )
 
+    # Regroupement des réactions selon leur prix.
     prices = sorted(
         reaction["price"]
         for reaction in reactions
@@ -555,9 +563,10 @@ def _refine_d1_zone_with_h4(
     refined_low = min(best_cluster)
     refined_high = max(best_cluster)
 
-    # Une zone doit rester suffisamment étroite.
     if refined_high - refined_low > maximum_width:
         return None
+
+    # La zone affinée doit rester dans la zone D1.
 
     refined_low = max(
         refined_low,
@@ -572,7 +581,6 @@ def _refine_d1_zone_with_h4(
     if refined_high <= refined_low:
         return None
 
-    # Vérification de la concentration des réactions.
     if refined_high - refined_low > tolerance * 8:
         return None
 
@@ -588,7 +596,7 @@ def _refine_d1_zone_with_h4(
 
 
 # ============================================================
-# CALCUL DE LA VALEUR D'UNE TRENDLINE
+# 13. CALCUL DE LA VALEUR D'UNE TRENDLINE
 # ============================================================
 
 def _line_value(line, index):
@@ -603,7 +611,7 @@ def _line_value(line, index):
 
 
 # ============================================================
-# DETECTION ET VALIDATION DES TRENDLINES
+# 14. DETECTION ET VALIDATION DES TRENDLINES
 # ============================================================
 
 def _find_trendline(
@@ -675,8 +683,6 @@ def _find_trendline(
                 "end_index": index2,
             }
 
-            # Vérification des contacts indépendants.
-
             touches = 0
 
             for pivot_index, pivot_price in recent_pivots:
@@ -701,7 +707,6 @@ def _find_trendline(
                 continue
 
             # Vérification des cassures par les clôtures.
-            # Une cassure importante invalide la droite.
 
             broken = False
 
@@ -776,7 +781,7 @@ def _find_trendline(
 
 
 # ============================================================
-# TRENDLINE POUR UNE DIRECTION DONNEE
+# 15. TRENDLINE POUR UNE DIRECTION DONNEE
 # ============================================================
 
 def _trendline_for_direction(
@@ -801,53 +806,100 @@ def _trendline_for_direction(
         candles,
         direction,
         atr,
-)
+    )
     # ============================================================
-# PARTIE 3/4 — CONFLUENCE MULTI-TIMEFRAME ET CALCUL DU TRADE
+# 16. RECHERCHE DES NIVEAUX PROCHES D'UNE ZONE
 # ============================================================
 
 def _levels_near_zone(candles, zone, atr):
     """
-    Recherche les niveaux horizontaux H2/H1 proches
+    Recherche les supports et résistances proches
     de la zone affinée en H4.
+
+    IMPORTANT :
+    _find_horizontal_levels retourne deux listes :
+    supports et résistances.
     """
+
     if not candles or not zone or atr <= 0:
         return []
 
-    levels = _find_horizontal_levels(candles, atr)
+    supports, resistances = _find_horizontal_levels(
+        candles,
+        atr,
+    )
 
-    zone_mid = (zone["low"] + zone["high"]) / 2
-    max_distance = atr * MAX_CONFLUENCE_DISTANCE_ATR
+    # On réunit les deux listes pour éviter
+    # de traiter une liste comme un dictionnaire.
 
-    return [
-        level
-        for level in levels
-        if abs(level["price"] - zone_mid) <= max_distance
-    ]
+    levels = supports + resistances
+
+    zone_mid = (
+        zone["low"] + zone["high"]
+    ) / 2
+
+    max_distance = (
+        atr * MAX_CONFLUENCE_DISTANCE_ATR
+    )
+
+    nearby = []
+
+    for level in levels:
+
+        price = level["price"]
+
+        if abs(price - zone_mid) <= max_distance:
+            nearby.append(level)
+
+    return nearby
 
 
-def _find_next_target(entry, direction, levels, zone):
+# ============================================================
+# 17. RECHERCHE DU PROCHAIN OBJECTIF TECHNIQUE
+# ============================================================
+
+def _find_next_target(
+    entry,
+    direction,
+    levels,
+    zone,
+):
     """
-    Cherche le prochain objectif technique réel
-    au-delà du prix d'entrée.
+    Recherche un support ou une résistance réel(le)
+    situé(e) au-delà de la zone et de l'entrée.
     """
+
     if not levels:
         return None
 
     candidates = []
 
     for level in levels:
-        price = level.get("price")
+
+        if not isinstance(level, dict):
+            continue
+
+        price = _number(
+            level.get("price")
+        )
 
         if price is None:
             continue
 
-        if direction == "BUY" and price > entry:
-            if price > zone["high"]:
+        if direction == "BUY":
+
+            if (
+                price > entry
+                and price > zone["high"]
+            ):
                 candidates.append(price)
 
-        elif direction == "SELL" and price < entry:
-            if price < zone["low"]:
+        elif direction == "SELL":
+
+            if (
+                price < entry
+                and price < zone["low"]
+            ):
                 candidates.append(price)
 
     if not candidates:
@@ -859,6 +911,10 @@ def _find_next_target(entry, direction, levels, zone):
     return max(candidates)
 
 
+# ============================================================
+# 18. CALCUL DU STOP LOSS ET TAKE PROFIT
+# ============================================================
+
 def _calculate_trade(
     direction,
     entry,
@@ -867,18 +923,31 @@ def _calculate_trade(
     target_levels,
 ):
     """
-    Calcule SL et TP à partir des limites de la zone
-    et du prochain objectif technique disponible.
+    Calcule le SL au-delà de la zone affinée
+    et le TP sur un objectif technique réel.
+
+    Le signal est rejeté si le RR est inférieur à 1:1.
     """
+
     if atr <= 0 or entry <= 0:
         return None
 
     buffer = atr * SL_BUFFER_ATR
 
     if direction == "BUY":
-        stop_loss = zone["low"] - buffer
+
+        stop_loss = (
+            zone["low"] - buffer
+        )
+
+    elif direction == "SELL":
+
+        stop_loss = (
+            zone["high"] + buffer
+        )
+
     else:
-        stop_loss = zone["high"] + buffer
+        return None
 
     take_profit = _find_next_target(
         entry=entry,
@@ -890,8 +959,13 @@ def _calculate_trade(
     if take_profit is None:
         return None
 
-    risk = abs(entry - stop_loss)
-    reward = abs(take_profit - entry)
+    risk = abs(
+        entry - stop_loss
+    )
+
+    reward = abs(
+        take_profit - entry
+    )
 
     if risk <= 0 or reward <= 0:
         return None
@@ -912,32 +986,213 @@ def _calculate_trade(
     }
 
 
+# ============================================================
+# 19. VERIFICATION DE LA CONFLUENCE H2 / H1
+# ============================================================
+
+def _has_horizontal_confluence(
+    h2_levels,
+    h1_levels,
+    zone,
+    atr,
+):
+    """
+    Vérifie qu'au moins un niveau horizontal H2 ou H1
+    se trouve à proximité de la zone affinée.
+    """
+
+    if atr <= 0:
+        return False, []
+
+    zone_mid = zone["mid"]
+
+    maximum_distance = (
+        atr * MAX_CONFLUENCE_DISTANCE_ATR
+    )
+
+    matches = []
+
+    for timeframe, levels in (
+        ("H2", h2_levels),
+        ("H1", h1_levels),
+    ):
+
+        for level in levels:
+
+            distance = abs(
+                level["price"] - zone_mid
+            )
+
+            if distance <= maximum_distance:
+
+                matches.append({
+                    "timeframe": timeframe,
+                    "price": level["price"],
+                    "touches": level["touches"],
+                    "distance": distance,
+                })
+
+    return bool(matches), matches
+
+
+# ============================================================
+# 20. VERIFICATION DE LA PROXIMITE DU PRIX
+# ============================================================
+
+def _price_near_zone(
+    price,
+    zone,
+    atr,
+):
+    """
+    Autorise une entrée anticipée lorsque le prix
+    approche suffisamment de la zone.
+    """
+
+    if price is None or atr <= 0:
+        return False
+
+    if zone["low"] <= price <= zone["high"]:
+        return True
+
+    distance = min(
+        abs(price - zone["low"]),
+        abs(price - zone["high"]),
+    )
+
+    return (
+        distance <= atr * MAX_ENTRY_DISTANCE_ATR
+    )
+
+
+# ============================================================
+# 21. VALIDATION DE LA DIRECTION
+# ============================================================
+
+def _direction_valid(
+    direction,
+    price,
+    zone,
+    trendline,
+):
+    """
+    Vérifie la cohérence entre le côté du prix,
+    la zone horizontale et la trendline.
+    """
+
+    if not trendline:
+        return False
+
+    if direction == "BUY":
+
+        if price > zone["high"]:
+            return False
+
+        if price < zone["low"] - 0.5 * abs(
+            zone["high"] - zone["low"]
+        ):
+            return False
+
+        return True
+
+    if direction == "SELL":
+
+        if price < zone["low"]:
+            return False
+
+        if price > zone["high"] + 0.5 * abs(
+            zone["high"] - zone["low"]
+        ):
+            return False
+
+        return True
+
+    return False
+    # ============================================================
+# 22. CONSTRUCTION D'UNE OPPORTUNITE DE TRADING
+# ============================================================
+
 def _build_candidate(
     symbol,
     direction,
-    price_now,
-    d1_zone,
-    h4_zone,
-    h4_atr,
+    refined_zone,
     h4_candles,
     h2_candles,
     h1_candles,
-    d1_levels,
-    h4_levels,
+    h4_atr,
+    h2_atr,
+    h1_atr,
+    price_now,
 ):
     """
-    Construit un signal uniquement si :
-    - la zone H4 reste dans la zone D1 ;
-    - une trendline H4 cohérente existe ;
-    - le prix est suffisamment proche de la zone ;
-    - une confluence horizontale H2 ou H1 existe ;
-    - un objectif technique et un RR acceptable existent.
+    Construit une opportunité à partir de :
+
+    - Zone horizontale D1 affinée par les réactions H4.
+    - Trendline H4 validée par au moins 3 contacts.
+    - Confluence horizontale H2 ou H1.
+    - Entrée anticipée.
+    - Objectif technique réel.
     """
-    if price_now <= 0 or h4_atr <= 0:
+
+    if not refined_zone:
         return None
 
-    if not _zone_contains(d1_zone, h4_zone):
+    if price_now is None or price_now <= 0:
         return None
+
+    if h4_atr <= 0 or h2_atr <= 0 or h1_atr <= 0:
+        return None
+
+    zone = refined_zone
+
+    # --------------------------------------------------------
+    # A. Vérification de la zone
+    # --------------------------------------------------------
+
+    if zone["low"] <= 0 or zone["high"] <= zone["low"]:
+        return None
+
+    zone_mid = (
+        zone["low"] + zone["high"]
+    ) / 2
+
+    zone = {
+        "low": zone["low"],
+        "high": zone["high"],
+        "mid": zone_mid,
+        "touches": zone.get("touches", 0),
+        "source": zone.get("source", "D1_H4"),
+    }
+
+    # --------------------------------------------------------
+    # B. Vérification de l'approche du prix
+    # --------------------------------------------------------
+
+    if not _price_near_zone(
+        price_now,
+        zone,
+        h4_atr,
+    ):
+        return None
+
+    # BUY : le prix doit approcher la zone par le dessus.
+    if direction == "BUY":
+
+        if price_now < zone["low"] - h4_atr * 0.25:
+            return None
+
+    # SELL : le prix doit approcher la zone par le dessous.
+    elif direction == "SELL":
+
+        if price_now > zone["high"] + h4_atr * 0.25:
+            return None
+
+    else:
+        return None
+
+    # --------------------------------------------------------
+    # C. Validation de la trendline H4
+    # --------------------------------------------------------
 
     trendline = _trendline_for_direction(
         h4_candles,
@@ -945,342 +1200,575 @@ def _build_candidate(
         h4_atr,
     )
 
-    if trendline is None:
+    if not trendline:
         return None
 
-    zone_mid = (h4_zone["low"] + h4_zone["high"]) / 2
+    if trendline.get("touches", 0) < MIN_TRENDLINE_TOUCHES:
+        return None
 
-    trendline_at_price = _line_value(
-        trendline,
-        len(h4_candles) - 1,
+    trendline_price = trendline.get("current_price")
+
+    if trendline_price is None:
+        return None
+
+    # La trendline doit se rapprocher de la zone horizontale.
+    trendline_distance = abs(
+        trendline_price - zone_mid
     )
 
-    if trendline_at_price is None:
+    if trendline_distance > (
+        h4_atr * MAX_CONFLUENCE_DISTANCE_ATR
+    ):
         return None
 
-    trendline_distance = abs(trendline_at_price - zone_mid)
+    # --------------------------------------------------------
+    # D. Recherche des niveaux H2 et H1
+    # --------------------------------------------------------
 
-    if trendline_distance > h4_atr * MAX_CONFLUENCE_DISTANCE_ATR:
-        return None
-
-    # Le prix doit être dans la zone ou du bon côté
-    # et suffisamment proche pour permettre une entrée.
-    if direction == "BUY":
-        if price_now < h4_zone["low"] - h4_atr * 0.10:
-            return None
-
-        distance = max(0, price_now - h4_zone["high"])
-
-    else:
-        if price_now > h4_zone["high"] + h4_atr * 0.10:
-            return None
-
-        distance = max(0, h4_zone["low"] - price_now)
-
-    if distance > h4_atr * MAX_ENTRY_DISTANCE_ATR:
-        return None
-
-    # Confluences horizontales sur H2 et H1.
-    h2_confluences = _levels_near_zone(
+    h2_levels = _levels_near_zone(
         h2_candles,
-        h4_zone,
-        h4_atr,
+        zone,
+        h2_atr,
     )
 
-    h1_confluences = _levels_near_zone(
+    h1_levels = _levels_near_zone(
         h1_candles,
-        h4_zone,
-        h4_atr,
+        zone,
+        h1_atr,
     )
 
-    # Il faut au moins une confluence locale.
-    if not h2_confluences and not h1_confluences:
+    has_confluence, confluence_matches = (
+        _has_horizontal_confluence(
+            h2_levels,
+            h1_levels,
+            zone,
+            h4_atr,
+        )
+    )
+
+    if not has_confluence:
         return None
 
-    # Les niveaux des quatre unités de temps peuvent
-    # servir à identifier un objectif technique.
+    # --------------------------------------------------------
+    # E. Détermination du prix d'entrée anticipé
+    # --------------------------------------------------------
+
+    entry = zone_mid
+
+    # Le prix doit encore être suffisamment proche
+    # de l'entrée envisagée.
+
+    if abs(price_now - entry) > (
+        h4_atr * MAX_ENTRY_DISTANCE_ATR
+    ):
+        return None
+
+    # --------------------------------------------------------
+    # F. Recherche des objectifs techniques
+    # --------------------------------------------------------
+
+    h4_supports, h4_resistances = (
+        _find_horizontal_levels(
+            h4_candles,
+            h4_atr,
+        )
+    )
+
+    h2_supports, h2_resistances = (
+        _find_horizontal_levels(
+            h2_candles,
+            h2_atr,
+        )
+    )
+
+    h1_supports, h1_resistances = (
+        _find_horizontal_levels(
+            h1_candles,
+            h1_atr,
+        )
+    )
+
     target_levels = (
-        d1_levels
-        + h4_levels
-        + _find_horizontal_levels(h2_candles, h4_atr)
-        + _find_horizontal_levels(h1_candles, h4_atr)
+        h4_supports
+        + h4_resistances
+        + h2_supports
+        + h2_resistances
+        + h1_supports
+        + h1_resistances
     )
 
     trade = _calculate_trade(
         direction=direction,
-        entry=price_now,
-        zone=h4_zone,
+        entry=entry,
+        zone=zone,
         atr=h4_atr,
         target_levels=target_levels,
     )
 
-    if trade is None:
+    if not trade:
         return None
 
-    confluence_score = (
-        len(h2_confluences)
-        + len(h1_confluences)
-    )
+    # --------------------------------------------------------
+    # G. Construction du signal
+    # --------------------------------------------------------
 
     return {
         "symbol": symbol,
         "direction": direction,
         "strategy": STRATEGY_NAME,
-        "timeframe": "H4",
-        "analysis_timeframes": ["D1", "H4", "H2", "H1"],
+
         "entry": trade["entry"],
         "stop_loss": trade["stop_loss"],
         "take_profit": trade["take_profit"],
         "rr": trade["rr"],
-        "zone_low": round(h4_zone["low"], 5),
-        "zone_high": round(h4_zone["high"], 5),
-        "d1_zone_low": round(d1_zone["low"], 5),
-        "d1_zone_high": round(d1_zone["high"], 5),
-        "trendline_price": round(trendline_at_price, 5),
-        "h2_confluences": len(h2_confluences),
-        "h1_confluences": len(h1_confluences),
-        "confluence_score": confluence_score,
-        "price_distance_atr": round(distance / h4_atr, 3),
-        }
-    # ============================================================
-# PARTIE 4/4 — ANALYSE PRINCIPALE ET MESSAGES TELEGRAM
+
+        "zone_low": round(zone["low"], 5),
+        "zone_high": round(zone["high"], 5),
+        "zone_mid": round(zone["mid"], 5),
+
+        "zone_touches": zone["touches"],
+        "zone_source": zone["source"],
+
+        "trendline_price": round(
+            trendline_price,
+            5,
+        ),
+
+        "trendline_touches": trendline["touches"],
+
+        "trendline_distance": round(
+            trendline_distance,
+            5,
+        ),
+
+        "confluence": confluence_matches,
+
+        "price_at_analysis": round(
+            price_now,
+            5,
+        ),
+
+        "timeframes": [
+            "D1",
+            "H4",
+            "H2",
+            "H1",
+        ],
+    }
+
+
+# ============================================================
+# 23. IDENTIFIANT UNIQUE DU SIGNAL
 # ============================================================
 
 def _make_signal_id(signal):
     """
-    Identifiant stable pour éviter les alertes répétées
-    sur une même configuration.
+    Génère un identifiant stable pour éviter
+    les doublons de signaux.
     """
-    raw = "|".join([
+
+    content = "|".join([
         str(signal.get("symbol", "")),
         str(signal.get("direction", "")),
-        str(round(signal.get("zone_low", 0), 2)),
-        str(round(signal.get("zone_high", 0), 2)),
-        str(signal.get("strategy", "")),
+        str(signal.get("entry", "")),
+        str(signal.get("stop_loss", "")),
+        str(signal.get("take_profit", "")),
+        STRATEGY_NAME,
     ])
 
     return hashlib.sha256(
-        raw.encode("utf-8")
-    ).hexdigest()[:24]
+        content.encode("utf-8")
+    ).hexdigest()[:16]
 
+
+# ============================================================
+# 24. VERIFICATION FINALE DU SIGNAL
+# ============================================================
+
+def _validate_signal(signal):
+    """
+    Dernière vérification de cohérence
+    avant de transmettre le signal.
+    """
+
+    if not isinstance(signal, dict):
+        return False
+
+    entry = _number(signal.get("entry"))
+    stop_loss = _number(signal.get("stop_loss"))
+    take_profit = _number(signal.get("take_profit"))
+    rr = _number(signal.get("rr"))
+
+    if None in (
+        entry,
+        stop_loss,
+        take_profit,
+        rr,
+    ):
+        return False
+
+    if entry <= 0 or stop_loss <= 0 or take_profit <= 0:
+        return False
+
+    if rr < MIN_RR:
+        return False
+
+    if signal.get("direction") == "BUY":
+
+        if not (
+            stop_loss < entry < take_profit
+        ):
+            return False
+
+    elif signal.get("direction") == "SELL":
+
+        if not (
+            take_profit < entry < stop_loss
+        ):
+            return False
+
+    else:
+        return False
+
+    return True
+    # ============================================================
+# 25. IMPORT POUR SECURISER LES MESSAGES TELEGRAM
+# ============================================================
+
+import html
+
+
+# ============================================================
+# 26. FONCTION PRINCIPALE D'ANALYSE MULTI-TIMEFRAME
+# ============================================================
 
 def find_signals(
     symbol,
-    d1,
-    h4,
-    h2,
-    h1,
+    d1_candles,
+    h4_candles,
+    h2_candles,
+    h1_candles,
     price_now,
     diagnostics=None,
 ):
     """
-    Analyse les quatre unités de temps :
+    Analyse un indice synthétique sur quatre unités de temps.
 
-    D1 : identification des grandes zones.
-    H4 : affinage des zones et trendlines.
-    H2 : confluences intermédiaires.
-    H1 : confluences locales et précision.
+    D1 : détection des supports et résistances.
+    H4 : affinage des zones et validation des trendlines.
+    H2 : recherche de confluence horizontale.
+    H1 : recherche de confluence horizontale.
 
-    Aucune confirmation complète n'est obligatoire.
-    Les alertes sont anticipées.
+    Les entrées sont anticipées.
+    Aucun ordre n'est exécuté automatiquement.
     """
 
     if diagnostics is None:
         diagnostics = {}
 
-    diagnostics["strategy"] = STRATEGY_NAME
-    diagnostics["symbol"] = symbol
-    diagnostics["status"] = "ANALYSIS_STARTED"
-
-    datasets = {
-        "D1": d1,
-        "H4": h4,
-        "H2": h2,
-        "H1": h1,
-    }
-
-    # Vérification des historiques disponibles.
-    for timeframe, candles in datasets.items():
-        if not isinstance(candles, list):
-            diagnostics["status"] = "INVALID_CANDLES"
-            diagnostics["reason"] = (
-                f"Données {timeframe} invalides"
-            )
-            return []
-
-        if len(candles) < MIN_CANDLES[timeframe]:
-            diagnostics["status"] = "INSUFFICIENT_CANDLES"
-            diagnostics["reason"] = (
-                f"Historique {timeframe} insuffisant"
-            )
-            return []
+    diagnostics.update({
+        "symbol": symbol,
+        "strategy": STRATEGY_NAME,
+        "status": "ANALYZING",
+        "reason": "",
+        "signals_found": 0,
+    })
 
     try:
-        price_now = _number(price_now)
 
-        if price_now <= 0:
-            diagnostics["status"] = "INVALID_PRICE"
-            return []
+        # ----------------------------------------------------
+        # A. NORMALISATION DES DONNEES
+        # ----------------------------------------------------
 
-        # Normalisation des données.
-        candles = {
-            timeframe: _normalise_candles(data)
-            for timeframe, data in datasets.items()
+        d1 = _normalise_candles(d1_candles)
+        h4 = _normalise_candles(h4_candles)
+        h2 = _normalise_candles(h2_candles)
+        h1 = _normalise_candles(h1_candles)
+
+        candle_counts = {
+            "D1": len(d1),
+            "H4": len(h4),
+            "H2": len(h2),
+            "H1": len(h1),
         }
 
-        for timeframe, data in candles.items():
-            if len(data) < MIN_CANDLES[timeframe]:
-                diagnostics["status"] = "INSUFFICIENT_VALID_CANDLES"
-                diagnostics["reason"] = (
-                    f"Bougies exploitables insuffisantes en {timeframe}"
-                )
+        diagnostics["candles"] = candle_counts
+
+        # ----------------------------------------------------
+        # B. VERIFICATION DU NOMBRE DE BOUGIES
+        # ----------------------------------------------------
+
+        for timeframe, candles in (
+            ("D1", d1),
+            ("H4", h4),
+            ("H2", h2),
+            ("H1", h1),
+        ):
+
+            minimum = MIN_CANDLES[timeframe]
+
+            if len(candles) < minimum:
+
+                diagnostics.update({
+                    "status": "INSUFFICIENT_DATA",
+                    "reason": (
+                        f"{timeframe}: {len(candles)} bougies "
+                        f"disponibles, {minimum} nécessaires."
+                    ),
+                })
+
                 return []
 
-        # Calcul des volatilités.
-        atr = {
-            timeframe: _calculate_atr(
-                candles[timeframe],
-                ATR_PERIOD,
-            )
-            for timeframe in ("D1", "H4", "H2", "H1")
+        # ----------------------------------------------------
+        # C. VERIFICATION DU PRIX ACTUEL
+        # ----------------------------------------------------
+
+        current_price = _number(price_now)
+
+        if current_price is None or current_price <= 0:
+
+            diagnostics.update({
+                "status": "INVALID_PRICE",
+                "reason": "Prix actuel absent ou invalide.",
+            })
+
+            return []
+
+        # ----------------------------------------------------
+        # D. CALCUL DES ATR
+        # ----------------------------------------------------
+
+        d1_atr = _calculate_atr(d1)
+        h4_atr = _calculate_atr(h4)
+        h2_atr = _calculate_atr(h2)
+        h1_atr = _calculate_atr(h1)
+
+        atr_values = {
+            "D1": d1_atr,
+            "H4": h4_atr,
+            "H2": h2_atr,
+            "H1": h1_atr,
         }
 
-        if any(value <= 0 for value in atr.values()):
-            diagnostics["status"] = "INVALID_ATR"
-            return []
+        for timeframe, atr in atr_values.items():
 
-        d1_atr = atr["D1"]
-        h4_atr = atr["H4"]
+            if atr is None or atr <= 0:
 
-        # Identification des zones principales D1.
-        d1_zones = _d1_zones(
-            candles["D1"],
+                diagnostics.update({
+                    "status": "INVALID_ATR",
+                    "reason": (
+                        f"ATR invalide sur {timeframe}."
+                    ),
+                })
+
+                return []
+
+        # ----------------------------------------------------
+        # E. DETECTION DES ZONES D1
+        # ----------------------------------------------------
+
+        d1_supports, d1_resistances = _d1_zones(
+            d1,
             d1_atr,
         )
 
-        if not d1_zones:
-            diagnostics["status"] = "NO_D1_ZONE"
-            diagnostics["reason"] = (
-                "Aucune zone horizontale D1 exploitable"
-            )
+        diagnostics["d1_supports"] = len(d1_supports)
+        diagnostics["d1_resistances"] = len(d1_resistances)
+
+        if not d1_supports and not d1_resistances:
+
+            diagnostics.update({
+                "status": "NO_VALID_ZONE",
+                "reason": (
+                    "Aucune zone horizontale D1 suffisamment "
+                    "valide n'a été détectée."
+                ),
+            })
+
             return []
 
-        # Niveaux horizontaux utilisables comme objectifs.
-        d1_levels = _find_horizontal_levels(
-            candles["D1"],
-            d1_atr,
-        )
+        # ----------------------------------------------------
+        # F. AFFINAGE DES ZONES D1 AVEC LES REACTIONS H4
+        # ----------------------------------------------------
 
-        h4_levels = _find_horizontal_levels(
-            candles["H4"],
-            h4_atr,
-        )
+        refined_supports = []
+        refined_resistances = []
 
-        candidates = []
+        for zone in d1_supports:
 
-        refined_count = 0
-
-        for d1_zone in d1_zones:
-
-            # Affinage de la zone D1 avec les réactions H4.
-            h4_zone = _refine_d1_zone_with_h4(
-                d1_zone,
-                candles["H4"],
+            refined = _refine_d1_zone_with_h4(
+                zone,
+                h4,
                 h4_atr,
             )
 
-            if h4_zone is None:
-                continue
+            if refined:
+                refined_supports.append(refined)
 
-            refined_count += 1
+        for zone in d1_resistances:
 
-            # Chaque zone est évaluée dans les deux directions.
-            # Les trendlines et confluences déterminent
-            # si une configuration est réellement exploitable.
-            for direction in ("BUY", "SELL"):
-
-                candidate = _build_candidate(
-                    symbol=symbol,
-                    direction=direction,
-                    price_now=price_now,
-                    d1_zone=d1_zone,
-                    h4_zone=h4_zone,
-                    h4_atr=h4_atr,
-                    h4_candles=candles["H4"],
-                    h2_candles=candles["H2"],
-                    h1_candles=candles["H1"],
-                    d1_levels=d1_levels,
-                    h4_levels=h4_levels,
-                )
-
-                if candidate is not None:
-                    candidates.append(candidate)
-
-        diagnostics["d1_zones_found"] = len(d1_zones)
-        diagnostics["h4_zones_refined"] = refined_count
-        diagnostics["candidates_found"] = len(candidates)
-
-        if not candidates:
-            diagnostics["status"] = "NO_VALID_SIGNAL"
-            diagnostics["reason"] = (
-                "Aucune configuration ne respecte "
-                "les critères de confluence et de risque"
+            refined = _refine_d1_zone_with_h4(
+                zone,
+                h4,
+                h4_atr,
             )
-            return []
 
-        # Priorité à la meilleure confluence,
-        # puis à la proximité du prix.
-        candidates.sort(
-            key=lambda item: (
-                item["confluence_score"],
-                item["rr"],
-                -item["price_distance_atr"],
-            ),
-            reverse=True,
+            if refined:
+                refined_resistances.append(refined)
+
+        diagnostics["refined_supports"] = len(
+            refined_supports
         )
 
-        # Un seul signal par direction et par zone.
-        unique_signals = []
-        seen = set()
+        diagnostics["refined_resistances"] = len(
+            refined_resistances
+        )
 
-        for signal in candidates:
-            signal["signal_id"] = _make_signal_id(signal)
+        if not refined_supports and not refined_resistances:
 
-            if signal["signal_id"] in seen:
+            diagnostics.update({
+                "status": "NO_VALID_REFINEMENT",
+                "reason": (
+                    "Les réactions H4 ne permettent pas "
+                    "d'affiner suffisamment les zones D1."
+                ),
+            })
+
+            return []
+
+        # ----------------------------------------------------
+        # G. CONSTRUCTION DES OPPORTUNITES BUY ET SELL
+        # ----------------------------------------------------
+
+        candidates = []
+
+        for zone in refined_supports:
+
+            candidate = _build_candidate(
+                symbol=symbol,
+                direction="BUY",
+                refined_zone=zone,
+                h4_candles=h4,
+                h2_candles=h2,
+                h1_candles=h1,
+                h4_atr=h4_atr,
+                h2_atr=h2_atr,
+                h1_atr=h1_atr,
+                price_now=current_price,
+            )
+
+            if candidate:
+                candidates.append(candidate)
+
+        for zone in refined_resistances:
+
+            candidate = _build_candidate(
+                symbol=symbol,
+                direction="SELL",
+                refined_zone=zone,
+                h4_candles=h4,
+                h2_candles=h2,
+                h1_candles=h1,
+                h4_atr=h4_atr,
+                h2_atr=h2_atr,
+                h1_atr=h1_atr,
+                price_now=current_price,
+            )
+
+            if candidate:
+                candidates.append(candidate)
+
+        # ----------------------------------------------------
+        # H. VALIDATION ET IDENTIFICATION DES SIGNAUX
+        # ----------------------------------------------------
+
+        valid_signals = []
+
+        for candidate in candidates:
+
+            if not _validate_signal(candidate):
                 continue
 
-            seen.add(signal["signal_id"])
-            unique_signals.append(signal)
+            candidate["signal_id"] = _make_signal_id(
+                candidate
+            )
 
-        diagnostics["signals_returned"] = len(unique_signals)
-        diagnostics["status"] = "SIGNALS_FOUND"
+            candidate["status"] = "NEW"
 
-        return unique_signals
+            valid_signals.append(candidate)
 
-    except Exception as error:
-        diagnostics["status"] = "ANALYSIS_ERROR"
-        diagnostics["reason"] = str(error)
+        # ----------------------------------------------------
+        # I. RESULTAT FINAL
+        # ----------------------------------------------------
+
+        if not valid_signals:
+
+            diagnostics.update({
+                "status": "NO_SIGNAL",
+                "reason": (
+                    "Aucune configuration ne satisfait "
+                    "tous les critères de la stratégie."
+                ),
+                "signals_found": 0,
+            })
+
+            return []
+
+        diagnostics.update({
+            "status": "SIGNALS_FOUND",
+            "reason": "Configuration(s) valide(s) détectée(s).",
+            "signals_found": len(valid_signals),
+        })
+
+        return valid_signals
+
+    except Exception as exc:
+
+        diagnostics.update({
+            "status": "ANALYSIS_ERROR",
+            "reason": (
+                f"{type(exc).__name__}: {str(exc)}"
+            ),
+            "signals_found": 0,
+        })
+
         return []
 
 
+# ============================================================
+# 27. FORMATAGE DU MESSAGE TELEGRAM
+# ============================================================
+
 def format_message(signal):
     """
-    Prépare le message Telegram.
-    Format HTML : scheduled_analysis.py devra envoyer
-    le message avec parse_mode='HTML'.
+    Produit un message Telegram au format HTML.
     """
 
-    symbol = signal.get("symbol", "Unknown")
-    full_name = SYMBOL_NAMES.get(symbol, symbol)
+    symbol = str(
+        signal.get("symbol", "UNKNOWN")
+    )
 
-    direction = signal.get("direction", "UNKNOWN")
+    symbol_name = SYMBOL_NAMES.get(
+        symbol,
+        symbol,
+    )
 
-    if direction == "BUY":
-        direction_label = "ACHAT"
-        direction_icon = "🟢"
-    else:
-        direction_label = "VENTE"
-        direction_icon = "🔴"
+    direction = signal.get(
+        "direction",
+        "UNKNOWN",
+    )
+
+    direction_label = (
+        "ACHAT / BUY"
+        if direction == "BUY"
+        else "VENTE / SELL"
+    )
+
+    emoji = (
+        "🟢"
+        if direction == "BUY"
+        else "🔴"
+    )
 
     entry = signal.get("entry", 0)
     stop_loss = signal.get("stop_loss", 0)
@@ -1290,26 +1778,51 @@ def format_message(signal):
     zone_low = signal.get("zone_low", 0)
     zone_high = signal.get("zone_high", 0)
 
-    h2_count = signal.get("h2_confluences", 0)
-    h1_count = signal.get("h1_confluences", 0)
-
-    return (
-        f"🚨 <b>TRADER AI PRO — SIGNAL</b>\n\n"
-        f"📊 <b>Indice :</b> {full_name}\n"
-        f"🔎 <b>Symbole :</b> {symbol}\n"
-        f"{direction_icon} <b>Direction :</b> {direction_label}\n\n"
-        f"📍 <b>Zone affinée H4 :</b>\n"
-        f"{zone_low} — {zone_high}\n\n"
-        f"🎯 <b>Entrée indicative :</b> {entry}\n"
-        f"🛑 <b>Stop Loss :</b> {stop_loss}\n"
-        f"🏁 <b>Take Profit :</b> {take_profit}\n"
-        f"⚖️ <b>Risk/Reward :</b> 1:{rr}\n\n"
-        f"📐 <b>Confluences :</b>\n"
-        f"• H2 : {h2_count}\n"
-        f"• H1 : {h1_count}\n"
-        f"• Trendline H4 + zone horizontale\n\n"
-        f"⏳ <b>Unités analysées :</b> D1 / H4 / H2 / H1\n"
-        f"⚠️ <b>Signal anticipé — exécution manuelle uniquement.</b>"
+    trendline_touches = signal.get(
+        "trendline_touches",
+        0,
     )
-    
-    
+
+    zone_touches = signal.get(
+        "zone_touches",
+        0,
+    )
+
+    signal_id = html.escape(
+        str(signal.get("signal_id", "N/A"))
+    )
+
+    safe_symbol = html.escape(symbol_name)
+
+    lines = [
+        "🚨 <b>TRADER AI PRO</b>",
+        "━━━━━━━━━━━━━━━━━━",
+        "",
+        f"📊 <b>Indice :</b> {safe_symbol}",
+        f"🔎 <b>Symbole :</b> {html.escape(symbol)}",
+        f"{emoji} <b>Direction :</b> {direction_label}",
+        "",
+        "🎯 <b>PLAN DE TRADING</b>",
+        f"📍 Entrée : <code>{entry}</code>",
+        f"🛑 Stop Loss : <code>{stop_loss}</code>",
+        f"🏁 Take Profit : <code>{take_profit}</code>",
+        f"⚖️ Risk/Reward : <b>1:{rr}</b>",
+        "",
+        "📐 <b>ANALYSE TECHNIQUE</b>",
+        f"• Zone affinée : {zone_low} - {zone_high}",
+        f"• Réactions de la zone : {zone_touches}",
+        f"• Contacts trendline : {trendline_touches}",
+        "• Confluence : D1 + H4 + H2 + H1",
+        "• Entrée : anticipée",
+        "",
+        f"🆔 Signal : <code>{signal_id}</code>",
+        "",
+        "⚠️ <b>ALERTE UNIQUEMENT</b>",
+        "Aucun ordre automatique n'est exécuté.",
+        "Vérifiez le graphique avant toute prise de position.",
+        "",
+        "━━━━━━━━━━━━━━━━━━",
+        "Trader AI Pro — Analyse technique",
+    ]
+
+    return "\n".join(lines)
