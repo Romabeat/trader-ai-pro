@@ -1,718 +1,741 @@
 """
-Trader AI Pro - Strategie SMC D1/H4
-------------------------------------
-D1 : biais directionnel.
-H4 : BOS, displacement et Order Block.
-Entree : ouverture de la bougie de l'Order Block.
-SL : au-dela de la zone avec marge ATR.
-TP : cible structurelle situee au-dela du prix actuel.
-RR minimum : 1.5.
+TRADER AI PRO — STRATEGIE TRENDLINE + CONFLUENCE
 
-Scanner uniquement : aucun ordre n'est execute.
+Principes :
+- Analyse D1, H4, H2 et H1.
+- Priorité : D1 -> H4 -> H2 -> H1.
+- Identification des tendances et trendlines.
+- Identification des supports et résistances horizontaux.
+- Recherche de confluences entre trendline et niveau horizontal.
+- Détection anticipée des configurations.
+- Aucun RR minimum imposé.
+- Aucun ordre exécuté automatiquement.
+
+Cette stratégie est indépendante de SMC, BOS et Order Blocks.
 """
 
-from math import isfinite
+from __future__ import annotations
+
+import hashlib
+import math
+from typing import Any
 
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
-MIN_RR = 1.5
+STRATEGY_NAME = "TRENDLINE_SUPPORT_RESISTANCE"
 
-MIN_D1_CANDLES = 100
-MIN_H4_CANDLES = 200
+TIMEFRAME_PRIORITY = ("D1", "H4", "H2", "H1")
 
-PIVOT_RADIUS = 2
-
-OB_LOOKBACK = 40
-OB_SEARCH_BACK = 5
-
+PIVOT_RADIUS = 3
 ATR_PERIOD = 14
-SL_ATR_BUFFER = 0.10
 
-MIN_BODY_RATIO = 0.55
-MIN_DISPLACEMENT_ATR = 0.80
+# Distance maximale entre la trendline et le niveau horizontal.
+CONFLUENCE_ATR = 0.60
 
-MAX_BOS_AGE = 20
-MAX_ENTRY_DISTANCE_ATR = 1.5
+# Distance maximale du prix actuel à la confluence.
+MAX_ENTRY_DISTANCE_ATR = 1.50
+
+# Marge supplémentaire au-delà de la zone pour le stop-loss.
+SL_ATR_BUFFER = 0.35
+
+# Distance minimale entre un pivot et un autre pour limiter
+# les faux niveaux horizontaux.
+MIN_LEVEL_SEPARATION_ATR = 0.30
+
+# Si aucun niveau opposé exploitable n'est détecté,
+# un objectif technique de remplacement est calculé.
+FALLBACK_TARGET_R = 3.0
+
+INDEX_NAMES = {
+    "1HZ10V": "Volatility 10 (1s) Index",
+    "1HZ15V": "Volatility 15 (1s) Index",
+    "1HZ25V": "Volatility 25 (1s) Index",
+    "1HZ30V": "Volatility 30 (1s) Index",
+    "1HZ50V": "Volatility 50 (1s) Index",
+    "1HZ75V": "Volatility 75 (1s) Index",
+    "1HZ90V": "Volatility 90 (1s) Index",
+    "1HZ100V": "Volatility 100 (1s) Index",
+    "R_10": "Volatility 10 Index",
+    "R_25": "Volatility 25 Index",
+    "R_50": "Volatility 50 Index",
+    "R_75": "Volatility 75 Index",
+    "R_100": "Volatility 100 Index",
+}
 
 
 # ============================================================
-# OUTILS
+# OUTILS NUMÉRIQUES
 # ============================================================
 
-def _number(value):
+def _finite_positive(value: Any) -> float | None:
+    """Convertit une valeur en nombre positif valide."""
+
     try:
         result = float(value)
-        return result if isfinite(result) else None
-    except (TypeError, ValueError, OverflowError):
+    except (TypeError, ValueError):
         return None
 
-
-def _first_value(row, keys):
-    for key in keys:
-        if key in row and row[key] is not None:
-            return row[key]
-    return None
-
-
-def _diagnose(diagnostics, symbol, reason):
-    if diagnostics is None:
-        return
-
-    if isinstance(diagnostics, dict):
-        diagnostics.setdefault(symbol, []).append(reason)
-
-    elif isinstance(diagnostics, list):
-        diagnostics.append(f"{symbol}: {reason}")
-
-
-def _normalize(candles):
-    """
-    Normalise les bougies et verifie leur coherence.
-    Les donnees numeriques d'epoch doivent etre strictement
-    chronologiques lorsqu'elles sont disponibles.
-    """
-    result = []
-
-    if not isinstance(candles, (list, tuple)):
-        return result
-
-    for row in candles:
-        if not isinstance(row, dict):
-            continue
-
-        o = _number(_first_value(row, ("open", "o", "Open")))
-        h = _number(_first_value(row, ("high", "h", "High")))
-        low = _number(_first_value(row, ("low", "l", "Low")))
-        c = _number(_first_value(row, ("close", "c", "Close")))
-
-        if None in (o, h, low, c):
-            continue
-
-        if h < max(o, low, c) or low > min(o, h, c):
-            continue
-
-        epoch = _first_value(
-            row,
-            ("epoch", "time", "timestamp", "datetime"),
-        )
-
-        result.append({
-            "o": o,
-            "h": h,
-            "l": low,
-            "c": c,
-            "epoch": epoch,
-        })
-
-    numeric_epochs = [_number(row["epoch"]) for row in result]
-
-    # Ne pas inverser silencieusement un historique mal ordonne.
-    if (
-        len(result) > 1
-        and all(value is not None for value in numeric_epochs)
-    ):
-        if any(
-            numeric_epochs[i] >= numeric_epochs[i + 1]
-            for i in range(len(numeric_epochs) - 1)
-        ):
-            return []
+    if not math.isfinite(result) or result <= 0:
+        return None
 
     return result
 
 
-# ============================================================
-# INDICATEURS
-# ============================================================
+def _normalize_candles(
+    candles: Any,
+) -> list[dict[str, float]]:
+    """Normalise les bougies et les trie par ordre chronologique."""
 
-def _true_range(current, previous_close):
-    return max(
-        current["h"] - current["l"],
-        abs(current["h"] - previous_close),
-        abs(current["l"] - previous_close),
-    )
+    if not isinstance(candles, list):
+        return []
+
+    normalized = []
+    seen_epochs = set()
+
+    for candle in candles:
+        if not isinstance(candle, dict):
+            continue
+
+        try:
+            epoch = int(candle["epoch"])
+            opening = float(candle["open"])
+            high = float(candle["high"])
+            low = float(candle["low"])
+            close = float(candle["close"])
+        except (KeyError, TypeError, ValueError):
+            continue
+
+        values = [opening, high, low, close]
+
+        if any(not math.isfinite(value) for value in values):
+            continue
+
+        if min(values) <= 0:
+            continue
+
+        if high < max(opening, close):
+            continue
+
+        if low > min(opening, close):
+            continue
+
+        if high < low or epoch in seen_epochs:
+            continue
+
+        seen_epochs.add(epoch)
+
+        normalized.append({
+            "epoch": float(epoch),
+            "open": opening,
+            "high": high,
+            "low": low,
+            "close": close,
+        })
+
+    normalized.sort(key=lambda item: item["epoch"])
+
+    return normalized
 
 
-def _atr(rows, period=ATR_PERIOD):
-    if len(rows) < period + 1:
+def _calculate_atr(
+    candles: list[dict[str, float]],
+    period: int = ATR_PERIOD,
+) -> float | None:
+    """Calcule l'Average True Range."""
+
+    if len(candles) < period + 1:
         return None
 
-    ranges = [
-        _true_range(rows[i], rows[i - 1]["c"])
-        for i in range(len(rows) - period, len(rows))
-    ]
+    true_ranges = []
 
-    if not ranges:
+    for index in range(1, len(candles)):
+        current = candles[index]
+        previous = candles[index - 1]
+
+        true_range = max(
+            current["high"] - current["low"],
+            abs(current["high"] - previous["close"]),
+            abs(current["low"] - previous["close"]),
+        )
+
+        if math.isfinite(true_range) and true_range > 0:
+            true_ranges.append(true_range)
+
+    if len(true_ranges) < period:
         return None
 
-    value = sum(ranges) / len(ranges)
+    # Moyenne des dernières périodes disponibles.
+    atr = sum(true_ranges[-period:]) / period
 
-    if value <= 0 or not isfinite(value):
+    if not math.isfinite(atr) or atr <= 0:
+        return None
+
+    return atr
+
+
+# ============================================================
+# PIVOTS ET STRUCTURE DU PRIX
+# ============================================================
+
+def _find_pivots(
+    candles: list[dict[str, float]],
+    radius: int = PIVOT_RADIUS,
+) -> tuple[list[dict[str, float]], list[dict[str, float]]]:
+    """
+    Identifie les sommets et creux locaux.
+
+    Un pivot n'est retenu qu'après l'existence des bougies
+    nécessaires à sa confirmation. On n'utilise donc pas les
+    dernières bougies comme si leurs pivots étaient confirmés.
+    """
+
+    highs = []
+    lows = []
+
+    if len(candles) < 2 * radius + 5:
+        return highs, lows
+
+    for index in range(radius, len(candles) - radius):
+        candle = candles[index]
+
+        left = candles[index - radius:index]
+        right = candles[index + 1:index + radius + 1]
+
+        is_pivot_high = all(
+            candle["high"] > other["high"]
+            for other in left + right
+        )
+
+        is_pivot_low = all(
+            candle["low"] < other["low"]
+            for other in left + right
+        )
+
+        if is_pivot_high:
+            highs.append({
+                "index": float(index),
+                "epoch": candle["epoch"],
+                "price": candle["high"],
+            })
+
+        if is_pivot_low:
+            lows.append({
+                "index": float(index),
+                "epoch": candle["epoch"],
+                "price": candle["low"],
+            })
+
+    return highs, lows
+
+
+def _line_value(
+    first: dict[str, float],
+    second: dict[str, float],
+    target_index: float,
+) -> float | None:
+    """Extrapole une droite passant par deux pivots."""
+
+    x1 = first["index"]
+    x2 = second["index"]
+    y1 = first["price"]
+    y2 = second["price"]
+
+    if x2 <= x1:
+        return None
+
+    slope = (y2 - y1) / (x2 - x1)
+    value = y1 + slope * (target_index - x1)
+
+    if not math.isfinite(value) or value <= 0:
         return None
 
     return value
 
 
-def _body_ratio(candle):
-    candle_range = candle["h"] - candle["l"]
-
-    if candle_range <= 0:
-        return 0.0
-
-    return abs(candle["c"] - candle["o"]) / candle_range
-
-
-def _is_bullish(candle):
-    return candle["c"] > candle["o"]
-
-
-def _is_bearish(candle):
-    return candle["c"] < candle["o"]
-
-
-# ============================================================
-# PIVOTS ET STRUCTURE
-# ============================================================
-
-def _pivots(rows, radius=PIVOT_RADIUS):
-    highs = []
-    lows = []
-
-    if len(rows) < 2 * radius + 1:
-        return highs, lows
-
-    for i in range(radius, len(rows) - radius):
-        candle = rows[i]
-
-        left = rows[i - radius:i]
-        right = rows[i + 1:i + radius + 1]
-
-        if all(candle["h"] > x["h"] for x in left + right):
-            highs.append((i, candle["h"]))
-
-        if all(candle["l"] < x["l"] for x in left + right):
-            lows.append((i, candle["l"]))
-
-    return highs, lows
-
-
-def _structure(rows):
+def _find_trendline(
+    pivots: list[dict[str, float]],
+    direction: str,
+    atr: float,
+) -> dict[str, Any] | None:
     """
-    Renvoie une tendance swing confirmee.
-    NEUTRAL ne signifie pas qu'aucun BOS exploitable n'existe.
+    Recherche une trendline cohérente.
+
+    BUY : trendline de support ascendante reliant des creux.
+    SELL : trendline de résistance descendante reliant des sommets.
     """
-    highs, lows = _pivots(rows)
 
-    if len(highs) < 2 or len(lows) < 2:
-        return "NEUTRAL"
+    if len(pivots) < 2:
+        return None
 
-    previous_high = highs[-2][1]
-    latest_high = highs[-1][1]
+    recent = pivots[-8:]
 
-    previous_low = lows[-2][1]
-    latest_low = lows[-1][1]
+    # On privilégie les deux derniers pivots confirmés.
+    first = recent[-2]
+    second = recent[-1]
 
-    if (
-        latest_high > previous_high
-        and latest_low > previous_low
-    ):
-        return "BULLISH"
+    if second["index"] <= first["index"]:
+        return None
 
-    if (
-        latest_high < previous_high
-        and latest_low < previous_low
-    ):
-        return "BEARISH"
-
-    return "NEUTRAL"
-
-
-def _daily_bias(d1):
-    return _structure(d1)
-
-
-# ============================================================
-# BREAK OF STRUCTURE ET DISPLACEMENT
-# ============================================================
-
-def _find_bos(rows, direction, atr_value):
-    """
-    Cherche le BOS le plus recent dans le sens du biais D1.
-
-    La cassure doit :
-    - etre confirmee par la cloture ;
-    - franchir un pivot precedemment confirme ;
-    - presenter un corps suffisamment important ;
-    - respecter le seuil de displacement ATR.
-    """
-    start = max(
-        PIVOT_RADIUS * 2 + 1,
-        len(rows) - OB_LOOKBACK,
-    )
-
-    for i in range(len(rows) - 1, start - 1, -1):
-        candle = rows[i]
-
-        if direction == "BUY" and not _is_bullish(candle):
-            continue
-
-        if direction == "SELL" and not _is_bearish(candle):
-            continue
-
-        if _body_ratio(candle) < MIN_BODY_RATIO:
-            continue
-
-        body = abs(candle["c"] - candle["o"])
-
-        if body < MIN_DISPLACEMENT_ATR * atr_value:
-            continue
-
-        # Seules les bougies precedant le BOS servent a
-        # determiner les pivots de reference.
-        previous_rows = rows[:i]
-        highs, lows = _pivots(previous_rows)
-
-        if direction == "BUY":
-            candidates = [
-                (index, level)
-                for index, level in highs
-                if candle["c"] > level
-            ]
-        else:
-            candidates = [
-                (index, level)
-                for index, level in lows
-                if candle["c"] < level
-            ]
-
-        if not candidates:
-            continue
-
-        # Le pivot casse le plus recent est la reference.
-        pivot_index, broken_level = candidates[-1]
-
-        return {
-            "index": i,
-            "broken_level": broken_level,
-            "pivot_index": pivot_index,
-            "impulse": candle,
-            "age": len(rows) - 1 - i,
-        }
-
-    return None
-
-
-# ============================================================
-# ORDER BLOCK
-# ============================================================
-
-def _find_order_block(rows, bos, direction):
-    """
-    Recherche la derniere bougie opposee avant l'impulsion BOS.
-    L'entree theorique est l'ouverture de cette bougie.
-    """
-    impulse_index = bos["index"]
-    first_index = max(0, impulse_index - OB_SEARCH_BACK)
-
-    for i in range(impulse_index - 1, first_index - 1, -1):
-        candle = rows[i]
-
-        if direction == "BUY" and _is_bearish(candle):
-            return {
-                "index": i,
-                "candle": candle,
-                "zone_low": candle["l"],
-                "zone_high": candle["h"],
-                "entry": candle["o"],
-            }
-
-        if direction == "SELL" and _is_bullish(candle):
-            return {
-                "index": i,
-                "candle": candle,
-                "zone_low": candle["l"],
-                "zone_high": candle["h"],
-                "entry": candle["o"],
-            }
-
-    return None
-
-
-def _is_invalidated(rows, ob, direction):
-    """
-    Une cloture ulterieure au-dela de la limite invalide
-    l'Order Block.
-    """
-    for candle in rows[ob["index"] + 1:]:
-        if direction == "BUY" and candle["c"] < ob["zone_low"]:
-            return True
-
-        if direction == "SELL" and candle["c"] > ob["zone_high"]:
-            return True
-
-    return False
-
-
-# ============================================================
-# CONFLUENCES SECONDAIRES
-# ============================================================
-
-def _liquidity_sweep(rows, direction, lookback=20):
-    if len(rows) < lookback + 2:
-        return False
-
-    previous = rows[-lookback - 1:-1]
-    latest = rows[-1]
+    difference = second["price"] - first["price"]
 
     if direction == "BUY":
-        previous_low = min(c["l"] for c in previous)
+        # Les creux doivent monter suffisamment.
+        if difference < atr * 0.05:
+            return None
 
-        return (
-            latest["l"] < previous_low
-            and latest["c"] > previous_low
-        )
-
-    previous_high = max(c["h"] for c in previous)
-
-    return (
-        latest["h"] > previous_high
-        and latest["c"] < previous_high
-    )
-
-
-def _engulfing(rows, direction):
-    if len(rows) < 2:
-        return False
-
-    previous = rows[-2]
-    latest = rows[-1]
-
-    if direction == "BUY":
-        return (
-            _is_bearish(previous)
-            and _is_bullish(latest)
-            and latest["o"] <= previous["c"]
-            and latest["c"] >= previous["o"]
-        )
-
-    return (
-        _is_bullish(previous)
-        and _is_bearish(latest)
-        and latest["o"] >= previous["c"]
-        and latest["c"] <= previous["o"]
-    )
-
-
-# ============================================================
-# TAKE PROFIT STRUCTUREL
-# ============================================================
-
-def _target_from_structure(
-    rows,
-    direction,
-    entry,
-    stop_loss,
-    current_price,
-):
-    """
-    La cible doit respecter le RR minimum et rester au-dela
-    du prix actuel. Cela evite de signaler un TP deja depasse.
-    """
-    highs, lows = _pivots(rows)
-
-    risk = abs(entry - stop_loss)
-
-    if risk <= 0:
-        return None, None
-
-    if direction == "BUY":
-        candidates = sorted({
-            level
-            for _, level in highs
-            if level > entry and level > current_price
-        })
-
-        for target in candidates:
-            rr = (target - entry) / risk
-
-            if rr >= MIN_RR:
-                return target, rr
+    elif direction == "SELL":
+        # Les sommets doivent descendre suffisamment.
+        if difference > -atr * 0.05:
+            return None
 
     else:
-        candidates = sorted(
-            {
-                level
-                for _, level in lows
-                if level < entry and level < current_price
-            },
-            reverse=True,
-        )
+        return None
 
-        for target in candidates:
-            rr = (entry - target) / risk
+    # Évite les droites presque verticales ou excessivement
+    # inclinées, souvent peu pertinentes pour une anticipation.
+    bars_between = second["index"] - first["index"]
+    slope_per_bar = difference / bars_between
 
-            if rr >= MIN_RR:
-                return target, rr
+    if abs(slope_per_bar) > atr * 0.80:
+        return None
 
-    return None, None
-
-
-# ============================================================
-# DETECTION DES SIGNAUX
-# ============================================================
-
-def find_signals(
-    symbol,
-    d1=None,
-    h4=None,
-    h1=None,
-    m30=None,
-    price_now=None,
-    diagnostics=None,
-):
-    """
-    Interface compatible avec scheduled_analysis.py.
-    Retourne toujours une liste de signaux.
-    Aucun ordre n'est execute.
-    """
-    signals = []
-
-    def reject(reason):
-        _diagnose(diagnostics, symbol, reason)
-
-    d1_rows = _normalize(d1)
-    h4_rows = _normalize(h4)
-
-    # 1. Historique
-    if len(d1_rows) < MIN_D1_CANDLES:
-        reject(
-            f"Historique D1 insuffisant : "
-            f"{len(d1_rows)}/{MIN_D1_CANDLES}."
-        )
-        return signals
-
-    if len(h4_rows) < MIN_H4_CANDLES:
-        reject(
-            f"Historique H4 insuffisant : "
-            f"{len(h4_rows)}/{MIN_H4_CANDLES}."
-        )
-        return signals
-
-    # 2. Biais D1
-    bias = _daily_bias(d1_rows)
-
-    if bias == "NEUTRAL":
-        reject(
-            "Biais D1 neutre : structure swing non confirmee."
-        )
-        return signals
-
-    direction = "BUY" if bias == "BULLISH" else "SELL"
-
-    # 3. Structure H4 informative, sans rejet automatique
-    # lorsqu'elle est neutre. Le BOS doit toujours confirmer
-    # une cassure dans le sens du biais D1.
-    h4_structure = _structure(h4_rows)
-
-    # 4. ATR H4
-    atr_value = _atr(h4_rows)
-
-    if atr_value is None:
-        reject("ATR H4 indisponible ou invalide.")
-        return signals
-
-    # 5. BOS dans le sens du biais D1
-    bos = _find_bos(h4_rows, direction, atr_value)
-
-    if bos is None:
-        reject(
-            f"Aucun BOS H4 recent avec displacement en direction "
-            f"du biais D1 ({direction})."
-        )
-        return signals
-
-    if bos["age"] > MAX_BOS_AGE:
-        reject(f"BOS trop ancien : {bos['age']} bougies H4.")
-        return signals
-
-    # 6. Order Block
-    ob = _find_order_block(h4_rows, bos, direction)
-
-    if ob is None:
-        reject("Aucune bougie opposee trouvee avant le BOS.")
-        return signals
-
-    if _is_invalidated(h4_rows, ob, direction):
-        reject("Order Block invalide par une cloture ulterieure.")
-        return signals
-
-    zone_low = ob["zone_low"]
-    zone_high = ob["zone_high"]
-    entry = ob["entry"]
-
-    if zone_high <= zone_low:
-        reject("Zone Order Block invalide.")
-        return signals
-
-    # 7. Prix actuel
-    current_price = _number(price_now)
-
-    if current_price is None or current_price <= 0:
-        reject("Prix actuel absent ou invalide.")
-        return signals
-
-    distance = abs(current_price - entry)
-    max_distance = MAX_ENTRY_DISTANCE_ATR * atr_value
-
-    if distance > max_distance:
-        reject(
-            f"Prix trop eloigne de l'entree sniper : "
-            f"{distance:.5f}, limite {max_distance:.5f}."
-        )
-        return signals
-
-    if direction == "BUY" and current_price <= entry:
-        reject("BUY : le prix doit etre au-dessus de l'entree.")
-        return signals
-
-    if direction == "SELL" and current_price >= entry:
-        reject("SELL : le prix doit etre en dessous de l'entree.")
-        return signals
-
-    # 8. Stop Loss
-    buffer = atr_value * SL_ATR_BUFFER
-
-    if direction == "BUY":
-        stop_loss = zone_low - buffer
-    else:
-        stop_loss = zone_high + buffer
-
-    risk = abs(entry - stop_loss)
-
-    if risk <= 0:
-        reject("Risque invalide : calcul du SL impossible.")
-        return signals
-
-    # 9. Take Profit : cible encore devant le prix actuel
-    take_profit, rr = _target_from_structure(
-        h4_rows,
-        direction,
-        entry,
-        stop_loss,
-        current_price,
-    )
-
-    if take_profit is None or rr is None:
-        reject(
-            "Aucune cible structurelle encore accessible "
-            "ne respecte le RR minimum."
-        )
-        return signals
-
-    if rr < MIN_RR:
-        reject(f"RR insuffisant : {rr:.2f}, minimum {MIN_RR:.2f}.")
-        return signals
-
-    # 10. Identifiant du signal
-    epoch = ob["candle"].get("epoch")
-
-    if epoch is None:
-        epoch = f"index-{ob['index']}"
-
-    safe_epoch = str(epoch).replace(" ", "_").replace(":", "-")
-
-    signal_id = (
-        f"{symbol}-{direction}-D1H4-POI-{safe_epoch}-"
-        f"{zone_low:.8f}-{zone_high:.8f}"
-    )
-
-    # 11. Signal final
-    signal = {
-        "signal_id": signal_id,
-        "symbol": symbol,
-        "direction": direction,
-        "entry": entry,
-        "stop_loss": stop_loss,
-        "take_profit": take_profit,
-        "rr": rr,
-        "zone_low": zone_low,
-        "zone_high": zone_high,
-        "current_price": current_price,
-        "h4_structure": h4_structure,
-        "d1_bias": bias,
-        "timeframe": "D1 bias / H4 BOS / H4 POI",
-        "order_block_index": ob["index"],
-        "bos_index": bos["index"],
-        "bos_level": bos["broken_level"],
-        "bos_age": bos["age"],
-        "atr_h4": atr_value,
-        "engulfing": _engulfing(h4_rows, direction),
-        "liquidity_sweep": _liquidity_sweep(h4_rows, direction),
-        "notes": (
-            "Biais D1 confirme ; BOS H4 avec displacement ; "
-            "Order Block valide ; cible structurelle accessible."
-        ),
+    return {
+        "first": first,
+        "second": second,
+        "slope": slope_per_bar,
     }
 
-    signals.append(signal)
 
-    _diagnose(
-        diagnostics,
-        symbol,
-        "Setup valide : biais D1, BOS H4, Order Block et RR conformes.",
+# ============================================================
+# SUPPORTS ET RÉSISTANCES HORIZONTAUX
+# ============================================================
+
+def _cluster_levels(
+    pivots: list[dict[str, float]],
+    atr: float,
+    recent_limit: int = 12,
+) -> list[dict[str, Any]]:
+    """
+    Regroupe les pivots proches pour identifier des niveaux
+    horizontaux approximatifs.
+
+    Un niveau touché plusieurs fois est privilégié.
+    """
+
+    if not pivots:
+        return []
+
+    tolerance = atr * 0.35
+    recent_pivots = pivots[-recent_limit:]
+
+    clusters: list[dict[str, Any]] = []
+
+    for pivot in recent_pivots:
+        price = pivot["price"]
+
+        matching = None
+
+        for cluster in clusters:
+            if abs(price - cluster["level"]) <= tolerance:
+                matching = cluster
+                break
+
+        if matching is None:
+            clusters.append({
+                "level": price,
+                "touches": 1,
+                "last_epoch": pivot["epoch"],
+                "last_index": pivot["index"],
+                "prices": [price],
+            })
+        else:
+            matching["prices"].append(price)
+            matching["touches"] += 1
+            matching["level"] = (
+                sum(matching["prices"])
+                / len(matching["prices"])
+            )
+
+            if pivot["epoch"] > matching["last_epoch"]:
+                matching["last_epoch"] = pivot["epoch"]
+                matching["last_index"] = pivot["index"]
+
+    result = []
+
+    for cluster in clusters:
+        result.append({
+            "level": float(cluster["level"]),
+            "touches": int(cluster["touches"]),
+            "last_epoch": float(cluster["last_epoch"]),
+            "last_index": float(cluster["last_index"]),
+        })
+
+    return result
+
+
+def _nearest_level(
+    levels: list[dict[str, Any]],
+    reference_price: float,
+    direction: str,
+    atr: float,
+) -> dict[str, Any] | None:
+    """
+    Sélectionne un niveau situé du côté attendu du marché.
+
+    BUY : niveau de support proche, sous le prix ou à proximité.
+    SELL : niveau de résistance proche, au-dessus du prix
+    ou à proximité.
+    """
+
+    if not levels:
+        return None
+
+    candidates = []
+
+    for level in levels:
+        price = float(level["level"])
+
+        if direction == "BUY":
+            if price > reference_price + atr * 0.75:
+                continue
+
+        elif direction == "SELL":
+            if price < reference_price - atr * 0.75:
+                continue
+
+        distance = abs(price - reference_price)
+
+        candidates.append((
+            distance,
+            -int(level["touches"]),
+            level,
+        ))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda item: (item[0], item[1]))
+
+    return candidates[0][2]
+
+
+def _next_opposing_level(
+    levels: list[dict[str, Any]],
+    entry: float,
+    direction: str,
+) -> float | None:
+    """Cherche le niveau horizontal opposé le plus proche."""
+
+    if direction == "BUY":
+        candidates = [
+            float(level["level"])
+            for level in levels
+            if float(level["level"]) > entry
+        ]
+
+        return min(candidates) if candidates else None
+
+    candidates = [
+        float(level["level"])
+        for level in levels
+        if float(level["level"]) < entry
+    ]
+
+    return max(candidates) if candidates else None
+
+
+# ============================================================
+# ANALYSE D'UNE UNITÉ DE TEMPS
+# ============================================================
+
+def _analyze_timeframe(
+    symbol: str,
+    timeframe: str,
+    raw_candles: Any,
+    price_now: float,
+) -> tuple[dict[str, Any] | None, str]:
+    """
+    Recherche une configuration anticipée de confluence.
+
+    BUY :
+    - trendline ascendante sur les creux ;
+    - support horizontal proche de cette trendline ;
+    - prix proche de la zone de confluence.
+
+    SELL :
+    - trendline descendante sur les sommets ;
+    - résistance horizontale proche de cette trendline ;
+    - prix proche de la zone de confluence.
+    """
+
+    candles = _normalize_candles(raw_candles)
+
+    if len(candles) < 40:
+        return None, (
+            f"Historique insuffisant : {len(candles)} bougies."
+        )
+
+    atr = _calculate_atr(candles)
+
+    if atr is None:
+        return None, "ATR indisponible."
+
+    highs, lows = _find_pivots(candles)
+
+    if len(highs) < 2 or len(lows) < 2:
+        return None, "Pas assez de pivots confirmés."
+
+    # Les valeurs de trendline sont évaluées à la dernière
+    # bougie clôturée, sans utiliser de pivot futur.
+    target_index = float(len(candles) - 1)
+
+    support_levels = _cluster_levels(lows, atr)
+    resistance_levels = _cluster_levels(highs, atr)
+
+    candidates: list[dict[str, Any]] = []
+
+    # --------------------------------------------------------
+    # Configuration haussière : trendline de support + support
+    # --------------------------------------------------------
+
+    bullish_line = _find_trendline(
+        lows,
+        direction="BUY",
+        atr=atr,
     )
 
-    return signals
+    if bullish_line:
+        line_price = _line_value(
+            bullish_line["first"],
+            bullish_line["second"],
+            target_index,
+        )
 
+        if line_price is not None:
+            horizontal = _nearest_level(
+                support_levels,
+                line_price,
+                direction="BUY",
+                atr=atr,
+            )
 
-# ============================================================
-# FORMATAGE TELEGRAM
-# ============================================================
+            if horizontal is not None:
+                level_price = float(horizontal["level"])
 
-def format_message(signal):
-    direction = signal.get("direction", "UNKNOWN")
-    symbol = signal.get("symbol", "UNKNOWN")
+                confluence_distance = abs(
+                    line_price - level_price
+                )
 
-    direction_label = {
-        "BUY": "ACHAT",
-        "SELL": "VENTE",
-    }.get(direction, direction)
+                price_distance = abs(
+                    price_now - line_price
+                )
 
-    rr = _number(signal.get("rr"))
+                if (
+                    confluence_distance <= atr * CONFLUENCE_ATR
+                    and price_distance <= atr * MAX_ENTRY_DISTANCE_ATR
+                    and price_now >= line_price - atr * 0.75
+                ):
+                    candidates.append({
+                        "direction": "BUY",
+                        "line_price": line_price,
+                        "level_price": level_price,
+                        "horizontal": horizontal,
+                        "line": bullish_line,
+                        "distance": price_distance,
+                        "confluence_distance": confluence_distance,
+                    })
 
-    rr_text = f"1:{rr:.2f}" if rr is not None else "Indisponible"
+    # --------------------------------------------------------
+    # Configuration baissière : trendline de résistance
+    # + résistance horizontale
+    # --------------------------------------------------------
 
-    return "\n".join([
-        "TRADER AI PRO — SIGNAL SMC",
-        "",
-        f"Instrument : {symbol}",
-        f"Direction : {direction_label}",
-        "Biais : Daily (D1)",
-        "BOS et Order Block : H4",
-        "Méthode : Sniper Entry — ouverture de l'OB",
-        "",
-        f"Zone OB : {signal.get('zone_low')} - "
-        f"{signal.get('zone_high')}",
-        f"Entrée théorique : {signal.get('entry')}",
-        f"Stop Loss : {signal.get('stop_loss')}",
-        f"Take Profit : {signal.get('take_profit')}",
-        f"RR estimé : {rr_text}",
-        f"Prix observé : {signal.get('current_price')}",
-        "",
-        f"Biais D1 : {signal.get('d1_bias')}",
-        f"Structure H4 : {signal.get('h4_structure')}",
-        f"Niveau BOS : {signal.get('bos_level')}",
-        f"Âge du BOS : {signal.get('bos_age')} bougies H4",
-        f"ATR H4 : {signal.get('atr_h4')}",
-        f"Englobement H4 : "
-        f"{'Oui' if signal.get('engulfing') else 'Non'}",
-        f"Prise de liquidité : "
-        f"{'Oui' if signal.get('liquidity_sweep') else 'Non'}",
-        "",
-        f"Note : {signal.get('notes', '')}",
-        "",
-        "Scanner uniquement : aucun ordre automatique exécuté.",
-        "Vérifier la validité du setup avant toute décision.",
-    ])
+    bearish_line = _find_trendline(
+        highs,
+        direction="SELL",
+        atr=atr,
+    )
+
+    if bearish_line:
+        line_price = _line_value(
+            bearish_line["first"],
+            bearish_line["second"],
+            target_index,
+        )
+
+        if line_price is not None:
+            horizontal = _nearest_level(
+                resistance_levels,
+                line_price,
+                direction="SELL",
+                atr=atr,
+            )
+
+            if horizontal is not None:
+                level_price = float(horizontal["level"])
+
+                confluence_distance = abs(
+                    line_price - level_price
+                )
+
+                price_distance = abs(
+                    price_now - line_price
+                )
+
+                if (
+                    confluence_distance <= atr * CONFLUENCE_ATR
+                    and price_distance <= atr * MAX_ENTRY_DISTANCE_ATR
+                    and price_now <= line_price + atr * 0.75
+                ):
+                    candidates.append({
+                        "direction": "SELL",
+                        "line_price": line_price,
+                        "level_price": level_price,
+                        "horizontal": horizontal,
+                        "line": bearish_line,
+                        "distance": price_distance,
+                        "confluence_distance": confluence_distance,
+                    })
+
+    if not candidates:
+        return None, (
+            "Aucune confluence exploitable à proximité du prix."
+        )
+
+    # Priorité à la confluence la plus proche du prix actuel.
+    # Les configurations proches de la zone sont préférées.
+    candidates.sort(
+        key=lambda item: (
+            item["distance"] / atr
+            + item["confluence_distance"] / atr
+        )
+    )
+
+    selected = candidates[0]
+
+    direction = selected["direction"]
+    line_price = float(selected["line_price"])
+    level_price = float(selected["level_price"])
+
+    # L'entrée est proposée au prix actuel pour permettre une
+    # anticipation. Ce n'est pas une garantie d'exécution au prix.
+    entry = float(price_now)
+
+    zone_low = min(line_price, level_price)
+    zone_high = max(line_price, level_price)
+
+    # Marge de sécurité autour de la zone.
+    buffer = atr * SL_ATR_BUFFER
+
+    if direction == "BUY":
+        stop_loss = min(zone_low, entry) - buffer
+
+        # Empêche un stop situé au-dessus ou au niveau de l'entrée.
+        if stop_loss >= entry:
+            stop_loss = entry - atr * 0.50
+
+        risk = entry - stop_loss
+
+        opposing_level = _next_opposing_level(
+            resistance_levels,
+            entry,
+            direction="BUY",
+        )
+
+        # On ne place pas un TP structurel trop proche ou derrière
+        # l'entrée. Dans ce cas, on utilise une projection technique.
+        if (
+            opposing_level is not None
+            and opposing_level > entry + risk * 0.25
+        ):
+            take_profit = opposing_level
+            target_type = "Résistance horizontale"
+        else:
+            take_profit = entry + risk * FALLBACK_TARGET_R
+            target_type = "Projection technique 3R"
+
+    else:
+        stop_loss = max(zone_high, entry) + buffer
+
+        if stop_loss <= entry:
+            stop_loss = entry + atr * 0.50
+
+        risk = stop_loss - entry
+
+        opposing_level = _next_opposing_level(
+            support_levels,
+            entry,
+            direction="SELL",
+        )
+
+        if (
+            opposing_level is not None
+            and opposing_level < entry - risk * 0.25
+        ):
+            take_profit = opposing_level
+            target_type = "Support horizontal"
+        else:
+            take_profit = entry - risk * FALLBACK_TARGET_R
+            target_type = "Projection technique 3R"
+
+    if risk <= 0:
+        return None, "Risque calculé invalide."
+
+    if direction == "BUY":
+        if not stop_loss < entry < take_profit:
+            return None, "Niveaux BUY incohérents."
+
+        rr = (take_profit - entry) / risk
+
+    else:
+        if not take_profit < entry < stop_loss:
+            return None, "Niveaux SELL incohérents."
+
+        rr = (entry - take_profit) / risk
+
+    if not math.isfinite(rr) or rr <= 0:
+        return None, "Ratio risque/rendement invalide."
+
+    first_pivot = selected["line"]["first"]
+    second_pivot = selected["line"]["second"]
+
+    # Identifiant stable pour ce couple de pivots et cette zone.
+    # Il aide à éviter de renvoyer le même signal à chaque scan,
+    # sous réserve que la base de données soit persistante.
+    identity = (
+        f"{symbol}|{timeframe}|{direction}|"
+        f"{int(first_pivot['epoch'])}|"
+        f"{int(second_pivot['epoch'])}|"
+        f"{round(level_price, 5)}"
+    )
+
+    signal_id = hashlib.sha256(
+        identity.encode("utf-8")
+    ).hexdigest()[:24]
+
+    signal = {
+        "signal_id": signal_id,
+        "strategy": STRATEGY_NAME,
+        "symbol": symbol,
+        "direction": direction,
+        "timeframe": timeframe,
+        "entry": round(entry, 5),
+        "stop_loss": round(stop_loss, 5),
+        "take_profit": round(take_profit, 5),
+        "rr": round(rr, 4),
+        "current_price": round(price_now, 5),
+        "trendline_level": round(line_price, 5),
+        "horizontal_level": round(level_price, 5),
+        "confluence_level": round(
+            (line_price + level_price) / 2,
+            5,
+        ),
+        "zone_low": round(zone_low, 5),
+        "zone_high": round(zone_high, 5),
+        "atr": round(atr, 5),
+        "distance_atr": round(
+            abs(price_now - line_price) / atr,
+     
