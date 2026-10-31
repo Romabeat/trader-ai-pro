@@ -1,40 +1,57 @@
-
-name: Trader AI Pro - Analyse automatique
+name: TRADER AI PRO - Analyse automatique
 
 on:
-  workflow_dispatch:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "17,47 * * * *"
+
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: trader-ai-pro-analysis
+  cancel-in-progress: false
+
 jobs:
   analysis:
+    name: Analyse des indices Deriv
+
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+
+    timeout-minutes: 30
+
+    env:
+      DRY_RUN: "true"
+      ENABLE_TELEGRAM_ALERTS: "true"
+      ENABLE_AUTO_TRADING: "false"
+      PYTHONUNBUFFERED: "1"
+
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
     steps:
-      - name: Recuperer le projet
+      - name: Recuperer le code
         uses: actions/checkout@v4
 
-      - name: Installer Python
+      - name: Installer Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: pip
-          cache-dependency-path: requirements.txt
+          cache: "pip"
+
+      - name: Mettre a jour pip
+        run: |
+          python -m pip install --upgrade pip
 
       - name: Installer les dependances
         run: |
-          python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Verifier la configuration
+        run: |
+          python -c "import os; print('Telegram token present:', bool(os.getenv('TELEGRAM_BOT_TOKEN'))); print('Telegram chat ID present:', bool(os.getenv('TELEGRAM_CHAT_ID'))); print('DRY_RUN:', os.getenv('DRY_RUN')); print('Auto trading:', os.getenv('ENABLE_AUTO_TRADING'))"
+
       - name: Lancer Trader AI Pro
-        env:
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          ENABLE_TELEGRAM_ALERTS: "true"
-          DRY_RUN: "true"
-        run: python -u scheduled_analysis.py
-        
+        run: |
+          python -u scheduled_analysis.py
