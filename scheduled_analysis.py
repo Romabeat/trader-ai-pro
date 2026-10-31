@@ -1,22 +1,26 @@
 """
 TRADER AI PRO
-Analyse automatique des indices synthetiques Deriv.
+Analyse automatique des indices Deriv.
 
-Timeframes : D1 / H4 / H2 / H1
-Alertes : Telegram
-Execution automatique : DESACTIVEE
-Mode securite : DRY_RUN
+Fonctions :
+- Recuperation des prix actuels.
+- Recuperation des bougies D1, H4, H2 et H1.
+- Analyse des 13 indices.
+- Envoi des alertes sur Telegram.
+- Controle des donnees de marche.
+- Execution automatique des ordres interdite.
+
+IMPORTANT :
+Ce programme genere des alertes.
+Les transactions restent manuelles.
 """
 
+import logging
 import os
 import sys
 import time
-import math
-import logging
-import traceback
-import requests
-
-from typing import Any, Optional
+from datetime import datetime, timezone
+from typing import Optional
 
 
 # ============================================================
@@ -25,17 +29,24 @@ from typing import Any, Optional
 
 APP_NAME = "TRADER AI PRO"
 
-DRY_RUN = os.getenv("DRY_RUN", "true").strip().lower() == "true"
-
-ENABLE_TELEGRAM_ALERTS = (
-    os.getenv("ENABLE_TELEGRAM_ALERTS", "true").strip().lower()
-    == "true"
+DRY_RUN = (
+    os.getenv("DRY_RUN", "true").strip().lower() == "true"
 )
 
-# Aucune execution automatique autorisee.
+ENABLE_TELEGRAM_ALERTS = (
+    os.getenv(
+        "ENABLE_TELEGRAM_ALERTS",
+        "true",
+    ).strip().lower() == "true"
+)
+
+# La valeur False est volontairement imposee.
+# Aucun ordre automatique ne doit etre execute.
 ENABLE_AUTO_TRADING = False
 
 MIN_CANDLES = 200
+
+REQUEST_DELAY = 0.20
 
 TIMEFRAMES = {
     "D1": 86400,
@@ -43,6 +54,30 @@ TIMEFRAMES = {
     "H2": 7200,
     "H1": 3600,
 }
+
+
+# ============================================================
+# CONFIGURATION TELEGRAM
+# ============================================================
+
+TELEGRAM_BOT_TOKEN = os.getenv(
+    "TELEGRAM_BOT_TOKEN",
+    "",
+).strip()
+
+TELEGRAM_CHAT_ID = os.getenv(
+    "TELEGRAM_CHAT_ID",
+    "",
+).strip()
+
+if TELEGRAM_BOT_TOKEN:
+    TELEGRAM_API_URL = (
+        "https://api.telegram.org/bot"
+        + TELEGRAM_BOT_TOKEN
+        + "/sendMessage"
+    )
+else:
+    TELEGRAM_API_URL = ""
 
 
 # ============================================================
@@ -66,7 +101,11 @@ SYMBOLS = [
 ]
 
 
-SYMBOL_NAMES = {
+# ============================================================
+# NOMS COMPLETS DES INDICES
+# ============================================================
+
+SYMBOL_LABELS = {
     "1HZ10V": "Volatility 10 (1s) Index",
     "1HZ15V": "Volatility 15 (1s) Index",
     "1HZ25V": "Volatility 25 (1s) Index",
@@ -84,52 +123,32 @@ SYMBOL_NAMES = {
 
 
 # ============================================================
-# CONFIGURATION TELEGRAM
-# ============================================================
-
-TELEGRAM_BOT_TOKEN = os.getenv(
-    "TELEGRAM_BOT_TOKEN", ""
-).strip()
-
-TELEGRAM_CHAT_ID = os.getenv(
-    "TELEGRAM_CHAT_ID", ""
-).strip()
-
-TELEGRAM_TIMEOUT = 15
-TELEGRAM_MAX_RETRIES = 2
-
-TELEGRAM_API_URL = (
-    "https://api.telegram.org/bot"
-    + TELEGRAM_BOT_TOKEN
-    + "/sendMessage"
-    if TELEGRAM_BOT_TOKEN
-    else ""
-)
-
-REQUEST_DELAY = 1
-SYMBOL_DELAY = 1
-
-
-# ============================================================
-# JOURNALISATION
+# CONFIGURATION DU JOURNAL
 # ============================================================
 
 logging.basicConfig(
     level=logging.INFO,
-    format=(
-        "%(asctime)s | %(levelname)s | %(message)s"
-    ),
+    format="%(asctime)s | %(levelname)s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
+    stream=sys.stdout,
 )
 
-LOGGER = logging.getLogger(APP_NAME)
+LOGGER = logging.getLogger("TRADER_AI_PRO")
 
 
 def log(message: str, level: str = "info") -> None:
-    """Enregistre un message dans les logs."""
+    """Ecrit un message dans les logs."""
 
-    method = getattr(LOGGER, level.lower(), LOGGER.info)
-    method(message)
+    message = str(message)
+
+    if level == "error":
+        LOGGER.error(message)
+
+    elif level == "warning":
+        LOGGER.warning(message)
+
+    else:
+        LOGGER.info(message)
 
 
 # ============================================================
@@ -137,84 +156,100 @@ def log(message: str, level: str = "info") -> None:
 # ============================================================
 
 def print_startup_information() -> None:
-    """Affiche la configuration generale du bot."""
+    """Affiche les parametres de fonctionnement."""
 
-    log("=" * 45)
-    log("TRADER AI PRO — ANALYSE AUTOMATIQUE")
-    log("=" * 45)
+    log("=" * 65)
+    log("TRADER AI PRO - ANALYSE DES INDICES DERIV")
+    log("=" * 65)
 
-    log("Timeframes : D1 / H4 / H2 / H1")
+    log("Timeframes : D1, H4, H2 et H1")
     log(f"Minimum de bougies par timeframe : {MIN_CANDLES}")
     log(f"Nombre d'indices : {len(SYMBOLS)}")
     log(f"DRY_RUN : {DRY_RUN}")
-    log(f"Alertes Telegram : {ENABLE_TELEGRAM_ALERTS}")
-    log("Execution automatique des ordres : DESACTIVEE")
+    log(
+        "Alertes Telegram : "
+        + str(ENABLE_TELEGRAM_ALERTS)
+    )
 
-    log("=" * 45)
-    # ============================================================
-# VERIFICATION DE LA CONFIGURATION
-# ============================================================
-
-def validate_configuration() -> bool:
-    """Verifie les parametres indispensables au fonctionnement."""
-
-    valid = True
-
-    if not DRY_RUN:
-        log(
-            "ERREUR : DRY_RUN doit obligatoirement etre True.",
-            "error",
-        )
-        valid = False
-
-    if ENABLE_AUTO_TRADING:
-        log(
-            "ERREUR : execution automatique interdite.",
-            "error",
-        )
-        valid = False
-
-    if ENABLE_TELEGRAM_ALERTS:
-        if not TELEGRAM_BOT_TOKEN:
-            log("Token Telegram absent.", "error")
-            valid = False
-
-        if not TELEGRAM_CHAT_ID:
-            log("Chat ID Telegram absent.", "error")
-            valid = False
-
-    if valid:
-        log("Configuration generale validee.")
-    else:
-        log("Configuration invalide.", "error")
-
-    return valid
-
-
-# ============================================================
-# DIAGNOSTIC DES SECRETS
-# ============================================================
-
-def print_secret_status() -> None:
-    """Affiche uniquement la presence des secrets."""
-
-    token_present = bool(TELEGRAM_BOT_TOKEN)
-    chat_present = bool(TELEGRAM_CHAT_ID)
+    log(
+        "Execution automatique des ordres : "
+        "DESACTIVEE"
+    )
 
     log(
         "Telegram token present : "
-        + str(token_present)
+        + str(bool(TELEGRAM_BOT_TOKEN))
     )
 
     log(
         "Telegram chat ID present : "
-        + str(chat_present)
+        + str(bool(TELEGRAM_CHAT_ID))
     )
 
-    # Ne jamais afficher les valeurs des secrets.
+    log("Aucune valeur de secret ne sera affichee.")
+    log("=" * 65)
 
 
 # ============================================================
+# VALIDATION DES PARAMETRES
+# ============================================================
+
+def is_positive_number(value) -> bool:
+    """Verifie qu'une valeur numerique est finie et positive."""
+
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+    return (
+        number > 0
+        and number == number
+        and abs(number) != float("inf")
+    )
+
+
+def validate_configuration() -> bool:
+    """Verifie la configuration generale."""
+
+    if ENABLE_AUTO_TRADING is not False:
+        log(
+            "SECURITE : execution automatique interdite.",
+            "error",
+        )
+        return False
+
+    if len(SYMBOLS) != 13:
+        log(
+            "Configuration invalide : nombre d'indices incorrect.",
+            "error",
+        )
+        return False
+
+    if len(set(SYMBOLS)) != len(SYMBOLS):
+        log(
+            "Configuration invalide : symboles en double.",
+            "error",
+        )
+        return False
+
+    if MIN_CANDLES != 200:
+        log(
+            "Configuration invalide : 200 bougies requises.",
+            "error",
+        )
+        return False
+
+    if not all(symbol in SYMBOL_LABELS for symbol in SYMBOLS):
+        log(
+            "Un ou plusieurs noms d'indices sont manquants.",
+            "error",
+        )
+        return False
+
+    log("Configuration generale validee.")
+    return True
+    # ============================================================
 # CHARGEMENT DU MODULE DERIV
 # ============================================================
 
@@ -225,7 +260,6 @@ try:
     )
 
     DERIV_MODULE_READY = True
-
     log("Module Deriv charge.")
 
 except Exception as exc:
@@ -248,7 +282,6 @@ try:
     )
 
     STRATEGY_MODULE_READY = True
-
     log("Module strategie charge.")
 
 except Exception as exc:
@@ -261,138 +294,18 @@ except Exception as exc:
 
 
 # ============================================================
-# VERIFICATION DES MODULES
-# ============================================================
-
-def validate_modules() -> bool:
-    """Verifie que les modules indispensables sont disponibles."""
-
-    if not DERIV_MODULE_READY:
-        log("Module Deriv indisponible.", "error")
-        return False
-
-    if not STRATEGY_MODULE_READY:
-        log("Module strategie indisponible.", "error")
-        return False
-
-    log("Tous les modules sont charges.")
-
-    return True
-
-
-# ============================================================
-# VALIDATION DES VALEURS NUMERIQUES
-# ============================================================
-
-def is_valid_number(value: Any) -> bool:
-    """Verifie qu'une valeur est numerique et finie."""
-
-    try:
-        number = float(value)
-    except (TypeError, ValueError, OverflowError):
-        return False
-
-    return math.isfinite(number)
-
-
-def is_positive_number(value: Any) -> bool:
-    """Verifie qu'une valeur numerique est strictement positive."""
-
-    if not is_valid_number(value):
-        return False
-
-    return float(value) > 0
-
-
-# ============================================================
-# VALIDATION DES BOUGIES
-# ============================================================
-
-def validate_candles(candles: Any) -> list:
-    """Nettoie et valide une liste de bougies."""
-
-    if not isinstance(candles, list):
-        return []
-
-    validated = []
-
-    for candle in candles:
-
-        if not isinstance(candle, dict):
-            continue
-
-        try:
-            epoch = int(candle.get("epoch"))
-            open_price = float(candle.get("open"))
-            high = float(candle.get("high"))
-            low = float(candle.get("low"))
-            close = float(candle.get("close"))
-
-        except (TypeError, ValueError, OverflowError):
-            continue
-
-        values = (
-            open_price,
-            high,
-            low,
-            close,
-        )
-
-        if not all(math.isfinite(value) for value in values):
-            continue
-
-        if min(values) <= 0:
-            continue
-
-        if high < low:
-            continue
-
-        if high < max(open_price, close):
-            continue
-
-        if low > min(open_price, close):
-            continue
-
-        validated.append({
-            "epoch": epoch,
-            "open": open_price,
-            "high": high,
-            "low": low,
-            "close": close,
-        })
-
-    validated.sort(key=lambda item: item["epoch"])
-
-    # Suppression des doublons temporels.
-    unique = {}
-
-    for candle in validated:
-        unique[candle["epoch"]] = candle
-
-    result = list(unique.values())
-
-    if len(result) < MIN_CANDLES:
-        log(
-            "Bougies insuffisantes : "
-            f"{len(result)}/{MIN_CANDLES}.",
-            "warning",
-        )
-        return []
-
-    return result
-    # ============================================================
-# RECUPERATION DES BOUGIES PAR TIMEFRAME
+# RECUPERATION DES BOUGIES D'UN TIMEFRAME
 # ============================================================
 
 def fetch_timeframe_candles(
     symbol: str,
     timeframe: str,
 ) -> list:
-    """Recupere et valide les bougies d'une unite de temps."""
+    """Recupere les bougies d'un timeframe."""
 
     if timeframe not in TIMEFRAMES:
         log(
-            f"{symbol} : timeframe invalide : {timeframe}",
+            f"{symbol} : timeframe inconnu {timeframe}.",
             "error",
         )
         return []
@@ -400,7 +313,7 @@ def fetch_timeframe_candles(
     granularity = TIMEFRAMES[timeframe]
 
     try:
-        raw_candles = get_candles(
+        candles = get_candles(
             symbol,
             granularity,
             count=MIN_CANDLES,
@@ -408,23 +321,28 @@ def fetch_timeframe_candles(
 
     except Exception as exc:
         log(
-            f"{symbol} {timeframe} : erreur Deriv : {exc}",
+            f"{symbol} : erreur bougies {timeframe} : {exc}",
             "error",
         )
         return []
 
-    candles = validate_candles(raw_candles)
-
-    if not candles:
+    if not isinstance(candles, list):
         log(
-            f"{symbol} {timeframe} : aucune donnee valide.",
+            f"{symbol} : format de bougies invalide ({timeframe}).",
             "warning",
         )
         return []
 
+    if len(candles) < MIN_CANDLES:
+        log(
+            f"{symbol} : {len(candles)}/{MIN_CANDLES} bougies "
+            f"recues pour {timeframe}.",
+            "warning",
+        )
+        return candles
+
     log(
-        f"{symbol} {timeframe} : "
-        f"{len(candles)} bougies recuperees."
+        f"{symbol} : {len(candles)} bougies {timeframe} recuperees."
     )
 
     return candles
@@ -435,7 +353,7 @@ def fetch_timeframe_candles(
 # ============================================================
 
 def fetch_current_price(symbol: str) -> Optional[float]:
-    """Recupere le dernier prix disponible sur Deriv."""
+    """Recupere et valide le dernier prix disponible."""
 
     try:
         price = get_current_price(symbol)
@@ -454,7 +372,14 @@ def fetch_current_price(symbol: str) -> Optional[float]:
         )
         return None
 
-    return float(price)
+    price = float(price)
+
+    log(
+        f"{SYMBOL_LABELS.get(symbol, symbol)} "
+        f"({symbol}) | PRIX ACTUEL : {price}"
+    )
+
+    return price
 
 
 # ============================================================
@@ -462,7 +387,7 @@ def fetch_current_price(symbol: str) -> Optional[float]:
 # ============================================================
 
 def fetch_market_data(symbol: str) -> Optional[dict]:
-    """Recupere les quatre timeframes et le prix actuel."""
+    """Recupere le prix et les quatre timeframes."""
 
     if symbol not in SYMBOLS:
         log(
@@ -471,11 +396,18 @@ def fetch_market_data(symbol: str) -> Optional[dict]:
         )
         return None
 
+    label = SYMBOL_LABELS.get(symbol, symbol)
+
+    log("-" * 65)
+    log(f"INDICE : {label}")
+    log(f"SYMBOLE : {symbol}")
+
     market_data = {
         "symbol": symbol,
+        "label": label,
     }
 
-    # Recuperation D1, H4, H2 et H1.
+    # Recuperation des bougies D1, H4, H2 et H1.
     for timeframe in ("D1", "H4", "H2", "H1"):
 
         candles = fetch_timeframe_candles(
@@ -496,249 +428,101 @@ def fetch_market_data(symbol: str) -> Optional[dict]:
         time.sleep(REQUEST_DELAY)
 
     # Recuperation du prix actuel.
+    current_price = fetch_current_price(symbol)
 
-current_price = fetch_current_price(symbol)
-
-if current_price is None:
-    log(
-        f"{symbol} : prix actuel indisponible.",
-        "warning",
-    )
-    return None
-
-market_data["current_price"] = current_price
-
-log(
-    f"{symbol} : PRIX ACTUEL = {current_price}"
-)
-
-log(
-    f"{symbol} : donnees multi-timeframe complete."
-)
-
-return market_data
-
-
-
-
-# ============================================================
-# VERIFICATION DES DONNEES DE MARCHE
-# ============================================================
-
-def validate_market_data(market_data: dict) -> bool:
-    """Verifie que toutes les donnees necessaires sont presentes."""
-
-    if not isinstance(market_data, dict):
-        return False
-
-    if not is_positive_number(
-        market_data.get("current_price")
-    ):
-        return False
-
-    for timeframe in ("D1", "H4", "H2", "H1"):
-
-        candles = market_data.get(timeframe)
-
-        if not isinstance(candles, list):
-            return False
-
-        if len(candles) < MIN_CANDLES:
-            return False
-
-    return True
-
-
-# ============================================================
-# ANALYSE DES DONNEES D'UN SYMBOLE
-# ============================================================
-
-def analyze_symbol(symbol: str) -> list:
-    """Recupere les donnees puis appelle la strategie."""
-
-    log(
-        f"Debut de l'analyse : "
-        f"{SYMBOL_NAMES.get(symbol, symbol)}"
-    )
-
-    market_data = fetch_market_data(symbol)
-
-    if market_data is None:
-        return []
-
-    if not validate_market_data(market_data):
+    if current_price is None:
         log(
-            f"{symbol} : donnees de marche invalides.",
+            f"{symbol} : prix actuel indisponible. "
+            "Analyse abandonnee.",
             "warning",
         )
-        return []
+        return None
 
-    try:
-        signals = find_signals(
-            symbol,
-            market_data,
-        )
-
-    except Exception as exc:
-        log(
-            f"{symbol} : erreur dans la strategie : {exc}",
-            "error",
-        )
-        LOGGER.exception("Detail de l'erreur strategique.")
-        return []
-
-    if signals is None:
-        return []
-
-    if isinstance(signals, dict):
-        signals = [signals]
-
-    if not isinstance(signals, list):
-        log(
-            f"{symbol} : format de signal invalide.",
-            "warning",
-        )
-        return []
-
-    valid_signals = [
-        signal
-        for signal in signals
-        if isinstance(signal, dict)
-    ]
+    market_data["current_price"] = current_price
 
     log(
-        f"{symbol} : {len(valid_signals)} signal(aux) detecte(s)."
+        f"{symbol} : donnees multi-timeframe completes."
     )
 
-    return valid_signals
+    log("-" * 65)
+
+    return market_data
     # ============================================================
-# VERIFICATION DE LA DISPONIBILITE TELEGRAM
+# CONFIGURATION ET ENVOI TELEGRAM
 # ============================================================
 
 def telegram_is_ready() -> bool:
-    """Verifie que Telegram est correctement configure."""
+    """Verifie si Telegram est correctement configure."""
+
+    return (
+        ENABLE_TELEGRAM_ALERTS
+        and bool(TELEGRAM_BOT_TOKEN)
+        and bool(TELEGRAM_CHAT_ID)
+    )
+
+
+def send_telegram_message(message: str) -> bool:
+    """Envoie une notification Telegram."""
 
     if not ENABLE_TELEGRAM_ALERTS:
         log("Alertes Telegram desactivees.")
         return False
 
-    if not TELEGRAM_BOT_TOKEN:
-        log("Token Telegram absent.", "error")
-        return False
-
-    if not TELEGRAM_CHAT_ID:
-        log("Chat ID Telegram absent.", "error")
-        return False
-
-    return True
-
-
-# ============================================================
-# ENVOI D'UN MESSAGE TELEGRAM
-# ============================================================
-
-def send_telegram_message(message: str) -> bool:
-    """Envoie un message Telegram avec plusieurs tentatives."""
-
     if not telegram_is_ready():
+        log(
+            "Telegram indisponible : configuration incomplete.",
+            "warning",
+        )
         return False
-
-    if not isinstance(message, str) or not message.strip():
-        log("Message Telegram vide.", "warning")
-        return False
-
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "disable_web_page_preview": True,
-    }
-
-    for attempt in range(1, TELEGRAM_MAX_RETRIES + 1):
-
-        try:
-            response = requests.post(
-                TELEGRAM_API_URL,
-                json=payload,
-                timeout=TELEGRAM_TIMEOUT,
-            )
-
-            if response.status_code == 200:
-                result = response.json()
-
-                if result.get("ok") is True:
-                    log("Message Telegram envoye.")
-                    return True
-
-                log(
-                    "Telegram a refuse le message.",
-                    "error",
-                )
-
-            else:
-                log(
-                    "Erreur HTTP Telegram : "
-                    f"{response.status_code}",
-                    "error",
-                )
-
-        except requests.RequestException as exc:
-            log(
-                f"Erreur reseau Telegram : {exc}",
-                "error",
-            )
-
-        if attempt < TELEGRAM_MAX_RETRIES:
-            time.sleep(2)
-
-    log(
-        "Echec definitif de l'envoi Telegram.",
-        "error",
-    )
-
-    return False
-
-
-# ============================================================
-# PREPARATION DU MESSAGE DU SIGNAL
-# ============================================================
-
-def prepare_signal_message(signal: dict) -> Optional[str]:
-    """Formate un signal avec la fonction de strategie."""
-
-    if not isinstance(signal, dict):
-        return None
 
     try:
-        message = format_message(signal)
+        import requests
+
+        response = requests.post(
+            TELEGRAM_API_URL,
+            json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": message,
+                "disable_web_page_preview": True,
+            },
+            timeout=20,
+        )
+
+        if response.status_code != 200:
+            log(
+                f"Erreur Telegram HTTP {response.status_code}.",
+                "error",
+            )
+            return False
+
+        result = response.json()
+
+        if not result.get("ok", False):
+            log(
+                "Telegram a refuse le message.",
+                "error",
+            )
+            return False
+
+        log("Notification Telegram envoyee.")
+        return True
 
     except Exception as exc:
         log(
-            f"Erreur de formatage du signal : {exc}",
+            f"Echec envoi Telegram : {exc}",
             "error",
         )
-        return None
-
-    if not isinstance(message, str) or not message.strip():
-        return None
-
-    return message
+        return False
 
 
 # ============================================================
-# VALIDATION DE SECURITE DU SIGNAL
+# VALIDATION DES SIGNAUX
 # ============================================================
 
 def validate_signal(signal: dict) -> bool:
-    """Verifie les donnees essentielles avant notification."""
+    """Verifie les champs essentiels d'un signal."""
 
     if not isinstance(signal, dict):
-        return False
-
-    direction = str(
-        signal.get("direction", "")
-    ).upper()
-
-    if direction not in ("BUY", "SELL"):
         return False
 
     required_fields = (
@@ -749,419 +533,325 @@ def validate_signal(signal: dict) -> bool:
     )
 
     for field in required_fields:
-        if not is_valid_number(signal.get(field)):
+        if field not in signal:
+            log(
+                f"Signal ignore : champ manquant {field}.",
+                "warning",
+            )
             return False
+
+    if not all(
+        is_positive_number(signal[field])
+        for field in required_fields
+    ):
+        log(
+            "Signal ignore : valeurs numeriques invalides.",
+            "warning",
+        )
+        return False
 
     entry = float(signal["entry"])
     stop_loss = float(signal["stop_loss"])
     take_profit = float(signal["take_profit"])
     rr = float(signal["rr"])
 
-    if entry <= 0 or stop_loss <= 0 or take_profit <= 0:
+    if entry == stop_loss or entry == take_profit:
+        log(
+            "Signal ignore : niveaux de prix incoherents.",
+            "warning",
+        )
         return False
 
     if rr < 1.0:
+        log(
+            f"Signal ignore : RR insuffisant ({rr:.2f}).",
+            "warning",
+        )
         return False
-
-    if direction == "BUY":
-        if not stop_loss < entry < take_profit:
-            return False
-
-    if direction == "SELL":
-        if not take_profit < entry < stop_loss:
-            return False
 
     return True
 
 
 # ============================================================
-# TRAITEMENT DES SIGNAUX
+# ANALYSE D'UN INDICE
 # ============================================================
 
-def process_signals(
-    symbol: str,
-    signals: list,
-) -> int:
-    """Valide et transmet les signaux trouves."""
+def process_symbol(symbol: str) -> int:
+    """Recupere les donnees et analyse un indice."""
 
-    if not isinstance(signals, list):
+    label = SYMBOL_LABELS.get(symbol, symbol)
+
+    log("=" * 65)
+    log(f"ANALYSE : {label} ({symbol})")
+
+    market_data = fetch_market_data(symbol)
+
+    if market_data is None:
+        log(
+            f"{symbol} : analyse impossible, donnees incompletes.",
+            "warning",
+        )
         return 0
 
-    sent_count = 0
+    log(
+        f"{symbol} : prix utilise pour l'analyse = "
+        f"{market_data['current_price']}"
+    )
+
+    try:
+        signals = find_signals(
+            symbol,
+            market_data,
+        )
+
+    except Exception as exc:
+        log(
+            f"{symbol} : erreur de strategie : {exc}",
+            "error",
+        )
+        return 0
+
+    if signals is None:
+        log(f"{symbol} : aucun signal retourne.")
+        return 0
+
+    if isinstance(signals, dict):
+        signals = [signals]
+
+    if not isinstance(signals, (list, tuple)):
+        log(
+            f"{symbol} : format de signaux invalide.",
+            "warning",
+        )
+        return 0
+
+    valid_count = 0
 
     for signal in signals:
-
         if not validate_signal(signal):
+            continue
+
+        signal.setdefault("symbol", symbol)
+        signal.setdefault("label", label)
+        signal.setdefault(
+            "current_price",
+            market_data["current_price"],
+        )
+
+        try:
+            message = format_message(signal)
+
+        except Exception as exc:
             log(
-                f"{symbol} : signal invalide rejete.",
+                f"{symbol} : erreur de formatage du signal : {exc}",
+                "error",
+            )
+            continue
+
+        if not isinstance(message, str) or not message.strip():
+            log(
+                f"{symbol} : message de signal vide.",
                 "warning",
             )
             continue
 
-        message = prepare_signal_message(signal)
-
-        if message is None:
-            continue
-
-        if not ENABLE_TELEGRAM_ALERTS:
-            log(
-                f"{symbol} : signal detecte, "
-                "mais alertes desactivees."
-            )
-            continue
-
-        if send_telegram_message(message):
-            sent_count += 1
-
-        time.sleep(REQUEST_DELAY)
-
-    return sent_count
-    # ============================================================
-# ANALYSE COMPLETE D'UN INDICE
-# ============================================================
-
-def process_symbol(symbol: str) -> int:
-    """Execute toutes les etapes d'analyse pour un indice."""
-
-    log("-" * 45)
-    log(
-        f"ANALYSE : {SYMBOL_NAMES.get(symbol, symbol)}"
-    )
-
-    try:
-        signals = analyze_symbol(symbol)
-
-        if not signals:
-            log(
-                f"{symbol} : aucun signal valide detecte."
-            )
-            return 0
-
-        sent_count = process_signals(
-            symbol,
-            signals,
-        )
-
         log(
-            f"{symbol} : {len(signals)} signal(aux) "
-            f"valide(s), {sent_count} alerte(s) envoyee(s)."
+            f"{symbol} : signal valide detecte, "
+            f"RR={float(signal['rr']):.2f}."
         )
 
-        return sent_count
+        if telegram_is_ready():
+            send_telegram_message(message)
+        else:
+            log(
+                "Signal non envoye : Telegram non configure.",
+                "warning",
+            )
 
-    except Exception as exc:
-        log(
-            f"{symbol} : erreur inattendue : {exc}",
-            "error",
-        )
-        LOGGER.exception(
-            "Detail de l'erreur pendant le traitement."
-        )
-        return 0
+        valid_count += 1
+
+    if valid_count == 0:
+        log(f"{symbol} : aucun signal valide.")
+
+    return valid_count
 
 
 # ============================================================
-# CONTROLE DES MODULES
+# VERIFICATION DES MODULES
 # ============================================================
 
 def check_application_modules() -> bool:
-    """Verifie la disponibilite des modules necessaires."""
+    """Verifie que les modules necessaires sont charges."""
 
     if not DERIV_MODULE_READY:
         log(
-            "Module deriv_market indisponible.",
+            "Module Deriv indisponible.",
             "error",
         )
         return False
 
     if not STRATEGY_MODULE_READY:
         log(
-            "Module strategy indisponible.",
+            "Module strategie indisponible.",
             "error",
         )
         return False
 
-    log("Modules Deriv et Strategy disponibles.")
-
+    log("Modules applicatifs disponibles.")
     return True
 
 
 # ============================================================
-# RAPPORT FINAL DU CYCLE
+# VERIFICATION DE LA CONFIGURATION
+# ============================================================
+
+def run_preflight_checks() -> bool:
+    """Effectue les controles avant l'analyse."""
+
+    log("Verification prealable de la configuration.")
+
+    if not validate_configuration():
+        return False
+
+    if not check_application_modules():
+        return False
+
+    if ENABLE_TELEGRAM_ALERTS and not telegram_is_ready():
+        log(
+            "Attention : alertes Telegram activees, "
+            "mais configuration incomplete.",
+            "warning",
+        )
+
+    if ENABLE_AUTO_TRADING:
+        log(
+            "SECURITE : le trading automatique doit rester desactive.",
+            "error",
+        )
+        return False
+
+    log("Tous les controles prealables sont termines.")
+    return True
+
+
+# ============================================================
+# RESUME DE L'ANALYSE
 # ============================================================
 
 def print_analysis_summary(
-    analyzed_count: int,
-    alert_count: int,
-    error_count: int,
+    analyzed: int,
+    skipped: int,
+    signal_count: int,
 ) -> None:
-    """Affiche le bilan du cycle d'analyse."""
+    """Affiche le bilan de l'execution."""
 
-    log("=" * 45)
-    log("BILAN DU CYCLE TRADER AI PRO")
-    log("=" * 45)
-
-    log(f"Indices traites : {analyzed_count}")
-    log(f"Alertes Telegram envoyees : {alert_count}")
-    log(f"Erreurs detectees : {error_count}")
-
+    log("=" * 65)
+    log("RESUME DE L'ANALYSE TRADER AI PRO")
+    log(f"Indices prevus : {len(SYMBOLS)}")
+    log(f"Indices analyses : {analyzed}")
+    log(f"Indices ignores ou en echec : {skipped}")
+    log(f"Signaux valides detectes : {signal_count}")
     log(f"DRY_RUN : {DRY_RUN}")
-    log("Execution automatique des ordres : DESACTIVEE")
-
-    log("=" * 45)
+    log("Execution automatique : DESACTIVEE")
+    log("=" * 65)
 
 
 # ============================================================
-# EXECUTION PRINCIPALE
+# LANCEMENT DE L'ANALYSE
 # ============================================================
 
 def run_analysis() -> int:
-    """Lance un cycle complet d'analyse des indices."""
+    """Lance l'analyse complete des indices."""
 
     print_startup_information()
 
-    # Diagnostic sans afficher les secrets.
-    print_secret_status()
-
-    # Verification des modules.
-    # Controles prealables complets.
     if not run_preflight_checks():
-       return 1
-
-    # Verification de la configuration.
-    if not validate_configuration():
         log(
-            "Configuration invalide. Analyse interrompue.",
+            "Analyse interrompue : controles prealables echoues.",
             "error",
         )
         return 1
 
-    analyzed_count = 0
-    alert_count = 0
-    error_count = 0
+    started_at = datetime.now(timezone.utc)
 
-    log("Demarrage du scanner des indices Deriv.")
+    log(
+        "Debut de l'analyse : "
+        + started_at.strftime("%Y-%m-%d %H:%M:%S UTC")
+    )
+
+    analyzed = 0
+    skipped = 0
+    signal_count = 0
 
     for index, symbol in enumerate(SYMBOLS, start=1):
-
         log(
-            f"Progression : {index}/{len(SYMBOLS)}"
+            f"Progression : indice {index}/{len(SYMBOLS)}"
         )
 
         try:
-            alert_count += process_symbol(symbol)
-            analyzed_count += 1
+            count = process_symbol(symbol)
+
+            if count >= 0:
+                analyzed += 1
+                signal_count += count
+            else:
+                skipped += 1
 
         except Exception as exc:
-            error_count += 1
-
+            skipped += 1
             log(
-                f"Erreur generale pour {symbol} : {exc}",
+                f"Erreur inattendue pour {symbol} : {exc}",
                 "error",
             )
 
-            LOGGER.exception(
-                "Erreur detaillee du traitement."
-            )
-
         if index < len(SYMBOLS):
-            time.sleep(SYMBOL_DELAY)
+            time.sleep(REQUEST_DELAY)
 
     print_analysis_summary(
-        analyzed_count,
-        alert_count,
-        error_count,
+        analyzed,
+        skipped,
+        signal_count,
     )
 
-    log("Cycle d'analyse termine.")
+    finished_at = datetime.now(timezone.utc)
+
+    log(
+        "Fin de l'analyse : "
+        + finished_at.strftime("%Y-%m-%d %H:%M:%S UTC")
+    )
+
+    # Le programme signale un echec si aucun indice n'a pu etre analyse.
+    if analyzed == 0:
+        log(
+            "Aucun indice n'a pu etre analyse. "
+            "Verifier la connexion aux donnees Deriv.",
+            "error",
+        )
+        return 1
 
     return 0
 
 
 # ============================================================
-# POINT D'ENTREE DU PROGRAMME
+# POINT D'ENTREE
 # ============================================================
 
 def main() -> None:
-    """Point d'entree principal."""
+    """Point d'entree du programme."""
 
     try:
         exit_code = run_analysis()
-
     except KeyboardInterrupt:
-        log(
-            "Analyse interrompue manuellement.",
-            "warning",
-        )
+        log("Analyse interrompue manuellement.", "warning")
         exit_code = 130
-
     except Exception as exc:
         log(
-            f"Erreur critique : {exc}",
+            f"Erreur fatale : {exc}",
             "error",
-        )
-        LOGGER.exception(
-            "Erreur critique non geree."
         )
         exit_code = 1
 
-    sys.exit(exit_code)
-    # ============================================================
-# CONTROLES FINAUX DE SECURITE
-# ============================================================
-
-def final_security_check() -> bool:
-    """Verifie les conditions de securite avant le scanner."""
-
-    log("Verification finale de securite.")
-
-    # Le mode DRY_RUN doit obligatoirement rester actif.
-    if DRY_RUN is not True:
-        log(
-            "SECURITE : DRY_RUN doit etre active.",
-            "error",
-        )
-        return False
-
-    # Aucun ordre automatique ne doit etre autorise.
-    if ENABLE_AUTO_TRADING is not False:
-        log(
-            "SECURITE : execution automatique interdite.",
-            "error",
-        )
-        return False
-
-    # Les identifiants Telegram ne sont jamais affiches.
-    if ENABLE_TELEGRAM_ALERTS:
-        if not TELEGRAM_BOT_TOKEN:
-            log(
-                "SECURITE : token Telegram absent.",
-                "error",
-            )
-            return False
-
-        if not TELEGRAM_CHAT_ID:
-            log(
-                "SECURITE : identifiant Telegram absent.",
-                "error",
-            )
-            return False
-
-    log("Verification finale de securite reussie.")
-
-    return True
-
-
-# ============================================================
-# CONTROLE DE COHERENCE DES TIMEFRAMES
-# ============================================================
-
-def check_timeframe_configuration() -> bool:
-    """Verifie la configuration des quatre timeframes."""
-
-    expected = {
-        "D1": 86400,
-        "H4": 14400,
-        "H2": 7200,
-        "H1": 3600,
-    }
-
-    if TIMEFRAMES != expected:
-        log(
-            "Configuration des timeframes incorrecte.",
-            "error",
-        )
-        return False
-
-    if MIN_CANDLES < 200:
-        log(
-            "Nombre minimum de bougies insuffisant.",
-            "error",
-        )
-        return False
-
-    log(
-        "Timeframes D1/H4/H2/H1 : configuration valide."
-    )
-
-    log(
-        f"Minimum de bougies par timeframe : {MIN_CANDLES}"
-    )
-
-    return True
-
-
-# ============================================================
-# CONTROLE DE LA LISTE DES INDICES
-# ============================================================
-
-def check_symbols_configuration() -> bool:
-    """Verifie les symboles et leurs noms complets."""
-
-    if not SYMBOLS:
-        log(
-            "Aucun indice configure.",
-            "error",
-        )
-        return False
-
-    if len(SYMBOLS) != len(set(SYMBOLS)):
-        log(
-            "Des symboles sont dupliques.",
-            "error",
-        )
-        return False
-
-    missing_names = [
-        symbol
-        for symbol in SYMBOLS
-        if symbol not in SYMBOL_NAMES
-    ]
-
-    if missing_names:
-        log(
-            "Noms complets manquants : "
-            + ", ".join(missing_names),
-            "error",
-        )
-        return False
-
-    log(
-        f"Configuration des {len(SYMBOLS)} indices valide."
-    )
-
-    return True
-
-
-# ============================================================
-# CONTROLE GLOBAL AVANT ANALYSE
-# ============================================================
-
-def run_preflight_checks() -> bool:
-    """Execute tous les controles avant le scanner."""
-
-    log("=" * 45)
-    log("CONTROLES PREALABLES")
-    log("=" * 45)
-
-    checks = [
-        final_security_check(),
-        check_timeframe_configuration(),
-        check_symbols_configuration(),
-        check_application_modules(),
-    ]
-
-    if not all(checks):
-        log(
-            "Echec des controles prealables.",
-            "error",
-        )
-        return False
-
-    log("Tous les controles prealables sont valides.")
-    log("=" * 45)
-
-    return True
+    raise SystemExit(exit_code)
 
 
 if __name__ == "__main__":
