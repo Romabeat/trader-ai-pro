@@ -1,4 +1,19 @@
-""" TRADER AI PRO Analyse automatique des indices Deriv. Fonctions : - Recuperation des prix actuels. - Recuperation des bougies D1, H4, H2 et H1. - Analyse des 13 indices. - Envoi des alertes sur Telegram. - Controle des donnees de marche. - Execution automatique des ordres interdite. IMPORTANT : Ce programme genere des alertes. Les transactions restent manuelles. """
+"""
+TRADER AI PRO
+Analyse automatique des indices Deriv.
+
+Fonctions :
+- Recuperation des prix actuels.
+- Recuperation des bougies D1, H4, H2 et H1.
+- Analyse des 13 indices.
+- Envoi des alertes sur Telegram.
+- Controle des donnees de marche.
+- Execution automatique des ordres interdite.
+
+IMPORTANT :
+Ce programme genere des alertes.
+Les transactions restent manuelles.
+"""
 
 import logging
 import os
@@ -234,7 +249,9 @@ def validate_configuration() -> bool:
 
     log("Configuration generale validee.")
     return True
-    # ============================================================
+
+
+# ============================================================
 # CHARGEMENT DU MODULE DERIV
 # ============================================================
 
@@ -275,14 +292,15 @@ except Exception as exc:
     log(
         f"Erreur de chargement du module strategie : {exc}",
         "error",
-    )
-
-
-# ============================================================
+)
+    # ============================================================
 # RECUPERATION DES BOUGIES D'UN TIMEFRAME
 # ============================================================
 
-def fetch_timeframe_candles( symbol: str, timeframe: str, ) -> list:
+def fetch_timeframe_candles(
+    symbol: str,
+    timeframe: str,
+) -> list:
     """Recupere les bougies d'un timeframe."""
 
     if timeframe not in TIMEFRAMES:
@@ -429,7 +447,9 @@ def fetch_market_data(symbol: str) -> Optional[dict]:
     log("-" * 65)
 
     return market_data
-    # ============================================================
+
+
+# ============================================================
 # CONFIGURATION ET ENVOI TELEGRAM
 # ============================================================
 
@@ -632,6 +652,7 @@ def process_symbol(symbol: str) -> int:
         f"{analysis_result.get('direction', 'N/A')} | "
         f"RR = {analysis_result.get('risk_reward', 'N/A')}"
     )
+
     signals = [dict(analysis_result)]
     signals[0]["rr"] = signals[0].get("risk_reward")
     signals[0]["automatic_execution"] = False
@@ -692,9 +713,7 @@ def process_symbol(symbol: str) -> int:
         log(f"{symbol} : aucun signal valide.")
 
     return valid_count
-
-
-# ============================================================
+    # ============================================================
 # VERIFICATION DES MODULES
 # ============================================================
 
@@ -756,7 +775,11 @@ def run_preflight_checks() -> bool:
 # RESUME DE L'ANALYSE
 # ============================================================
 
-def print_analysis_summary( analyzed: int, skipped: int, signal_count: int, ) -> None:
+def print_analysis_summary(
+    analyzed: int,
+    skipped: int,
+    signal_count: int,
+) -> None:
     """Affiche le bilan de l'execution."""
 
     log("=" * 65)
@@ -804,7 +827,8 @@ def run_analysis() -> int:
 
         try:
             count = process_symbol(symbol)
-             if count >= 0:
+
+            if count >= 0:
                 analyzed += 1
                 signal_count += count
             else:
@@ -868,4 +892,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()     
+    main()
