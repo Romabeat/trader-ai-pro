@@ -359,4 +359,477 @@ def telegram_is_configured() -> bool:
     return bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID)
 
 
-def send_telegram(message: str) -> bool
+def send_telegram(message: str) -> bool:
+    if not ENABLE_TELEGRAM_ALERTS:
+        logger.info("Alertes Telegram désactivées.")
+        return False
+
+    if not telegram_is_configured():
+        logger.warning(
+            "Telegram non configuré : token ou chat ID absent."
+        )
+        return False
+
+    url = (
+        f"https://api.telegram.org/bot"
+        f"{TELEGRAM_TOKEN}/sendMessage"
+    )
+
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "disable_web_page_preview": True,
+    }
+
+    try:
+        response = requests.post(
+            url,
+            json=payload,
+            timeout=REQUEST_TIMEOUT,
+        )
+
+        response.raise_for_status()
+
+        data = response.json()
+
+        if not data.get("ok"):
+            logger.error(
+                "Telegram a refusé le message : %s",
+                data,
+            )
+            return False
+
+        logger.info("Alerte Telegram envoyée.")
+        return True
+
+    except Exception as exc:
+        logger.error(
+            "Échec de l'envoi Telegram : %s",
+            exc,
+        )
+        return False
+
+
+# ============================================================
+# RÉCUPÉRATION DES BOUGIES
+# ============================================================
+
+def normalize_candles(
+    candles: Any,
+) -> list[dict[str, Any]]:
+    """
+    Normalise les bougies et supprime les doublons d'époque.
+    """
+
+    if isinstance(candles, dict):
+        candles = candles.get("candles", [])
+
+    if not isinstance(candles, list):
+        return []
+
+    result = []
+    seen_epochs = set()
+
+    for item in candles:
+        if not isinstance(item, dict):
+            continue
+
+        try:
+            epoch = int(item["epoch"])
+
+            opening = float(item["open"])
+            high = float(item["high"])
+            low = float(item["low"])
+            close = float(item["close"])
+
+        except (KeyError, TypeError, ValueError):
+            continue
+
+        values = [opening, high, low, close]
+
+        if any(
+            not math.isfinite(value) or value <= 0
+            for value in values
+        ):
+            continue
+
+        if high < max(opening, close):
+            continue
+
+        if low > min(opening, close):
+            continue
+
+        if high < low or epoch in seen_epochs:
+            continue
+
+        seen_epochs.add(epoch)
+
+        result.append({
+            "epoch": epoch,
+            "open": opening,
+            "high": high,
+            "low": low,
+            "close": close,
+        })
+
+    result.sort(key=lambda candle: candle["epoch"])
+
+    return result
+
+
+def fetch_candles(
+    symbol: str,
+    timeframe: str,
+    required_count: int,
+) -> list[dict[str, Any]]:
+    """
+    Récupère les bougies d'une unité de temps.
+
+    Les bougies encore en formation sont exclues par
+    deriv_market.py.
+    """
+
+    response = get_candles(
+        symbol,
+        timeframe,
+        count=required_count + 1,
+        timeout=REQUEST_TIMEOUT,
+    )
+
+    if not isinstance(response, dict):
+        logger.warning(
+            "%s %s : réponse Deriv inattendue.",
+            symbol,
+            timeframe,
+        )
+        return []
+
+    if response.get("error"):
+        logger.warning(
+            "%s %s : %s",
+            symbol,
+            timeframe,
+            response["error"],
+        )
+        return []
+
+    candles = normalize_candles(response.get("candles", []))
+
+    if len(candles) < required_count:
+        logger.warning(
+            "%s %s : %s/%s bougies disponibles.",
+            symbol,
+            timeframe,
+            len(candles),
+            required_count,
+        )
+        return []
+
+    candles = candles[-required_count:]
+
+    logger.info(
+        "%s %s : %s bougies utilisables.",
+        symbol,
+        timeframe,
+        len(candles),
+    )
+
+    return candles
+
+
+# ============================================================
+# PRIX COURANT
+# ============================================================
+
+def fetch_current_price(symbol: str) -> float | None:
+    try:
+        response = get_current_price(
+            symbol,
+            timeout=REQUEST_TIMEOUT,
+        )
+
+    except Exception as exc:
+        logger.warning(
+            "%s : erreur de récupération du prix : %s",
+            symbol,
+            exc,
+        )
+        return None
+
+    if isinstance(response, dict):
+        if response.get("error"):
+            logger.warning(
+                "%s : %s",
+                symbol,
+                response["error"],
+            )
+            return None
+
+        response = response.get(
+            "price",
+            response.get("quote"),
+        )
+
+    try:
+        price = float(response)
+
+    except (TypeError, ValueError):
+        logger.warning(
+            "%s : prix indisponible.",
+            symbol,
+        )
+        return None
+
+    if not math.isfinite(price) or price <= 0:
+        return None
+
+    return price
+
+
+# ============================================================
+# ANALYSE D'UN INDICE
+# ============================================================
+
+def analyze_symbol(symbol: str) -> list[dict[str, Any]]:
+    logger.info("=" * 60)
+    logger.info("Analyse de %s", symbol)
+    logger.info("Stratégie : TRENDLINE + CONFLUENCE")
+
+    candles_by_timeframe: dict[str, list[dict[str, Any]]] = {}
+
+    # On récupère les quatre unités de temps.
+    # La stratégie choisit ensuite la première unité qui
+    # présente une configuration valide.
+    for timeframe, count in TIMEFRAMES.items():
+        candles = fetch_candles(
+            symbol,
+            timeframe,
+            count,
+        )
+
+        candles_by_timeframe[timeframe] = candles
+
+    # Le prix courant est nécessaire pour éviter de proposer
+    # une entrée devenue trop éloignée.
+    current_price = fetch_current_price(symbol)
+
+    if current_price is None:
+        logger.warning(
+            "%s : analyse ignorée, prix courant indisponible.",
+            symbol,
+        )
+        return []
+
+    diagnostics: dict[str, Any] = {}
+
+    try:
+        signals = find_signals(
+            symbol=symbol,
+            d1=candles_by_timeframe.get("D1"),
+            h4=candles_by_timeframe.get("H4"),
+            h2=candles_by_timeframe.get("H2"),
+            h1=candles_by_timeframe.get("H1"),
+            price_now=current_price,
+            diagnostics=diagnostics,
+        )
+
+    except Exception:
+        logger.exception(
+            "%s : erreur dans le moteur de stratégie.",
+            symbol,
+        )
+        return []
+
+    for timeframe, detail in diagnostics.items():
+        logger.info(
+            "%s | %s : %s",
+            symbol,
+            timeframe,
+            detail,
+        )
+
+    if not signals:
+        logger.info(
+            "%s : aucune configuration valide.",
+            symbol,
+        )
+        return []
+
+    valid_signals = []
+
+    for signal in signals:
+        if not isinstance(signal, dict):
+            continue
+
+        # Le scanner n'accepte que les signaux issus de la
+        # nouvelle stratégie.
+        if signal.get("strategy") != "TRENDLINE_SUPPORT_RESISTANCE":
+            logger.warning(
+                "%s : signal ignoré, stratégie non conforme.",
+                symbol,
+            )
+            continue
+
+        if signal.get("direction") not in ("BUY", "SELL"):
+            continue
+
+        if signal.get("timeframe") not in TIMEFRAMES:
+            continue
+
+        valid_signals.append(signal)
+
+    return valid_signals
+
+
+# ============================================================
+# TRAITEMENT DES SIGNAUX
+# ============================================================
+
+def process_signal(signal: dict[str, Any]) -> bool:
+    """
+    Enregistre le signal avant l'envoi Telegram pour éviter
+    qu'une erreur d'envoi provoque des répétitions à chaque run.
+    """
+
+    try:
+        message = format_message(signal)
+
+    except Exception:
+        logger.exception(
+            "Impossible de formater le signal."
+        )
+        return False
+
+    is_new = store_signal(signal, message)
+
+    if not is_new:
+        return False
+
+    logger.info(
+        "NOUVEAU SIGNAL : %s %s | TF=%s | RR=1:%s",
+        signal["symbol"],
+        signal["direction"],
+        signal["timeframe"],
+        signal["rr"],
+    )
+
+    # Aucun ordre n'est envoyé à Deriv.
+    if AUTO_EXECUTION_ENABLED:
+        logger.critical(
+            "Sécurité : ce scanner ne contient aucune fonction "
+            "d'exécution d'ordre."
+        )
+
+    if ENABLE_TELEGRAM_ALERTS:
+        send_telegram(message)
+
+    return True
+
+
+# ============================================================
+# EXÉCUTION PRINCIPALE
+# ============================================================
+
+def main() -> None:
+    started_at = utc_now()
+
+    logger.info("=" * 65)
+    logger.info("%s — SCANNER TRENDLINE + CONFLUENCE", BOT_NAME)
+    logger.info("=" * 65)
+
+    logger.info("Début : %s", started_at)
+    logger.info("Timeframes : D1 → H4 → H2 → H1")
+    logger.info("Bougies D1 : %s", D1_CANDLE_COUNT)
+    logger.info("Bougies H4 : %s", H4_CANDLE_COUNT)
+    logger.info("Bougies H2 : %s", H2_CANDLE_COUNT)
+    logger.info("Bougies H1 : %s", H1_CANDLE_COUNT)
+
+    logger.info(
+        "Alertes Telegram : %s",
+        ENABLE_TELEGRAM_ALERTS,
+    )
+
+    logger.info(
+        "Telegram configuré : %s",
+        telegram_is_configured(),
+    )
+
+    logger.info("DRY_RUN : %s", DRY_RUN)
+    logger.info("Exécution automatique : DÉSACTIVÉE")
+    logger.info("Nombre d'indices : %s", len(SYMBOLS))
+
+    logger.info(
+        "Stratégie active : tendances, trendlines, "
+        "supports, résistances et confluences."
+    )
+
+    logger.info(
+        "RR minimum imposé : aucun."
+    )
+
+    # Protection supplémentaire : cette application est un
+    # scanner d'alertes, jamais un exécuteur d'ordres.
+    if AUTO_EXECUTION_ENABLED:
+        raise RuntimeError(
+            "L'exécution automatique doit rester désactivée."
+        )
+
+    init_db()
+
+    run_id = start_analysis_run()
+
+    symbols_checked = 0
+    signals_found = 0
+    errors = []
+
+    try:
+        for index, symbol in enumerate(SYMBOLS, start=1):
+            logger.info(
+                "[%s/%s] %s",
+                index,
+                len(SYMBOLS),
+                symbol,
+            )
+
+            try:
+                signals = analyze_symbol(symbol)
+
+                symbols_checked += 1
+
+                for signal in signals:
+                    if process_signal(signal):
+                        signals_found += 1
+
+            except Exception as exc:
+                errors.append(f"{symbol}: {exc}")
+
+                logger.exception(
+                    "Erreur pendant l'analyse de %s.",
+                    symbol,
+                )
+
+            if index < len(SYMBOLS):
+                time.sleep(PAUSE_BETWEEN_SYMBOLS)
+
+        status = "PARTIAL" if errors else "SUCCESS"
+
+        details = (
+            f"Stratégie=TRENDLINE+CONFLUENCE; "
+            f"erreurs={len(errors)}; "
+            f"alertes_nouvelles={signals_found}"
+        )
+
+        if errors:
+            details += "; " + " | ".join(errors[:10])
+
+        finish_analysis_run(
+            run_id=run_id,
+            status=status,
+            symbols_checked=symbols_checked,
+            signals_found=signals_found,
+            details=details,
+        )
+
+    except Exception as exc:
+        finish_analysis_run(
+            run_id=run
