@@ -1,677 +1,645 @@
 # ============================================================
-# TRADER AI PRO — SCANNER MULTI-TIMEFRAME
-# STRATEGIE TRENDLINE + SUPPORTS / RESISTANCES
+# 25. IMPORT POUR SECURISER LES MESSAGES TELEGRAM
 # ============================================================
 
-import logging
-import os
-import sqlite3
-import time
-
-from datetime import datetime, timezone
-from pathlib import Path
-
-import requests
-
-from deriv_market import get_candles, get_current_price
-from strategy import find_signals, format_message
+import html
 
 
 # ============================================================
-# CONFIGURATION GENERALE
+# 26. FONCTION PRINCIPALE D'ANALYSE MULTI-TIMEFRAME
 # ============================================================
 
-BOT_NAME = "TRADER AI PRO"
+def find_signals(
+    symbol,
+    d1_candles,
+    h4_candles,
+    h2_candles,
+    h1_candles,
+    price_now,
+    diagnostics=None,
+):
+    """
+    Analyse un indice synthétique sur quatre unités de temps.
 
-STRATEGY_NAME = "TRENDLINE_SUPPORT_RESISTANCE"
+    D1 : détection des supports et résistances.
+    H4 : affinage des zones et validation des trendlines.
+    H2 : recherche de confluence horizontale.
+    H1 : recherche de confluence horizontale.
 
-TIMEFRAMES = {
-    "D1": 200,
-    "H4": 200,
-    "H2": 200,
-    "H1": 200,
-}
+    Les entrées sont anticipées.
+    Aucun ordre n'est exécuté automatiquement.
+    """
 
-MIN_RR = 1.0
+    if diagnostics is None:
+        diagnostics = {}
 
-DRY_RUN = (
-    os.getenv("DRY_RUN", "true").strip().lower()
-    == "true"
-)
-
-AUTO_EXECUTION_ENABLED = False
-
-ENABLE_TELEGRAM_ALERTS = (
-    os.getenv("ENABLE_TELEGRAM_ALERTS", "true").strip().lower()
-    == "true"
-)
-
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-
-REQUEST_TIMEOUT = 20
-PAUSE_BETWEEN_SYMBOLS = 2
-
-DATABASE_PATH = Path(
-    os.getenv(
-        "DATABASE_PATH",
-        "state/trader_ai_pro.sqlite3"
-    )
-)
-
-DATABASE_PATH.parent.mkdir(
-    parents=True,
-    exist_ok=True
-)
-
-
-# ============================================================
-# INDICES DERIV
-# ============================================================
-
-SYMBOLS = [
-    "1HZ10V",
-    "1HZ15V",
-    "1HZ25V",
-    "1HZ30V",
-    "1HZ50V",
-    "1HZ75V",
-    "1HZ90V",
-    "1HZ100V",
-    "R_10",
-    "R_25",
-    "R_50",
-    "R_75",
-    "R_100",
-]
-
-
-# ============================================================
-# JOURNALISATION
-# ============================================================
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
-
-logger = logging.getLogger(BOT_NAME)
-
-
-# ============================================================
-# BASE DE DONNEES
-# ============================================================
-
-def get_database_connection():
-    connection = sqlite3.connect(
-        str(DATABASE_PATH),
-        timeout=30,
-    )
-
-    connection.row_factory = sqlite3.Row
-
-    return connection
-
-
-def initialize_database():
-    connection = get_database_connection()
+    diagnostics.update({
+        "symbol": symbol,
+        "strategy": STRATEGY_NAME,
+        "status": "ANALYZING",
+        "reason": "",
+        "signals_found": 0,
+    })
 
     try:
-        cursor = connection.cursor()
 
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS signals (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                signal_id TEXT UNIQUE,
-                symbol TEXT NOT NULL,
-                direction TEXT NOT NULL,
-                strategy TEXT,
-                timeframe TEXT,
-                entry REAL NOT NULL,
-                stop_loss REAL NOT NULL,
-                take_profit REAL NOT NULL,
-                rr REAL NOT NULL,
-                zone_low REAL,
-                zone_high REAL,
-                status TEXT DEFAULT 'DETECTED',
-                message TEXT,
-                created_at TEXT NOT NULL
+        # ----------------------------------------------------
+        # A. NORMALISATION DES DONNEES
+        # ----------------------------------------------------
+
+        d1 = _normalise_candles(d1_candles)
+        h4 = _normalise_candles(h4_candles)
+        h2 = _normalise_candles(h2_candles)
+        h1 = _normalise_candles(h1_candles)
+
+        candle_counts = {
+            "D1": len(d1),
+            "H4": len(h4),
+            "H2": len(h2),
+            "H1": len(h1),
+        }
+
+        diagnostics["candles"] = candle_counts
+
+        # ----------------------------------------------------
+        # B. VERIFICATION DU NOMBRE DE BOUGIES
+        # ----------------------------------------------------
+
+        for timeframe, candles in (
+            ("D1", d1),
+            ("H4", h4),
+            ("H2", h2),
+            ("H1", h1),
+        ):
+
+            minimum = MIN_CANDLES[timeframe]
+
+            if len(candles) < minimum:
+
+                diagnostics.update({
+                    "status": "INSUFFICIENT_DATA",
+                    "reason": (
+                        f"{timeframe}: {len(candles)} bougies "
+                        f"disponibles, {minimum} nécessaires."
+                    ),
+                })
+
+                return []
+
+        # ----------------------------------------------------
+        # C. VERIFICATION DU PRIX ACTUEL
+        # ----------------------------------------------------
+
+        current_price = _number(price_now)
+
+        if current_price is None or current_price <= 0:
+
+            diagnostics.update({
+                "status": "INVALID_PRICE",
+                "reason": "Prix actuel absent ou invalide.",
+            })
+
+            return []
+
+        # ----------------------------------------------------
+        # D. CALCUL DES ATR
+        # ----------------------------------------------------
+
+        d1_atr = _calculate_atr(d1)
+        h4_atr = _calculate_atr(h4)
+        h2_atr = _calculate_atr(h2)
+        h1_atr = _calculate_atr(h1)
+
+        atr_values = {
+            "D1": d1_atr,
+            "H4": h4_atr,
+            "H2": h2_atr,
+            "H1": h1_atr,
+        }
+
+        for timeframe, atr in atr_values.items():
+
+            if atr is None or atr <= 0:
+
+                diagnostics.update({
+                    "status": "INVALID_ATR",
+                    "reason": (
+                        f"ATR invalide sur {timeframe}."
+                    ),
+                })
+
+                return []
+
+        # ----------------------------------------------------
+        # E. DETECTION DES ZONES D1
+        # ----------------------------------------------------
+
+        d1_supports, d1_resistances = _d1_zones(
+            d1,
+            d1_atr,
+        )
+
+        diagnostics["d1_supports"] = len(d1_supports)
+        diagnostics["d1_resistances"] = len(d1_resistances)
+
+        if not d1_supports and not d1_resistances:
+
+            diagnostics.update({
+                "status": "NO_VALID_ZONE",
+                "reason": (
+                    "Aucune zone horizontale D1 suffisamment "
+                    "valide n'a été détectée."
+                ),
+            })
+
+            return []
+
+        # ----------------------------------------------------
+        # F. AFFINAGE DES ZONES D1 AVEC LES REACTIONS H4
+        # ----------------------------------------------------
+
+        refined_supports = []
+        refined_resistances = []
+
+        for zone in d1_supports:
+
+            refined = _refine_d1_zone_with_h4(
+                zone,
+                h4,
+                h4_atr,
             )
-        """)
 
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS run_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                started_at TEXT NOT NULL,
-                finished_at TEXT,
-                symbols_scanned INTEGER DEFAULT 0,
-                signals_found INTEGER DEFAULT 0,
-                errors INTEGER DEFAULT 0,
-                status TEXT
+            if refined:
+                refined_supports.append(refined)
+
+        for zone in d1_resistances:
+
+            refined = _refine_d1_zone_with_h4(
+                zone,
+                h4,
+                h4_atr,
             )
-        """)
 
-        connection.commit()
+            if refined:
+                refined_resistances.append(refined)
 
-    finally:
-        connection.close()
-        # ============================================================
-# PARTIE 2/4 — RECUPERATION ET VALIDATION DES DONNEES
+        diagnostics["refined_supports"] = len(
+            refined_supports
+        )
+
+        diagnostics["refined_resistances"] = len(
+            refined_resistances
+        )
+
+        if not refined_supports and not refined_resistances:
+
+            diagnostics.update({
+                "status": "NO_VALID_REFINEMENT",
+                "reason": (
+                    "Les réactions H4 ne permettent pas "
+                    "d'affiner suffisamment les zones D1."
+                ),
+            })
+
+            return []
+
+        # ----------------------------------------------------
+        # G. CONSTRUCTION DES OPPORTUNITES BUY ET SELL
+        # ----------------------------------------------------
+
+        candidates = []
+
+        for zone in refined_supports:
+
+            candidate = _build_candidate(
+                symbol=symbol,
+                direction="BUY",
+                refined_zone=zone,
+                h4_candles=h4,
+                h2_candles=h2,
+                h1_candles=h1,
+                h4_atr=h4_atr,
+                h2_atr=h2_atr,
+                h1_atr=h1_atr,
+                price_now=current_price,
+            )
+
+            if candidate:
+                candidates.append(candidate)
+
+        for zone in refined_resistances:
+
+            candidate = _build_candidate(
+                symbol=symbol,
+                direction="SELL",
+                refined_zone=zone,
+                h4_candles=h4,
+                h2_candles=h2,
+                h1_candles=h1,
+                h4_atr=h4_atr,
+                h2_atr=h2_atr,
+                h1_atr=h1_atr,
+                price_now=current_price,
+            )
+
+            if candidate:
+                candidates.append(candidate)
+
+        # ----------------------------------------------------
+        # H. VALIDATION ET IDENTIFICATION DES SIGNAUX
+        # ----------------------------------------------------
+
+        valid_signals = []
+
+        for candidate in candidates:
+
+            if not _validate_signal(candidate):
+                continue
+
+            candidate["signal_id"] = _make_signal_id(
+                candidate
+            )
+
+            candidate["status"] = "NEW"
+
+            valid_signals.append(candidate)
+
+        # ----------------------------------------------------
+        # I. RESULTAT FINAL
+        # ----------------------------------------------------
+
+        if not valid_signals:
+
+            diagnostics.update({
+                "status": "NO_SIGNAL",
+                "reason": (
+                    "Aucune configuration ne satisfait "
+                    "tous les critères de la stratégie."
+                ),
+                "signals_found": 0,
+            })
+
+            return []
+
+        diagnostics.update({
+            "status": "SIGNALS_FOUND",
+            "reason": "Configuration(s) valide(s) détectée(s).",
+            "signals_found": len(valid_signals),
+        })
+
+        return valid_signals
+
+    except Exception as exc:
+
+        diagnostics.update({
+            "status": "ANALYSIS_ERROR",
+            "reason": (
+                f"{type(exc).__name__}: {str(exc)}"
+            ),
+            "signals_found": 0,
+        })
+
+        return []
+
+
+# ============================================================
+# 27. FORMATAGE DU MESSAGE TELEGRAM
 # ============================================================
 
-import math
-
-
-# ============================================================
-# NORMALISATION DES BOUGIES
-# ============================================================
-
-def normalize_candles(candles):
+def format_message(signal):
     """
-    Nettoie les bougies :
-    - vérifie les valeurs OHLC ;
-    - élimine les données invalides ;
-    - supprime les doublons ;
-    - classe les bougies par ordre chronologique.
+    Produit un message Telegram au format HTML.
+    """
+
+    symbol = str(
+        signal.get("symbol", "UNKNOWN")
+    )
+
+    symbol_name = SYMBOL_NAMES.get(
+        symbol,
+        symbol,
+    )
+
+    direction = signal.get(
+        "direction",
+        "UNKNOWN",
+    )
+
+    direction_label = (
+        "ACHAT / BUY"
+        if direction == "BUY"
+        else "VENTE / SELL"
+    )
+
+    emoji = (
+        "🟢"
+        if direction == "BUY"
+        else "🔴"
+    )
+
+    entry = signal.get("entry", 0)
+    stop_loss = signal.get("stop_loss", 0)
+    take_profit = signal.get("take_profit", 0)
+    rr = signal.get("rr", 0)
+
+    zone_low = signal.get("zone_low", 0)
+    zone_high = signal.get("zone_high", 0)
+
+    trendline_touches = signal.get(
+        "trendline_touches",
+        0,
+    )
+
+    zone_touches = signal.get(
+        "zone_touches",
+        0,
+    )
+
+    signal_id = html.escape(
+        str(signal.get("signal_id", "N/A"))
+    )
+
+    safe_symbol = html.escape(symbol_name)
+
+    lines = [
+        "🚨 <b>TRADER AI PRO</b>",
+        "━━━━━━━━━━━━━━━━━━",
+        "",
+        f"📊 <b>Indice :</b> {safe_symbol}",
+        f"🔎 <b>Symbole :</b> {html.escape(symbol)}",
+        f"{emoji} <b>Direction :</b> {direction_label}",
+        "",
+        "🎯 <b>PLAN DE TRADING</b>",
+        f"📍 Entrée : <code>{entry}</code>",
+        f"🛑 Stop Loss : <code>{stop_loss}</code>",
+        f"🏁 Take Profit : <code>{take_profit}</code>",
+        f"⚖️ Risk/Reward : <b>1:{rr}</b>",
+        "",
+        "📐 <b>ANALYSE TECHNIQUE</b>",
+        f"• Zone affinée : {zone_low} - {zone_high}",
+        f"• Réactions de la zone : {zone_touches}",
+        f"• Contacts trendline : {trendline_touches}",
+        "• Confluence : D1 + H4 + H2 + H1",
+        "• Entrée : anticipée",
+        "",
+        f"🆔 Signal : <code>{signal_id}</code>",
+        "",
+        "⚠️ <b>ALERTE UNIQUEMENT</b>",
+        "Aucun ordre automatique n'est exécuté.",
+        "Vérifiez le graphique avant toute prise de position.",
+        "",
+        "━━━━━━━━━━━━━━━━━━",
+        "Trader AI Pro — Analyse technique",
+    ]
+
+    return "\n".join(lines)
+    # ============================================================
+# 8. IMPORT DU MODULE DE DONNEES DERIV
+# ============================================================
+
+try:
+
+    from deriv_market import (
+        get_candles,
+        get_current_price,
+    )
+
+except ImportError as exc:
+
+    logger.critical(
+        "Impossible d'importer deriv_market.py : %s",
+        exc,
+    )
+
+    raise
+
+
+# ============================================================
+# 9. VERIFICATION DES DONNEES DE MARCHE
+# ============================================================
+
+def validate_candles(candles, timeframe):
+    """
+    Vérifie que les bougies reçues sont exploitables.
     """
 
     if not isinstance(candles, list):
-        return []
-
-    normalized = []
-    seen_epochs = set()
-
-    for candle in candles:
-
-        if not isinstance(candle, dict):
-            continue
-
-        try:
-            epoch = int(candle["epoch"])
-
-            open_price = float(candle["open"])
-            high_price = float(candle["high"])
-            low_price = float(candle["low"])
-            close_price = float(candle["close"])
-
-        except (KeyError, TypeError, ValueError, OverflowError):
-            continue
-
-        values = [
-            open_price,
-            high_price,
-            low_price,
-            close_price,
-        ]
-
-        if not all(math.isfinite(value) for value in values):
-            continue
-
-        if min(values) <= 0:
-            continue
-
-        if high_price < low_price:
-            continue
-
-        if high_price < max(open_price, close_price):
-            continue
-
-        if low_price > min(open_price, close_price):
-            continue
-
-        if epoch in seen_epochs:
-            continue
-
-        seen_epochs.add(epoch)
-
-        normalized.append({
-            "epoch": epoch,
-            "open": open_price,
-            "high": high_price,
-            "low": low_price,
-            "close": close_price,
-        })
-
-    normalized.sort(key=lambda item: item["epoch"])
-
-    return normalized
-
-
-# ============================================================
-# RECUPERATION DES BOUGIES
-# ============================================================
-
-def fetch_candles(symbol, timeframe):
-    """
-    Récupère les bougies Deriv pour une unité de temps.
-
-    Demande une bougie supplémentaire pour disposer
-    d'une marge de sécurité.
-    """
-
-    required_count = TIMEFRAMES.get(timeframe)
-
-    if required_count is None:
-        logger.error(
-            "%s | Unité de temps inconnue : %s",
-            symbol,
+        logger.warning(
+            "%s : format de bougies invalide.",
             timeframe,
         )
-        return []
+        return False
 
-    try:
-        result = get_candles(
-            symbol,
-            timeframe=timeframe,
-            count=required_count + 1,
-            timeout=REQUEST_TIMEOUT,
-        )
+    minimum = TIMEFRAMES[timeframe]["candles"]
 
-        if not isinstance(result, dict):
-            logger.error(
-                "%s | Réponse Deriv invalide en %s",
-                symbol,
-                timeframe,
-            )
-            return []
-
-        if result.get("error"):
-            logger.error(
-                "%s | Erreur bougies %s : %s",
-                symbol,
-                timeframe,
-                result.get("error"),
-            )
-            return []
-
-        raw_candles = result.get("candles", [])
-
-        candles = normalize_candles(raw_candles)
-
-        if len(candles) < required_count:
-            logger.warning(
-                "%s | %s : seulement %s bougies valides sur %s requises",
-                symbol,
-                timeframe,
-                len(candles),
-                required_count,
-            )
-            return []
-
-        # On conserve les bougies les plus récentes.
-        candles = candles[-required_count:]
-
-        logger.info(
-            "%s | %s : %s bougies valides",
-            symbol,
+    if len(candles) < minimum:
+        logger.warning(
+            "%s : seulement %s bougies reçues, %s nécessaires.",
             timeframe,
             len(candles),
+            minimum,
         )
+        return False
 
-        return candles
-
-    except Exception:
-        logger.exception(
-            "%s | Erreur récupération bougies %s",
-            symbol,
-            timeframe,
-        )
-        return []
+    return True
 
 
 # ============================================================
-# RECUPERATION DU PRIX ACTUEL
+# 10. RECUPERATION DES BOUGIES D'UN INDICE
 # ============================================================
 
-def fetch_current_price(symbol):
+def fetch_symbol_candles(symbol):
     """
-    Récupère le dernier prix disponible sur Deriv.
-    Aucun ordre n'est envoyé.
-    """
-
-    try:
-        result = get_current_price(
-            symbol,
-            timeout=REQUEST_TIMEOUT,
-        )
-
-        if isinstance(result, dict):
-            result = result.get(
-                "price",
-                result.get("quote"),
-            )
-
-        if result is None:
-            logger.warning(
-                "%s | Prix actuel indisponible",
-                symbol,
-            )
-            return None
-
-        price = float(result)
-
-        if not math.isfinite(price) or price <= 0:
-            logger.warning(
-                "%s | Prix actuel invalide",
-                symbol,
-            )
-            return None
-
-        return price
-
-    except Exception:
-        logger.exception(
-            "%s | Impossible de récupérer le prix actuel",
-            symbol,
-        )
-        return None
-
-
-# ============================================================
-# RECUPERATION DES QUATRE UNITES DE TEMPS
-# ============================================================
-
-def fetch_market_data(symbol):
-    """
-    Récupère D1, H4, H2 et H1.
-
-    Si une seule unité de temps ne possède pas
-    les 200 bougies nécessaires, l'analyse est arrêtée.
+    Récupère les 200 bougies de chaque unité de temps.
     """
 
     market_data = {}
 
-    for timeframe in ("D1", "H4", "H2", "H1"):
+    for timeframe, settings in TIMEFRAMES.items():
 
-        candles = fetch_candles(
-            symbol,
-            timeframe,
-        )
+        candles = None
 
-        if len(candles) < TIMEFRAMES[timeframe]:
-            logger.warning(
-                "%s | Analyse interrompue : données %s insuffisantes",
+        for attempt in range(1, MAX_RETRIES + 1):
+
+            try:
+
+                logger.info(
+                    "%s | Récupération %s | tentative %s/%s",
+                    symbol,
+                    timeframe,
+                    attempt,
+                    MAX_RETRIES,
+                )
+
+                candles = get_candles(
+                    symbol=symbol,
+                    granularity=settings["granularity"],
+                    count=settings["candles"],
+                )
+
+                if validate_candles(
+                    candles,
+                    timeframe,
+                ):
+                    break
+
+                candles = None
+
+            except Exception as exc:
+
+                logger.warning(
+                    "%s | Erreur récupération %s : %s",
+                    symbol,
+                    timeframe,
+                    exc,
+                )
+
+                candles = None
+
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_DELAY)
+
+        if candles is None:
+
+            logger.error(
+                "%s | Impossible de récupérer les bougies %s.",
                 symbol,
                 timeframe,
             )
+
             return None
 
         market_data[timeframe] = candles
 
     return market_data
-    # ============================================================
-# PARTIE 3/4 — SECURITE ET GESTION DES SIGNAUX
-# ============================================================
 
 
 # ============================================================
-# HORODATAGE
+# 11. RECUPERATION DU PRIX ACTUEL
 # ============================================================
 
-def current_timestamp():
-    return datetime.now(timezone.utc).isoformat()
+def fetch_current_price(symbol):
+    """
+    Récupère le dernier prix disponible.
+    """
 
+    for attempt in range(1, MAX_RETRIES + 1):
 
-# ============================================================
-# DEMARRAGE D'UNE ANALYSE
-# ============================================================
+        try:
 
-def start_analysis_run():
-    connection = get_database_connection()
-
-    try:
-        cursor = connection.cursor()
-
-        cursor.execute("""
-            INSERT INTO run_log (
-                started_at,
-                status
+            price = get_current_price(
+                symbol=symbol,
             )
-            VALUES (?, ?)
-        """, (
-            current_timestamp(),
-            "RUNNING",
-        ))
 
-        connection.commit()
+            if price is None:
+                raise ValueError(
+                    "Prix actuel absent."
+                )
 
-        return cursor.lastrowid
+            price = float(price)
 
-    finally:
-        connection.close()
+            if price <= 0:
+                raise ValueError(
+                    "Prix actuel invalide."
+                )
 
+            return price
 
-# ============================================================
-# FIN D'UNE ANALYSE
-# ============================================================
+        except Exception as exc:
 
-def finish_analysis_run(
-    run_id,
-    symbols_scanned,
-    signals_found,
-    errors,
-    status="COMPLETED",
-):
-    connection = get_database_connection()
-
-    try:
-        connection.execute("""
-            UPDATE run_log
-            SET
-                finished_at = ?,
-                symbols_scanned = ?,
-                signals_found = ?,
-                errors = ?,
-                status = ?
-            WHERE id = ?
-        """, (
-            current_timestamp(),
-            symbols_scanned,
-            signals_found,
-            errors,
-            status,
-            run_id,
-        ))
-
-        connection.commit()
-
-    finally:
-        connection.close()
-
-
-# ============================================================
-# VALIDATION INDEPENDANTE DU SIGNAL
-# ============================================================
-
-def validate_signal(signal):
-    """
-    Vérifie les données du signal avant tout enregistrement
-    ou envoi Telegram.
-
-    Aucun ordre n'est exécuté ici.
-    """
-
-    if not isinstance(signal, dict):
-        return False, "Signal invalide"
-
-    if signal.get("strategy") != STRATEGY_NAME:
-        return False, "Stratégie non autorisée"
-
-    if signal.get("direction") not in ("BUY", "SELL"):
-        return False, "Direction invalide"
-
-    if signal.get("timeframe") not in TIMEFRAMES:
-        return False, "Unité de temps invalide"
-
-    if signal.get("symbol") not in SYMBOLS:
-        return False, "Indice non autorisé"
-
-    try:
-        entry = float(signal["entry"])
-        stop_loss = float(signal["stop_loss"])
-        take_profit = float(signal["take_profit"])
-
-    except (KeyError, TypeError, ValueError, OverflowError):
-        return False, "Prix du signal invalides"
-
-    prices = (entry, stop_loss, take_profit)
-
-    if not all(math.isfinite(value) and value > 0 for value in prices):
-        return False, "Prix non valides"
-
-    if signal["direction"] == "BUY":
-        if stop_loss >= entry:
-            return False, "Stop Loss incorrect pour un BUY"
-
-        if take_profit <= entry:
-            return False, "Take Profit incorrect pour un BUY"
-
-    else:
-        if stop_loss <= entry:
-            return False, "Stop Loss incorrect pour un SELL"
-
-        if take_profit >= entry:
-            return False, "Take Profit incorrect pour un SELL"
-
-    risk = abs(entry - stop_loss)
-    reward = abs(take_profit - entry)
-
-    if risk <= 0 or reward <= 0:
-        return False, "Risque ou rendement nul"
-
-    calculated_rr = reward / risk
-
-    if calculated_rr < MIN_RR:
-        return False, (
-            f"RR insuffisant : {calculated_rr:.2f}"
-        )
-
-    if not signal.get("signal_id"):
-        return False, "Identifiant du signal absent"
-
-    return True, calculated_rr
-
-
-# ============================================================
-# ENREGISTREMENT DU SIGNAL
-# ============================================================
-
-def store_signal(signal, message):
-    """
-    Enregistre un signal valide dans SQLite.
-
-    INSERT OR IGNORE empêche l'enregistrement
-    d'un signal dont l'identifiant existe déjà.
-    """
-
-    valid, result = validate_signal(signal)
-
-    if not valid:
-        logger.warning(
-            "%s | Signal rejeté : %s",
-            signal.get("symbol", "UNKNOWN"),
-            result,
-        )
-        return False
-
-    calculated_rr = result
-
-    connection = get_database_connection()
-
-    try:
-        cursor = connection.cursor()
-
-        cursor.execute("""
-            INSERT OR IGNORE INTO signals (
-                signal_id,
+            logger.warning(
+                "%s | Erreur prix actuel : %s | tentative %s/%s",
                 symbol,
-                direction,
-                strategy,
-                timeframe,
-                entry,
-                stop_loss,
-                take_profit,
-                rr,
-                zone_low,
-                zone_high,
-                status,
-                message,
-                created_at
+                exc,
+                attempt,
+                MAX_RETRIES,
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            signal["signal_id"],
-            signal["symbol"],
-            signal["direction"],
-            signal["strategy"],
-            signal["timeframe"],
-            float(signal["entry"]),
-            float(signal["stop_loss"]),
-            float(signal["take_profit"]),
-            round(calculated_rr, 4),
-            signal.get("zone_low"),
-            signal.get("zone_high"),
-            "DETECTED",
-            message,
-            current_timestamp(),
-        ))
 
-        connection.commit()
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_DELAY)
 
-        if cursor.rowcount == 0:
-            logger.info(
-                "%s | Signal déjà enregistré : %s",
-                signal["symbol"],
-                signal["signal_id"],
-            )
-            return False
-
-        logger.info(
-            "%s | Signal enregistré | %s | RR 1:%.2f",
-            signal["symbol"],
-            signal["direction"],
-            calculated_rr,
-        )
-
-        return True
-
-    except sqlite3.Error:
-        logger.exception(
-            "%s | Erreur SQLite lors de l'enregistrement",
-            signal.get("symbol", "UNKNOWN"),
-        )
-        return False
-
-    finally:
-        connection.close()
-        # ============================================================
-# PARTIE 4/4 — TELEGRAM ET SCANNER PRINCIPAL
-# ============================================================
+    return None
 
 
 # ============================================================
-# ENVOI DES ALERTES TELEGRAM
+# 12. RECUPERATION COMPLETE DES DONNEES
 # ============================================================
 
-def send_telegram(message):
+def fetch_market_data(symbol):
     """
-    Envoie une alerte Telegram.
-    Aucun ordre Deriv n'est exécuté.
+    Récupère les bougies D1, H4, H2, H1
+    et le prix actuel d'un indice.
+    """
+
+    logger.info(
+        "%s | Début récupération des données.",
+        symbol,
+    )
+
+    candles = fetch_symbol_candles(symbol)
+
+    if candles is None:
+        return None
+
+    price_now = fetch_current_price(symbol)
+
+    if price_now is None:
+
+        logger.error(
+            "%s | Prix actuel indisponible.",
+            symbol,
+        )
+
+        return None
+
+    return {
+        "d1_candles": candles["D1"],
+        "h4_candles": candles["H4"],
+        "h2_candles": candles["H2"],
+        "h1_candles": candles["H1"],
+        "price_now": price_now,
+    }
+    # ============================================================
+# 13. VERIFICATION DE LA CONFIGURATION TELEGRAM
+# ============================================================
+
+def telegram_is_ready():
+    """
+    Vérifie que Telegram est correctement configuré.
     """
 
     if not ENABLE_TELEGRAM_ALERTS:
         logger.info("Alertes Telegram désactivées.")
         return False
 
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.error(
-            "Configuration Telegram incomplète."
-        )
+    if not TELEGRAM_BOT_TOKEN:
+        logger.error("Token Telegram manquant.")
+        return False
+
+    if not TELEGRAM_CHAT_ID:
+        logger.error("Chat ID Telegram manquant.")
+        return False
+
+    return True
+
+
+# ============================================================
+# 14. ENVOI D'UN MESSAGE TELEGRAM
+# ============================================================
+
+def send_telegram_message(message):
+    """
+    Envoie une alerte Telegram.
+
+    Aucun ordre de trading n'est exécuté ici.
+    """
+
+    if not telegram_is_ready():
         return False
 
     url = (
-        f"https://api.telegram.org/"
-        f"bot{TELEGRAM_TOKEN}/sendMessage"
+        f"https://api.telegram.org/bot"
+        f"{TELEGRAM_BOT_TOKEN}/sendMessage"
     )
 
     payload = {
@@ -681,72 +649,88 @@ def send_telegram(message):
         "disable_web_page_preview": True,
     }
 
-    try:
-        response = requests.post(
-            url,
-            json=payload,
-            timeout=REQUEST_TIMEOUT,
-        )
+    for attempt in range(1, MAX_RETRIES + 1):
 
-        response.raise_for_status()
+        try:
 
-        result = response.json()
-
-        if not result.get("ok"):
-            logger.error(
-                "Telegram a refusé le message : %s",
-                result,
+            response = requests.post(
+                url,
+                json=payload,
+                timeout=REQUEST_TIMEOUT,
             )
-            return False
 
-        logger.info("Alerte Telegram envoyée.")
-        return True
+            response.raise_for_status()
 
-    except requests.RequestException:
-        logger.exception(
-            "Erreur lors de l'envoi Telegram."
-        )
-        return False
+            result = response.json()
+
+            if not result.get("ok", False):
+                raise RuntimeError(
+                    result.get(
+                        "description",
+                        "Erreur Telegram inconnue.",
+                    )
+                )
+
+            logger.info("Alerte Telegram envoyée.")
+
+            return True
+
+        except Exception as exc:
+
+            logger.error(
+                "Erreur Telegram : %s | tentative %s/%s",
+                exc,
+                attempt,
+                MAX_RETRIES,
+            )
+
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_DELAY)
+
+    return False
 
 
 # ============================================================
-# ANALYSE D'UN INDICE
+# 15. ANALYSE D'UN INDICE
 # ============================================================
 
 def analyze_symbol(symbol):
     """
-    Analyse un indice avec les quatre unités de temps.
+    Récupère les données puis lance l'analyse technique.
     """
 
+    logger.info("-" * 55)
+
     logger.info(
-        "========== ANALYSE DE %s ==========",
+        "ANALYSE DE L'INDICE : %s",
         symbol,
     )
 
     market_data = fetch_market_data(symbol)
 
     if market_data is None:
-        return [], 1
 
-    current_price = fetch_current_price(symbol)
+        logger.warning(
+            "%s | Analyse ignorée : données indisponibles.",
+            symbol,
+        )
 
-    if current_price is None:
-        return [], 1
+        return []
 
     diagnostics = {}
 
     signals = find_signals(
         symbol=symbol,
-        d1=market_data["D1"],
-        h4=market_data["H4"],
-        h2=market_data["H2"],
-        h1=market_data["H1"],
-        price_now=current_price,
+        d1_candles=market_data["d1_candles"],
+        h4_candles=market_data["h4_candles"],
+        h2_candles=market_data["h2_candles"],
+        h1_candles=market_data["h1_candles"],
+        price_now=market_data["price_now"],
         diagnostics=diagnostics,
     )
 
     logger.info(
-        "%s | Résultat stratégie : %s",
+        "%s | Résultat : %s",
         symbol,
         diagnostics.get("status", "UNKNOWN"),
     )
@@ -758,178 +742,251 @@ def analyze_symbol(symbol):
             diagnostics["reason"],
         )
 
-    valid_signals = []
+    if not signals:
+
+        logger.info(
+            "%s | Aucun signal valide.",
+            symbol,
+        )
+
+        return []
+
+    logger.info(
+        "%s | %s signal(aux) détecté(s).",
+        symbol,
+        len(signals),
+    )
+
+    return signals
+
+
+# ============================================================
+# 16. TRAITEMENT DES SIGNAUX
+# ============================================================
+
+def process_signals(signals):
+    """
+    Formate et transmet les signaux à Telegram.
+    """
+
+    if not signals:
+        return 0
+
+    sent_count = 0
 
     for signal in signals:
 
-        valid, result = validate_signal(signal)
+        try:
 
-        if not valid:
-            logger.warning(
-                "%s | Signal rejeté : %s",
-                symbol,
-                result,
+            message = format_message(signal)
+
+            logger.info(
+                "%s | Signal %s détecté.",
+                signal.get("symbol"),
+                signal.get("direction"),
             )
-            continue
 
-        valid_signals.append(signal)
+            if ENABLE_TELEGRAM_ALERTS:
 
-    return valid_signals, 0
+                if send_telegram_message(message):
+                    sent_count += 1
+
+                else:
+                    logger.error(
+                        "Impossible d'envoyer le signal %s.",
+                        signal.get("signal_id"),
+                    )
+
+            else:
+
+                logger.info(
+                    "Alerte non envoyée : Telegram désactivé."
+                )
+
+        except Exception:
+
+            logger.error(
+                "Erreur lors du traitement d'un signal :\n%s",
+                traceback.format_exc(),
+            )
+
+    return sent_count
 
 
 # ============================================================
-# TRAITEMENT D'UN SIGNAL
+# 17. ANALYSE DE TOUS LES INDICES
 # ============================================================
 
-def process_signal(signal):
+def analyze_all_symbols():
     """
-    Vérifie, enregistre et transmet un signal.
-
-    L'enregistrement est effectué avant l'envoi Telegram
-    afin d'éviter les doublons.
+    Parcourt tous les indices configurés.
     """
 
-    valid, result = validate_signal(signal)
+    total_signals = 0
+    total_alerts_sent = 0
 
-    if not valid:
-        logger.warning(
-            "%s | Signal ignoré : %s",
-            signal.get("symbol", "UNKNOWN"),
-            result,
+    for index, symbol in enumerate(SYMBOLS, start=1):
+
+        logger.info(
+            "Indice %s/%s : %s",
+            index,
+            len(SYMBOLS),
+            symbol,
         )
-        return False
 
-    message = format_message(signal)
+        try:
 
-    saved = store_signal(
-        signal,
-        message,
+            signals = analyze_symbol(symbol)
+
+            total_signals += len(signals)
+
+            sent = process_signals(signals)
+
+            total_alerts_sent += sent
+
+        except Exception:
+
+            logger.error(
+                "%s | Erreur générale :\n%s",
+                symbol,
+                traceback.format_exc(),
+            )
+
+        if index < len(SYMBOLS):
+            time.sleep(SYMBOL_DELAY)
+
+    return {
+        "symbols_analyzed": len(SYMBOLS),
+        "signals_found": total_signals,
+        "alerts_sent": total_alerts_sent,
+    }
+    # ============================================================
+# 18. AFFICHAGE DU BILAN FINAL
+# ============================================================
+
+def print_analysis_summary(results, start_time):
+    """
+    Affiche le bilan complet de l'analyse.
+    """
+
+    end_time = time.time()
+
+    duration = round(
+        end_time - start_time,
+        2,
     )
 
-    if not saved:
-        return False
+    logger.info("=" * 55)
+    logger.info("BILAN DE L'ANALYSE TRADER AI PRO")
+    logger.info("=" * 55)
 
-    if ENABLE_TELEGRAM_ALERTS:
-        sent = send_telegram(message)
+    logger.info(
+        "Indices analysés : %s",
+        results["symbols_analyzed"],
+    )
 
-        if not sent:
-            logger.error(
-                "%s | Signal enregistré mais Telegram non envoyé.",
-                signal["symbol"],
-            )
-            return False
+    logger.info(
+        "Signaux détectés : %s",
+        results["signals_found"],
+    )
 
-    else:
-        logger.info(
-            "%s | Signal enregistré, Telegram désactivé.",
-            signal["symbol"],
-        )
+    logger.info(
+        "Alertes Telegram envoyées : %s",
+        results["alerts_sent"],
+    )
 
-    return True
+    logger.info(
+        "Durée totale : %s secondes",
+        duration,
+    )
+
+    logger.info(
+        "DRY_RUN : %s",
+        DRY_RUN,
+    )
+
+    logger.info(
+        "Exécution automatique des ordres : DÉSACTIVÉE",
+    )
+
+    logger.info("=" * 55)
 
 
 # ============================================================
-# SCANNER PRINCIPAL
+# 19. FONCTION PRINCIPALE
 # ============================================================
 
 def main():
+    """
+    Point d'entrée du programme.
+    """
 
-    logger.info("=" * 60)
-    logger.info("TRADER AI PRO — SCANNER MULTI-TIMEFRAME")
-    logger.info("Stratégie : TRENDLINE + CONFLUENCE")
-    logger.info("=" * 60)
+    start_time = time.time()
 
-    logger.info("D1 : %s bougies", TIMEFRAMES["D1"])
-    logger.info("H4 : %s bougies", TIMEFRAMES["H4"])
-    logger.info("H2 : %s bougies", TIMEFRAMES["H2"])
-    logger.info("H1 : %s bougies", TIMEFRAMES["H1"])
+    print_startup_information()
 
-    logger.info("RR minimum : 1:%.1f", MIN_RR)
-    logger.info("DRY_RUN : %s", DRY_RUN)
-    logger.info("Exécution automatique des ordres : DÉSACTIVÉE")
     logger.info(
-        "Alertes Telegram : %s",
-        ENABLE_TELEGRAM_ALERTS,
+        "Démarrage de l'analyse programmée."
     )
 
-    if not DRY_RUN:
-        logger.critical(
-            "DRY_RUN doit obligatoirement rester à true."
-        )
-        return
+    # Vérification de la configuration Telegram.
+    if ENABLE_TELEGRAM_ALERTS:
 
-    initialize_database()
+        if telegram_is_ready():
 
-    run_id = start_analysis_run()
+            logger.info(
+                "Configuration Telegram valide."
+            )
 
-    symbols_scanned = 0
-    signals_found = 0
-    errors = 0
+        else:
 
+            logger.warning(
+                "Telegram est activé mais sa configuration "
+                "est incomplète."
+            )
+
+    # Analyse des indices.
     try:
-        for symbol in SYMBOLS:
 
-            try:
-                signals, error_count = analyze_symbol(symbol)
+        results = analyze_all_symbols()
 
-                symbols_scanned += 1
-                errors += error_count
+    except KeyboardInterrupt:
 
-                for signal in signals:
-
-                    if process_signal(signal):
-                        signals_found += 1
-
-            except Exception:
-                errors += 1
-
-                logger.exception(
-                    "%s | Erreur pendant l'analyse",
-                    symbol,
-                )
-
-            time.sleep(PAUSE_BETWEEN_SYMBOLS)
-
-        status = (
-            "COMPLETED_WITH_ERRORS"
-            if errors > 0
-            else "COMPLETED"
+        logger.warning(
+            "Analyse interrompue manuellement."
         )
 
-        finish_analysis_run(
-            run_id=run_id,
-            symbols_scanned=symbols_scanned,
-            signals_found=signals_found,
-            errors=errors,
-            status=status,
-        )
-
-        logger.info("=" * 60)
-        logger.info("ANALYSE TERMINÉE")
-        logger.info("Indices analysés : %s", symbols_scanned)
-        logger.info("Signaux transmis : %s", signals_found)
-        logger.info("Erreurs : %s", errors)
-        logger.info("=" * 60)
+        return 1
 
     except Exception:
-        finish_analysis_run(
-            run_id=run_id,
-            symbols_scanned=symbols_scanned,
-            signals_found=signals_found,
-            errors=errors + 1,
-            status="FAILED",
+
+        logger.critical(
+            "Erreur critique pendant l'analyse :\n%s",
+            traceback.format_exc(),
         )
 
-        logger.exception(
-            "Erreur générale du scanner."
-        )
+        return 1
+
+    # Affichage du bilan.
+    print_analysis_summary(
+        results,
+        start_time,
+    )
+
+    logger.info(
+        "Analyse programmée terminée."
+    )
+
+    return 0
 
 
 # ============================================================
-# POINT D'ENTREE
+# 20. EXECUTION DU PROGRAMME
 # ============================================================
 
 if __name__ == "__main__":
-    main()
+
+    exit_code = main()
+
+    sys.exit(exit_code)
     
-        
