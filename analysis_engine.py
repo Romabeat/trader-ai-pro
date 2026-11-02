@@ -149,29 +149,36 @@ def find_trendline(candles, direction):
     kind = "low" if direction == "BUY" else "high"
     pivots = find_pivots(candles[:-1], kind)
 
-    if len(pivots) < 2:
+    # Une trendline ne doit pas etre tracee avec seulement deux pivots.
+    # On ajuste une droite sur l'ensemble des pivots recents pertinents.
+    if len(pivots) < 3:
         return None
 
-    (i1, p1), (i2, p2) = pivots[-2:]
+    relevant = pivots[-min(len(pivots), 12):]
+    xs = [float(i) for i, _ in relevant]
+    ys = [float(price) for _, price in relevant]
+    mean_x = sum(xs) / len(xs)
+    mean_y = sum(ys) / len(ys)
+    variance_x = sum((x - mean_x) ** 2 for x in xs)
+    if variance_x <= 0:
+        return None
+    slope = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys)) / variance_x
+    intercept = mean_y - slope * mean_x
 
-    if i2 == i1:
+    if direction == "BUY" and slope <= 0:
+        return None
+    if direction == "SELL" and slope >= 0:
         return None
 
-    if direction == "BUY" and p2 <= p1:
-        return None
-
-    if direction == "SELL" and p2 >= p1:
-        return None
-
-    projected = p2 + (
-        (p2 - p1) / (i2 - i1)
-    ) * (len(candles) - 1 - i2)
-
+    projected = slope * (len(candles) - 1) + intercept
     return {
         "direction": direction,
         "price": projected,
-        "pivot_1": p1,
-        "pivot_2": p2,
+        "pivot_1": relevant[0][1],
+        "pivot_2": relevant[-1][1],
+        "pivot_count": len(relevant),
+        "slope": slope,
+        "intercept": intercept,
     }
 
 
@@ -421,12 +428,8 @@ def analyze_candles(candles):
             current["close"] * 0.00001,
         )
 
-        if direction == "BUY":
-            if current["low"] > level + 1.5 * span:
-                continue
-        else:
-            if current["high"] < level - 1.5 * span:
-                continue
+        # La distance au support/resistance ne rejette pas le signal.
+        # Le niveau detecte reste disponible pour qualifier l'alerte.
 
         ob = find_order_block(data, direction)
         line = find_trendline(data, direction)
