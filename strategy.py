@@ -4204,7 +4204,6 @@ def _env_number(name: str, default: float, minimum: float = 0.0) -> float:
         return default
 # Reglables par variables d'environnement.
 MIN_ZONE_TOUCHES = int(_env_number("MIN_ZONE_TOUCHES", 2, 1))
-MAX_ALERT_DISTANCE_ATR = _env_number("MAX_ALERT_DISTANCE_ATR", 8.0, 0.5)
 MIN_SIGNAL_GRADE = _os.getenv("MIN_SIGNAL_GRADE", "C").strip().upper()
 GRADE_RANK = {"C": 1, "B": 2, "A": 3}
 PROJECTION_CANDLES_H4 = 60      # horizon de projection des trendlines
@@ -4401,7 +4400,12 @@ def _build_zone_signal(
         if common is None:
             return None
         near_anchor = anchor is not None and (common[0] - tolerance <= anchor <= common[1] + tolerance)
-        return (0 if near_anchor else 1, 0 if item["tf"] == "H1" else 1, common[1] - common[0]), common
+        # Priorite stricte a l'Order Block, puis Doji ; le timeframe
+        # et la proximite de l'ancre departagent les candidats d'un meme type.
+        return (0 if item["kind"] == "OB" else 1,
+                0 if near_anchor else 1,
+                0 if item["tf"] == "H1" else 1,
+                common[1] - common[0]), common
     ranked = [(rank(c), c) for c in candidates if rank(c) is not None]
     used_kinds = set()
     if ranked:
@@ -4542,16 +4546,16 @@ def find_zone_signals(symbol: str, snapshot: Dict[str, Any]) -> Dict[str, Any]:
         return {"signals": [], "result": build_no_signal_result(symbol, "ATR indisponible.",
 price)}
     zones = collect_candidate_zones(price, atr_h4, supports, resistances)
-    limit = atr_h4 * MAX_ALERT_DISTANCE_ATR
-    usable = [z for z in zones if z["distance"] <= limit and z["touches"] >= MIN_ZONE_TOUCHES]
+    # La distance au prix ne supprime plus une zone strategique valide.
+    # Elle est conservee dans l'alerte via zone_distance_atr.
+    usable = [z for z in zones if z["touches"] >= MIN_ZONE_TOUCHES]
     if not usable:
         nearest = min(zones, key=lambda z: z["distance"]) if zones else None
         return {"signals": [], "result": build_no_signal_result(
-            symbol, "Aucune zone S/R exploitable dans le rayon d'alerte.", price,
+            symbol, "Aucune zone S/R ne satisfait le minimum de contacts.", price,
             {"zones_detected": len(zones),
-             "nearest_distance_atr": round(nearest["distance"] / atr_h4, 2) if nearest else
-None,
-             "alert_radius_atr": MAX_ALERT_DISTANCE_ATR})}
+             "nearest_distance_atr": round(nearest["distance"] / atr_h4, 2) if nearest else None,
+             "minimum_zone_touches": MIN_ZONE_TOUCHES})}
     ctx = {
         "price": price, "atr_h4": atr_h4, "atr_h1": atr_h1, "h1": h1, "h4": h4,
         "zones": zones, "trendlines": h4_analysis.get("trendlines", {}),
@@ -4668,13 +4672,13 @@ def find_signals(symbol: str, market_data: Dict[str, Any]) -> List[Dict[str, Any
     if not signals:
         result = found.get("result", {})
         logger.warning(
-            "%s : AUCUN SIGNAL - %s | details=%s | erreurs=%s | note minimale=%s | rayon=%s ATR | contacts min=%s",
+            "%s : AUCUN SIGNAL - %s | details=%s | erreurs=%s | note minimale=%s | distance=%s | contacts min=%s",
             symbol,
             result.get("reason"),
             result.get("details") or result.get("data"),
             result.get("errors"),
             MIN_SIGNAL_GRADE,
-            MAX_ALERT_DISTANCE_ATR,
+            "sans limite de distance",
             MIN_ZONE_TOUCHES,
         )
     output = []
