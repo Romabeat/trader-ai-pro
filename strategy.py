@@ -26,7 +26,7 @@ TIMEFRAME_REQUIREMENTS = {
 }
 MIN_TRENDLINE_TOUCHES = 3
 ATR_PERIOD = 14
-MIN_RISK_REWARD = 1.0
+MIN_RISK_REWARD = 2.0
 ATR_STOP_BUFFER = 0.15
 ZONE_ATR_TOLERANCE = 0.25
 MIN_CANDLE_COUNT = 200
@@ -4192,8 +4192,9 @@ def get_strategy_status() -> Dict[str, Any]:
 #   - zone retournee (ancien support <-> resistance) = retest ;
 #   - trendline (y compris cassee puis retestee) qui croise la zone :
 #     son intersection avec la zone devient le point d'entree ;
-#   - Order Block / Doji (H1 puis H4) dans la zone : ils la RESSERRENT
-#     (entree precise, SL proche) ; ils ne bloquent jamais l'alerte.
+#   - Order Block historique solide obligatoire, dans la zone ou ses contours.
+#   - Aucun Doji ; trendline et OB valides sont des conditions obligatoires.
+#   - RR technique reel >= 2 ; aucun TP artificiel pour atteindre le seuil.
 # Aucun ordre n'est execute : alerte uniquement.
 SETUP_TYPE_ZONE = "ZONE_ANTICIPATION"
 import os as _os
@@ -4210,7 +4211,6 @@ PROJECTION_CANDLES_H4 = 60      # horizon de projection des trendlines
 INTERSECTION_BAND_ATR = 0.15    # demi-largeur de la zone autour de l'intersection
 SCAN_CANDIDATES_PER_SIDE = 4    # zones evaluees par sens
 REFINEMENT_LOOKBACK = 150       # OB recherches dans la zone
-DOJI_LOOKBACK = 60              # dojis recents seulement
 FLIP_LOOKBACK_H4 = 150          # recherche d'une cassure de la zone
 FLIP_MIN_CLOSES = 12            # clotures H4 de l'autre cote = vraie cassure
 def _zone_of(level: Dict[str, Any], atr: float) -> Optional[Tuple[float, float]]:
@@ -4331,36 +4331,55 @@ def _refinement_candidates(
     atr_h1: float,
     atr_h4: float,
 ) -> List[Dict[str, Any]]:
-    """Order Blocks et dojis (H1 puis H4) qui se trouvent dans la zone."""
+    """Recherche exclusivement des OB valides dans la zone et ses contours.
+
+    La solidite minimale repose sur un displacement initial net et sur des
+    retests/rejets historiques observables apres la creation du bloc.
+    """
     wanted = "BULLISH" if direction == "BUY" else "BEARISH"
-    expanded = (zone[0] - atr_h4 * ZONE_ATR_TOLERANCE, zone[1] + atr_h4 * ZONE_ATR_TOLERANCE)
+    margin = atr_h4 * 2.0
+    search_zone = (zone[0] - margin, zone[1] + margin)
     found: List[Dict[str, Any]] = []
     for label, candles, atr in (("H1", h1, atr_h1), ("H4", h4, atr_h4)):
         try:
-            blocks = detect_order_blocks(candles, lookback=REFINEMENT_LOOKBACK, search_back=5,
-atr=atr)
+            blocks = detect_order_blocks(candles, lookback=REFINEMENT_LOOKBACK, search_back=5, atr=atr)
         except (StrategyError, ValueError, TypeError, KeyError, IndexError):
-            blocks = []
+            continue
         for block in blocks:
             if str(block.get("type", "")).upper() != wanted:
                 continue
-            lo, hi = safe_float(block.get("zone_lower")), safe_float(block.get("zone_upper"))
-            if lo is None or hi is None or lo > hi or _overlap(zone, (lo, hi)) is None:
+            lo = safe_float(block.get("zone_lower")); hi = safe_float(block.get("zone_upper"))
+            idx = int(block.get("index", -1))
+            displacement = safe_float(block.get("displacement_range_atr")) or 0.0
+            body_ratio = safe_float(block.get("body_ratio")) or 0.0
+            if lo is None or hi is None or lo >= hi or idx < 0:
                 continue
-            found.append({"label": f"OB {label}", "bounds": (lo, hi), "atr": atr, "kind": "OB",
-"tf": label})
-        for candle in candles[-DOJI_LOOKBACK:]:
-            try:
-                if not is_doji(candle, 0.10):
+            if _overlap(search_zone, (lo, hi)) is None:
+                continue
+            # Un bloc faible ou sans impulsion significative est écarté.
+            if displacement < 0.80 or body_ratio < 0.55:
+                continue
+            later = candles[idx + 1:]
+            mid = (lo + hi) / 2.0
+            reactions = 0
+            for c in later:
+                touched = c["low"] <= hi and c["high"] >= lo
+                if not touched:
                     continue
-            except StrategyError:
+                rejected = (c["close"] > mid if direction == "BUY" else c["close"] < mid)
+                if rejected:
+                    reactions += 1
+            # Exige au moins une réaction/reprise historique après le départ du bloc.
+            if reactions < 1:
                 continue
-            lo, hi = float(candle["low"]), float(candle["high"])
-            if _overlap(zone, (lo, hi)) is None:
-                continue
-            found.append({"label": f"Doji {label}", "bounds": (lo, hi), "atr": atr, "kind":
-"DOJI", "tf": label})
+            found.append({
+                "label": f"OB {label}", "bounds": (lo, hi), "atr": atr,
+                "kind": "OB", "tf": label, "reactions": reactions,
+                "displacement_atr": displacement, "body_ratio": body_ratio,
+                "index": idx,
+            })
     return found
+
 def _build_zone_signal(
     symbol: str,
     zone: Dict[str, Any],
@@ -4391,17 +4410,21 @@ def _build_zone_signal(
             f"Trendline {kind} ({intersection['touches']} contacts, {role}) croise la zone {when}"
         )
         score += 1
-    anchor = intersection["price"] if intersection else None
+    # La trendline est une confluence obligatoire, pas un bonus.
+    if intersection is None:
+        return None
+    anchor = intersection["price"]
     refined, atr_ref = base, atr_h4
     candidates = _refinement_candidates(direction, base, h1, h4, atr_h1, atr_h4)
     tolerance = atr_h4 * ZONE_ATR_TOLERANCE
     def rank(item):
         common = _overlap(base, item["bounds"])
         if common is None:
-            return None
+            # OB des contours alentours : on retient le bloc entier, s'il est
+            # dans le périmètre de recherche déjà validé.
+            common = item["bounds"]
         near_anchor = anchor is not None and (common[0] - tolerance <= anchor <= common[1] + tolerance)
-        # Priorite stricte a l'Order Block, puis Doji ; le timeframe
-        # et la proximite de l'ancre departagent les candidats d'un meme type.
+        # Priorite aux blocs proches de la trendline, puis au timeframe et a la largeur.
         return (0 if item["kind"] == "OB" else 1,
                 0 if near_anchor else 1,
                 0 if item["tf"] == "H1" else 1,
@@ -4419,12 +4442,9 @@ def _build_zone_signal(
                 refinements.append(item["label"])
                 confluences.append(f"{item['label'].replace('OB', 'Order Block')} dans la zone")
                 score += 1
-    if not used_kinds and anchor is not None:
-        band = atr_h4 * INTERSECTION_BAND_ATR
-        narrowed = _overlap(base, (anchor - band, anchor + band))
-        if narrowed:
-            refined = narrowed
-            refinements.append("Intersection trendline x zone")
+    # Aucun Doji ni signal sans Order Block historique solide.
+    if "OB" not in used_kinds:
+        return None
     sweep = detect_liquidity_sweep(h1)
     if sweep.get("detected") and normalize_signal_direction(sweep.get("direction")) == direction:
         if distance_to_range(float(h1[-1]["close"]), base[0], base[1]) <= atr_h1 * MAX_PRICE_DISTANCE_ATR:
@@ -4471,9 +4491,9 @@ def _build_zone_signal(
         if abs(target - entry) / risk >= MIN_RISK_REWARD:
             take_profit = target
             break
+    # Ne jamais fabriquer un TP à 2R : il faut un objectif technique réel.
     if take_profit is None:
-        tp_source = "RR_MINIMUM"
-        take_profit = entry + risk * MIN_RISK_REWARD if direction == "BUY" else entry - risk * MIN_RISK_REWARD
+        return None
     ok, _ = validate_signal_prices(direction, entry, stop_loss, take_profit)
     if not ok:
         return None
@@ -4508,6 +4528,10 @@ def _build_zone_signal(
         "zone": {"lower": base[0], "upper": base[1], "touches": zone["touches"]},
         "refined_zone": {"lower": refined[0], "upper": refined[1]},
         "refinements": refinements,
+        "order_block": {"lower": refined[0], "upper": refined[1],
+                        "historical_reactions": best.get("reactions", 0),
+                        "displacement_atr": best.get("displacement_atr"),
+                        "timeframe": best.get("tf")},
         "confluences": confluences,
         "retest": bool(flipped) or bool(intersection and intersection["broken_retest"]),
         "intersection": intersection,
@@ -4564,28 +4588,15 @@ price)}
     }
     by_side: Dict[str, List[Dict[str, Any]]] = {"BUY": [], "SELL": []}
     for zone in sorted(usable, key=lambda z: z["distance"]):
-        if zone["position"] == "BELOW_PRICE":
-            direction = "BUY"
-        elif zone["position"] == "ABOVE_PRICE":
-            direction = "SELL"
-        else:
-            direction = "NEUTRAL"
-            for candle in reversed(h1[-60:-1]):
-                if candle["close"] < zone["lower"]:
-                    direction = "SELL"
-                    break
-                if candle["close"] > zone["upper"]:
-                    direction = "BUY"
-                    break
-            if direction == "NEUTRAL" and ctx["trend_d1"] in ("BUY", "SELL"):
-                direction = ctx["trend_d1"]
-            if direction == "NEUTRAL":
+        # Les deux sens sont évalués : la position de la zone par rapport
+        # au prix ne suffit jamais à attribuer BUY ou SELL.
+        directions = ("BUY", "SELL")
+        for direction in directions:
+            if len(by_side[direction]) >= SCAN_CANDIDATES_PER_SIDE:
                 continue
-        if len(by_side[direction]) >= SCAN_CANDIDATES_PER_SIDE:
-            continue
-        built = _build_zone_signal(symbol, zone, direction, ctx)
-        if built:
-            by_side[direction].append(built)
+            built = _build_zone_signal(symbol, zone, direction, ctx)
+            if built:
+                by_side[direction].append(built)
     signals = []
     for direction in ("BUY", "SELL"):
         if by_side[direction]:
@@ -4627,6 +4638,12 @@ def format_zone_signal_message(signal: Dict[str, Any]) -> str:
         "━━━━━━━━━━━━━━━━━━",
         f"Zone S/R : {format_price(zone.get('lower'))} - {format_price(zone.get('upper'))}",
     ]
+    ob = signal.get("order_block") or {}
+    if ob:
+        lines.append(
+            f"Order Block historique : {format_price(ob.get('lower'))} - {format_price(ob.get('upper'))} "
+            f"({ob.get('historical_reactions', 0)} réaction(s), TF {ob.get('timeframe', '?')})"
+        )
     if signal.get("refinements"):
         lines.append(
             f"Zone affinee ({', '.join(signal['refinements'])}) : "
